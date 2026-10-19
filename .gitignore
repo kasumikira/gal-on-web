@@ -1,0 +1,8 @@
+/galweb.exe
+/tests/
+/node_modules/
+/out/
+/web/build/
+/tools/emsdk/
+/tools/dev/extract/
+/third_party/kirikiroid2/

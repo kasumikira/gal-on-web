@@ -1,0 +1,20 @@
+{
+  "name": "gal-kirikiri",
+  "version-string": "0.1.0",
+  "builtin-baseline": "b1e15efef6758eaa0beb0a8732cfa66f6a68a81d",
+  "overrides": [
+    {
+      "name": "fmt",
+      "version": "12.0.0"
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "boost-locale",
+      "default-features": false
+    },
+    "fmt",
+    "spdlog",
+    "oniguruma"
+  ]
+}

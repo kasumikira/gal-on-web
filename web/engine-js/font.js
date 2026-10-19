@@ -1,0 +1,632 @@
+import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner } from '#krkr/native';
+import { number, truth, Closure } from '#krkr/values';
+import { Image, colorBytes, clamp255 } from './bitmap.js';
+
+export class FontState {
+  constructor() {
+    this.height = 23;
+    this.flags = 0;
+    this.angle = 0;
+    this.face = 'MS Shell Dlg 2';
+    this.faceIsFileName = false;
+    this.prerenderedFont = null;
+  }
+}
+
+// Text measurement/drawing through the browser canvas 2D context. The native
+// engine rasterizes via FreeType; the browser font stack replaces it (platform
+// boundary), with the same API surface and extents in pixels.
+let LayerFontClass = null;
+let LayerNativeClass = null;
+
+export function attachFontClass(fontClass, layerClass) {
+  LayerFontClass = fontClass;
+  LayerNativeClass = layerClass;
+}
+
+export function createFontInstance(layerNode) {
+  // TVPCreateFontObject: a Font native instance bound to a layer node.
+  if (!LayerFontClass) throw new Error('TJS Font class is not registered');
+  return createNativeInstance(LayerFontClass, { layer: layerNode });
+}
+
+// TVPCreateRectObject returns a real Rect native instance, including its
+// width/height properties and methods.  Constructing it here mirrors the VM's
+// NativeClass path because getGlyphDrawRect is a synchronous native method.
+function createRectObject(Rect, left, top, right, bottom) {
+  if (!Rect) throw new Error('TJS Font.getGlyphDrawRect requires the Rect native class');
+  const owner = createNativeInstance(Rect, Rect.initialize());
+  const rect = Rect.state(owner).rect;
+  rect.left = left; rect.top = top; rect.right = right; rect.bottom = bottom;
+  return owner;
+}
+
+const PRERENDERED_HEADER = new TextEncoder().encode('TVP pre-rendered font\x1a');
+const read16 = (bytes, offset) => bytes[offset] | bytes[offset + 1] << 8;
+const read32 = (bytes, offset) => (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
+
+// Prerendered fonts are a small indexed bitmap format in Kirikiri.  The
+// browser parses the same index and RLE data after Storages.read resolves;
+// rasterization itself remains synchronous once the bytes are mapped.
+function parsePrerenderedFont(bytes) {
+  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+  if (bytes.length < 36 || !PRERENDERED_HEADER.every((value, i) => bytes[i] === value)) throw new Error('TJS invalid prerendered font file');
+  const version = bytes[22];
+  if (bytes[23] !== 2) throw new Error('TJS prerendered font is not a 16-bit Unicode font');
+  if (version !== 0 && version !== 1) throw new Error('TJS invalid prerendered font header version');
+  const count = read32(bytes, 24), charsOffset = read32(bytes, 28), itemsOffset = read32(bytes, 32);
+  if (charsOffset + count * 2 > bytes.length || itemsOffset + count * 20 > bytes.length) throw new Error('TJS truncated prerendered font index');
+  const glyphs = new Map();
+  for (let i = 0; i < count; i++) {
+    const item = itemsOffset + i * 20;
+    glyphs.set(read16(bytes, charsOffset + i * 2), {
+      offset: read32(bytes, item), width: read16(bytes, item + 4), height: read16(bytes, item + 6),
+      originX: (read16(bytes, item + 8) << 16) >> 16, originY: (read16(bytes, item + 10) << 16) >> 16,
+      incX: (read16(bytes, item + 12) << 16) >> 16, incY: (read16(bytes, item + 14) << 16) >> 16,
+      inc: (read16(bytes, item + 16) << 16) >> 16,
+    });
+  }
+  return { bytes, version, glyphs };
+}
+
+function retrievePrerenderedGlyph(font, glyph) {
+  const { bytes, version } = font;
+  const output = new Uint8Array(glyph.width * glyph.height);
+  let source = glyph.offset, dest = 0;
+  while (dest < output.length && source < bytes.length) {
+    const marker = bytes[source++];
+    if (version === 0) {
+      if (marker === 0x41) {
+        if (source >= bytes.length) throw new Error('TJS truncated prerendered glyph');
+        const value = dest ? output[dest - 1] : 0, count = bytes[source++];
+        if (dest + count > output.length) throw new Error('TJS truncated prerendered glyph');
+        output.fill(value, dest, dest + count); dest += count;
+      } else output[dest++] = marker;
+    } else if (marker >= 0x41) {
+      const count = marker - 0x40, value = dest ? output[dest - 1] : 0;
+      if (dest + count > output.length) throw new Error('TJS truncated prerendered glyph');
+      output.fill(value, dest, dest + count); dest += count;
+    } else output[dest++] = marker;
+  }
+  if (dest !== output.length) throw new Error('TJS truncated prerendered glyph');
+  // TVPUpscale65_255: prerendered fonts store coverage in the 0..64 range;
+  // each value is expanded to the normal 0..255 alpha range.
+  for (let i = 0; i < output.length; i++) output[i] = Math.min(255, output[i] * 4);
+  return output;
+}
+
+function clipErase(node, source, left, top, strength) {
+  const clip = node.clip ?? { left: 0, top: 0, right: node.image.width, bottom: node.image.height };
+  const dx = Math.max(left, clip.left), dy = Math.max(top, clip.top);
+  const right = Math.min(left + source.width, clip.right), bottom = Math.min(top + source.height, clip.bottom);
+  if (right <= dx || bottom <= dy) return false;
+  strength = Math.max(0, Math.min(255, Math.trunc(Math.abs(strength))));
+  for (let sy = dy - top, y = dy; y < bottom; y++, sy++) for (let sx = dx - left, x = dx; x < right; x++, sx++) {
+    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
+    const coverage = source.pixels[si + 3];
+    node.image.pixels[di + 3] = Math.max(0, Math.trunc(node.image.pixels[di + 3] * (255 - coverage * strength / 255) / 255));
+  }
+  node.markImageModified({ left: dx, top: dy, right, bottom });
+  return true;
+}
+
+function blendTextPixel(p, di, source, si, opa, face) {
+  const coverage = Math.max(0, Math.min(255, Math.trunc(source[si + 3])));
+  const opacity = Math.max(0, Math.min(255, Math.trunc(opa)));
+  if (opa < 0) {
+    // bmAlphaOnAlpha + negative opacity selects RemoveOpacity in the native
+    // renderer.  The source coverage is the removal mask; RGB is untouched.
+    p[di + 3] = Math.max(0, Math.trunc(p[di + 3] * (255 - coverage * opacity / 255) / 255));
+    return;
+  }
+  const alpha = Math.min(255, (coverage * opacity) >> 8);
+  if (face === 1) {
+    // bmAlpha (opaque destination): colour is interpolated, destination
+    // alpha is retained by ApplyColorMap.
+    for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * alpha / 256);
+    return;
+  }
+  if (face === 4) {
+    // bmAlphaOnAddAlpha: the destination and source RGB values are additive
+    // alpha (premultiplied) channels, as in TVPAddAlphaBlend_a_a.
+    const inverse = 255 - alpha, destAlpha = p[di + 3];
+    for (let c = 0; c < 3; c++) p[di + c] = Math.min(255, ((p[di + c] * inverse) >> 8) + ((source[si + c] * alpha) >> 8));
+    const union = alpha + destAlpha - ((destAlpha * alpha) >> 8);
+    p[di + 3] = union - (union >> 8);
+    return;
+  }
+  if (face !== 0) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  // bmAlphaOnAlpha: source-over in straight RGB, with destination alpha
+  // participating in the source colour ratio.
+  const destAlpha = p[di + 3];
+  const outAlpha = 255 - Math.trunc((255 - alpha) * (255 - destAlpha) / 255);
+  let ratio = 255;
+  if (destAlpha) {
+    const sourceOverDest = alpha / destAlpha;
+    ratio = Math.trunc((sourceOverDest / (1 - alpha / 255 + sourceOverDest)) * 255);
+  }
+  for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * ratio / 256);
+  p[di + 3] = outAlpha;
+}
+
+export function clipBlit(node, source, left, top, { opa = 255 } = {}) {
+  const face = node.drawFace ?? 0;
+  if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  if (opa < 0) return clipErase(node, source, left, top, opa);
+  const clip = node.clip ?? { left: 0, top: 0, right: node.image.width, bottom: node.image.height };
+  const dx = Math.max(left, clip.left), dy = Math.max(top, clip.top);
+  const right = Math.min(left + source.width, clip.right), bottom = Math.min(top + source.height, clip.bottom);
+  if (right <= dx || bottom <= dy) return false;
+  for (let sy = dy - top, y = dy; y < bottom; y++, sy++) for (let sx = dx - left, x = dx; x < right; x++, sx++) {
+    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
+    blendTextPixel(node.image.pixels, di, source.pixels, si, opa, face);
+  }
+  node.markImageModified({ left: dx, top: dy, right, bottom });
+  return true;
+}
+
+function prerenderedGlyphImage(font, glyph, color, aa) {
+  const coverage = retrievePrerenderedGlyph(font, glyph);
+  const image = new Image(glyph.width, glyph.height);
+  const [r, g, b] = colorBytes(color);
+  // TVPToActualColor strips system-color markers and leaves RGB.  Text
+  // opacity comes from the `opa` argument, so an ordinary 0xRRGGBB color is
+  // fully opaque even though its high byte is zero.
+  for (let i = 0; i < coverage.length; i++) {
+    let alpha = coverage[i];
+    if (!aa) alpha = alpha >= 128 ? 255 : 0;
+    const p = i * 4;
+    image.pixels[p] = r; image.pixels[p + 1] = g; image.pixels[p + 2] = b;
+    image.pixels[p + 3] = alpha;
+  }
+  return image;
+}
+
+// LayerBitmapImpl::ApplyFont derives these offsets from the rasterizer ascent.
+// Canvas does not expose the native rasterizer's ascent, so use its measured
+// glyph ascent when available and retain the same integer/trigonometric rules.
+export function getFontAscentOffsets(document, font) {
+  const size = Math.abs(font?.height ?? 0) | 0;
+  let ascent = Math.trunc(size * 0.8);
+  if (document?.createElement) {
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    if (context) {
+      context.font = `${font?.flags & 0x0200 ? 'bold ' : ''}${font?.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font?.face ?? '').replace(/"/g, '')}", sans-serif`;
+      const metrics = context.measureText('Mg');
+      if (Number.isFinite(metrics.actualBoundingBoxAscent)) ascent = Math.trunc(metrics.actualBoundingBoxAscent);
+    }
+  }
+  const angle = (font?.angle || 0) * Math.PI / 1800;
+  return {
+    x: Math.trunc(Math.sin(angle) * ascent),
+    y: Math.trunc(Math.cos(angle) * ascent),
+    angle,
+  };
+}
+
+function nativeCellIncY(value, angleTenths) {
+  value = Math.trunc(value);
+  if (value !== 0) {
+    if (angleTenths < 1800) { if (value > 0) value = -value; }
+    else if (value < 0) value = -value;
+  }
+  return value;
+}
+
+export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
+  const radius = Math.abs(Math.trunc(blurWidth));
+  blurLevel = Math.max(0, Math.min(255, Math.trunc(blurLevel)));
+  if (!radius) {
+    if (blurLevel === 255) return { image: source, offsetX: 0, offsetY: 0 };
+    const image = source.clone();
+    for (let i = 3; i < image.pixels.length; i += 4) image.pixels[i] = Math.min(255, (image.pixels[i] * blurLevel) >> 8);
+    return { image, offsetX: 0, offsetY: 0 };
+  }
+  const hypot = (x, y) => {
+    x = Math.abs(x); y = Math.abs(y);
+    const hi = Math.max(x, y), lo = Math.min(x, y), t = lo + (lo >> 1);
+    return hi - (hi >> 5) - (hi >> 7) + (t >> 2) + (t >> 6);
+  };
+  const kernel = [];
+  let total = 0;
+  for (let y = -radius; y <= radius; y++) for (let x = -radius; x <= radius; x++) {
+    const distance = hypot(x, y);
+    if (distance <= radius) { const weight = radius - distance + 1; kernel.push([x, y, weight]); total += weight; }
+  }
+  const levelScale = Math.trunc((1 << 18) / total);
+  const weightedKernel = kernel.map(([x, y, weight]) => [x, y, Math.trunc(weight * levelScale * blurLevel / 256)]);
+  const image = new Image(source.width + radius * 2, source.height + radius * 2);
+  let hasActive = false;
+  let minX = source.width, minY = source.height, maxX = -1, maxY = -1;
+  for (let i = 3; i < source.pixels.length; i += 4) {
+    if (!source.pixels[i]) continue;
+    const index = (i - 3) >> 2, x = index % source.width, y = Math.floor(index / source.width);
+    hasActive = true;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  }
+  // Alpha is a sum of nonnegative, integer contributions with a 255 cap, so
+  // transparent source pixels can be omitted without changing the result.
+  // This avoids scanning blank parts of the glyph rectangle for every kernel
+  // position.
+  if (hasActive) {
+    for (let sy = minY; sy <= maxY; sy++) for (let sx = minX; sx <= maxX; sx++) {
+      const src = (sy * source.width + sx) * 4, sourceAlpha = source.pixels[src + 3];
+      if (!sourceAlpha) continue;
+      for (const [ox, oy, kernelLevel] of weightedKernel) {
+        const dst = ((sy + oy + radius) * image.width + sx + ox + radius) * 4 + 3;
+        const contribution = Math.trunc(sourceAlpha * kernelLevel / (1 << 18));
+        image.pixels[dst] = Math.min(255, image.pixels[dst] + contribution);
+      }
+    }
+  }
+  // RGB does not participate in the blur; the legacy loop leaves the RGB
+  // value from the last kernel sample touching each output pixel. Reproduce
+  // that value with a reverse kernel lookup, including transparent pixels.
+  for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+    const dst = (y * image.width + x) * 4;
+    for (let i = weightedKernel.length - 1; i >= 0; i--) {
+      const [ox, oy] = weightedKernel[i];
+      const sx = x - ox - radius, sy = y - oy - radius;
+      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue;
+      const src = (sy * source.width + sx) * 4;
+      image.pixels[dst] = source.pixels[src];
+      image.pixels[dst + 1] = source.pixels[src + 1];
+      image.pixels[dst + 2] = source.pixels[src + 2];
+      break;
+    }
+  }
+  return { image, offsetX: -Math.trunc(blurWidth), offsetY: -Math.trunc(blurWidth) };
+}
+
+function normalizeTextOpacity(node, opa) {
+  opa = Math.trunc(number(opa));
+  const face = node.drawFace ?? 0;
+  if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  if (face === 4 && opa < 0) throw new Error('TJS negative opacity not supported on additive alpha face');
+  if (face !== 0 && opa < 0) return 0;
+  return Math.max(-255, Math.min(255, opa));
+}
+
+function measuredTextBounds(context, text, size, flags) {
+  const metrics = context.measureText(text);
+  const baseline = size * 0.8;
+  const left = Number.isFinite(metrics.actualBoundingBoxLeft) ? -metrics.actualBoundingBoxLeft : -size * 0.25;
+  const right = Number.isFinite(metrics.actualBoundingBoxRight) ? metrics.actualBoundingBoxRight : metrics.width + size * 0.25;
+  const ascent = Number.isFinite(metrics.actualBoundingBoxAscent) ? metrics.actualBoundingBoxAscent : size * 0.8;
+  const descent = Number.isFinite(metrics.actualBoundingBoxDescent) ? metrics.actualBoundingBoxDescent : size * 0.2;
+  const boxes = [];
+  if (right > left && ascent + descent > 0) boxes.push([left, baseline - ascent, right, baseline + descent]);
+  const line = Math.max(1, Math.ceil(size / 14));
+  if (flags & 0x0800) boxes.push([0, size * 0.52, metrics.width, size * 0.52 + line]);
+  if (flags & 0x0400) boxes.push([0, size * 0.86, metrics.width, size * 0.86 + line]);
+  return { metrics, boxes };
+}
+
+function addRotatedTextBounds(bounds, textBounds, x, y, angle) {
+  const cosine = Math.cos(angle), sine = Math.sin(angle);
+  for (const [left, top, right, bottom] of textBounds.boxes) {
+    for (const [localX, localY] of [[left, top], [right, top], [left, bottom], [right, bottom]]) {
+      const worldX = x + cosine * localX + sine * localY;
+      const worldY = y - sine * localX + cosine * localY;
+      bounds.left = Math.min(bounds.left, worldX);
+      bounds.top = Math.min(bounds.top, worldY);
+      bounds.right = Math.max(bounds.right, worldX);
+      bounds.bottom = Math.max(bounds.bottom, worldY);
+    }
+  }
+}
+
+function textCanvasRegion(node, bounds) {
+  if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return null;
+  const left = Math.max(0, Math.floor(bounds.left) - 1), top = Math.max(0, Math.floor(bounds.top) - 1);
+  const right = Math.min(node.image.width, Math.ceil(bounds.right) + 1), bottom = Math.min(node.image.height, Math.ceil(bounds.bottom) + 1);
+  if (right <= left || bottom <= top) return null;
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+function drawFallback(document, node, glyphs, color, opa, shadowWidth = 0, offsetX = 0, offsetY = 0, angle = 0, blurLevel = 255) {
+  if (!glyphs.length) return false;
+  if (!document?.createElement) throw new Error('TJS prerendered font fallback requires a browser canvas');
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const size = Math.abs(node.font.height) | 0;
+  const [r, g, b] = colorBytes(color);
+  const flags = node.font.flags;
+  const font = `${flags & 0x0200 ? 'bold ' : ''}${flags & 0x0100 ? 'italic ' : ''}${size}px "${String(node.font.face).replace(/"/g, '')}", sans-serif`;
+  context.font = font;
+  const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+  for (const item of glyphs) {
+    const measured = measuredTextBounds(context, item.character, size, flags);
+    addRotatedTextBounds(bounds, measured, item.x + offsetX, item.y + offsetY, angle);
+  }
+  const region = textCanvasRegion(node, bounds);
+  if (!region) return false;
+  canvas.width = region.width; canvas.height = region.height;
+  context.font = font;
+  context.imageSmoothingEnabled = true;
+  blurLevel = Math.max(0, Math.min(255, Math.abs(Math.trunc(blurLevel))));
+  context.fillStyle = `rgba(${r},${g},${b},1)`;
+  for (const item of glyphs) {
+    context.save();
+    context.translate(item.x + offsetX - region.left, item.y + offsetY - region.top);
+    context.rotate(-angle);
+    context.fillText(item.character, 0, size * 0.8);
+    const metrics = context.measureText(item.character), line = Math.max(1, Math.ceil(size / 14));
+    if (node.font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
+    if (node.font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
+    context.restore();
+  }
+  const source = Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height);
+  const blurred = blurGlyphImage(source, shadowWidth, blurLevel);
+  return clipBlit(node, blurred.image, region.left + blurred.offsetX, region.top + blurred.offsetY, { opa, holdAlpha: !!node.holdAlpha });
+}
+
+// TVPGetCharacter uses the mapped glyph's bitmap and advances by IncX/IncY.
+// Returning false when a character is absent lets the normal browser font
+// renderer handle the mixed mapped/fallback case as the native rasterizer does.
+function drawPrerenderedText(document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy) {
+  const font = node.font?.prerenderedFont;
+  if (!font) return false;
+  opa = normalizeTextOpacity(node, opa);
+  if (opa === 0) return true;
+  const ascent = getFontAscentOffsets(document, node.font);
+  const glyphs = [], fallback = [];
+  let cursorX = x, cursorY = y;
+  for (const character of text) {
+    const glyph = font.glyphs.get(character.charCodeAt(0));
+    if (glyph) {
+      glyphs.push({ glyph, x: cursorX + glyph.originX + ascent.x, y: cursorY - glyph.originY + ascent.y });
+      cursorX += glyph.incX;
+      cursorY += nativeCellIncY(glyph.incY, node.font.angle);
+    } else {
+      // FreeType's GetBitmap adds AscentOfsX to the fallback origin.  Its
+      // OriginY already includes the rasterizer ascent, unlike packed glyphs.
+      fallback.push({ character, x: cursorX + ascent.x, y: cursorY });
+      // The browser fallback is measured one character at a time, matching
+      // TVPGetCharacter's per-character fallback for an absent mapped glyph.
+      const canvas = document?.createElement?.('canvas');
+      if (!canvas) throw new Error('TJS prerendered font fallback requires a browser canvas');
+      const context = canvas.getContext('2d');
+      const size = Math.abs(node.font.height) | 0;
+      context.font = `${node.font.flags & 0x0200 ? 'bold ' : ''}${node.font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(node.font.face).replace(/"/g, '')}", sans-serif`;
+      const advance = Math.ceil(context.measureText(character).width);
+      const radians = ascent.angle;
+      if (node.font.angle === 2700) cursorY += advance;
+      else {
+        cursorX += Math.trunc(Math.cos(radians) * advance);
+        cursorY += nativeCellIncY(Math.trunc(-Math.sin(radians) * advance), node.font.angle);
+      }
+    }
+  }
+  const drawSet = (set, drawColor, drawOpa, ox = 0, oy = 0, blurWidth = 0, blurLevel = 255) => {
+    for (const item of set) {
+      const source = prerenderedGlyphImage(font, item.glyph, drawColor, aa);
+      const blurred = blurGlyphImage(source, blurWidth, blurLevel);
+      clipBlit(node, blurred.image, item.x + ox + blurred.offsetX, item.y + oy + blurred.offsetY, { opa: drawOpa, holdAlpha: !!node.holdAlpha });
+    }
+  };
+  if (shadowLevel) {
+    drawSet(glyphs, shadowColor, opa, Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), shadowWidth, Math.abs(Math.trunc(shadowLevel)));
+    drawFallback(document, node, fallback, shadowColor, opa, shadowWidth, Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), ascent.angle, shadowLevel);
+  }
+  drawSet(glyphs, color, opa);
+  drawFallback(document, node, fallback, color, opa, 0, 0, 0, ascent.angle);
+  return true;
+}
+
+async function storageBytes(storage, name) {
+  if (name instanceof Uint8Array) return name.slice();
+  if (name instanceof ArrayBuffer) return new Uint8Array(name);
+  if (!storage?.read) return null;
+  const bytes = await storage.read(String(name));
+  if (bytes instanceof Uint8Array) return bytes;
+  if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+  return null;
+}
+
+export function createFontClass(document, { storage, Rect } = {}) {
+  let rasterizer = 0;
+  const browserDefaultFace = () => {
+    const faces = document?.fonts ? Array.from(document.fonts).map(font => String(font.family || '')).filter(Boolean) : [];
+    return faces[0] ?? 'sans-serif';
+  };
+  const defaultFaceName = browserDefaultFace();
+  const measure = (font, text) => {
+    if (font?.prerenderedFont) {
+      let width = 0;
+      let context;
+      for (const character of text) {
+        const glyph = font.prerenderedFont.glyphs.get(character.charCodeAt(0));
+        if (glyph) width += glyph.inc;
+        else {
+          if (!context) {
+            const canvas = document.createElement('canvas');
+            context = canvas.getContext('2d');
+            context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${Math.abs(font.height) | 0}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
+          }
+          width += Math.ceil(context.measureText(character).width);
+        }
+      }
+      return { width, height: Math.abs(font.height) };
+    }
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${Math.abs(font.height) | 0}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
+    const metrics = context.measureText(text);
+    return { width: Math.ceil(metrics.width), height: Math.abs(font.height) };
+  };
+  // The Font instance follows its owning layer's font state when attached.
+  const fontOf = state => {
+    if (!state.layer) state.font ??= new FontState();
+    return state.layer ? state.layer.font : state.font;
+  };
+  @nativeClass('Font')
+  class Font {
+    static initialize() { return { layer: null }; }
+
+    @nativeMethod Font(layer) {
+      const state = this;
+      if (layer !== undefined && layer !== null) {
+        if (!LayerNativeClass) throw new Error('TJS Layer class is not registered');
+        state.layer = LayerNativeClass.state(nativeOwner(layer)).node;
+      }
+    }
+    @nativeMethod getTextWidth(...args) {
+      if (!arguments.length) throw new Error('TJS Font.getTextWidth requires text');
+      const state = this;
+      return measure(state.layer ? state.layer.font : state.font ?? new FontState(), String(args[0])).width;
+    }
+    @nativeMethod getTextHeight(...args) {
+      if (!arguments.length) throw new Error('TJS Font.getTextHeight requires text');
+      const state = this;
+      return measure(state.layer ? state.layer.font : state.font ?? new FontState(), String(args[0])).height;
+    }
+
+    @nativeProperty get height() { return fontOf(this).height; }
+    @nativeProperty set height(value) {
+      let next = Math.trunc(number(value));
+      if (next < 0) next = -next;
+      fontOf(this).height = next;
+    }
+    @nativeProperty get angle() { return fontOf(this).angle; }
+    @nativeProperty set angle(value) {
+      let next = Math.trunc(number(value));
+      next %= 3600; if (next < 0) next += 3600;
+      fontOf(this).angle = next;
+    }
+    @nativeProperty get bold() { return Number(!!(fontOf(this).flags & 0x0200)); }
+    @nativeProperty set bold(value) { if (truth(value)) fontOf(this).flags |= 0x0200; else fontOf(this).flags &= ~0x0200; }
+    @nativeProperty get italic() { return Number(!!(fontOf(this).flags & 0x0100)); }
+    @nativeProperty set italic(value) { if (truth(value)) fontOf(this).flags |= 0x0100; else fontOf(this).flags &= ~0x0100; }
+    @nativeProperty get strikeout() { return Number(!!(fontOf(this).flags & 0x0800)); }
+    @nativeProperty set strikeout(value) { if (truth(value)) fontOf(this).flags |= 0x0800; else fontOf(this).flags &= ~0x0800; }
+    @nativeProperty get underline() { return Number(!!(fontOf(this).flags & 0x0400)); }
+    @nativeProperty set underline(value) { if (truth(value)) fontOf(this).flags |= 0x0400; else fontOf(this).flags &= ~0x0400; }
+    @nativeProperty get face() { return fontOf(this).face; }
+    @nativeProperty set face(value) { fontOf(this).face = String(value); }
+    @nativeProperty get faceIsFileName() { return Number(fontOf(this).faceIsFileName); }
+    @nativeProperty set faceIsFileName(value) { fontOf(this).faceIsFileName = !!truth(value); }
+
+    @nativeMethod getEscWidthX(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthX requires text'); const f = fontOf(this); return measure(f, String(args[0])).width * Math.cos(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscWidthY(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthY requires text'); const f = fontOf(this); return measure(f, String(args[0])).width * -Math.sin(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscHeightX(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightX requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.sin(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscHeightY(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightY requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.cos(f.angle * Math.PI / 1800); }
+    @nativeMethod getGlyphDrawRect(...args) {
+      if (arguments.length < 1) throw new Error('TJS Font.getGlyphDrawRect requires text');
+      const font = fontOf(this), text = String(args[0]);
+      if (!text.length) return createRectObject(Rect, 0, 0, 0, 0);
+      const size = Math.abs(font.height) | 0;
+      let left = 0, top = -Math.trunc(size * 0.8), right = measure(font, text).width, bottom = size - Math.trunc(size * 0.8);
+      if (document?.createElement) {
+        const canvas = document.createElement('canvas'), context = canvas.getContext('2d');
+        context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
+        const metrics = context.measureText(text);
+        if (Number.isFinite(metrics.actualBoundingBoxLeft)) left = -Math.ceil(metrics.actualBoundingBoxLeft);
+        if (Number.isFinite(metrics.actualBoundingBoxAscent)) top = -Math.ceil(metrics.actualBoundingBoxAscent);
+        if (Number.isFinite(metrics.actualBoundingBoxRight)) right = Math.ceil(metrics.actualBoundingBoxRight);
+        if (Number.isFinite(metrics.actualBoundingBoxDescent)) bottom = Math.ceil(metrics.actualBoundingBoxDescent);
+      }
+      // Canvas exposes no portable underline/strikeout metrics; retain the
+      // native text extent convention by extending to the advance width.
+      if (font.flags & (0x0400 | 0x0800)) right = Math.max(right, measure(font, text).width);
+      return createRectObject(Rect, left, top, right, bottom);
+    }
+    @nativeMethod async mapPrerenderedFont(...args) {
+      if (!args.length) throw new Error('TJS Font.mapPrerenderedFont requires a storage');
+      const bytes = await storageBytes(storage, args[0]);
+      if (!bytes) throw new Error('TJS prerendered font mapping could not read storage bytes in the browser');
+      const state = this;
+      state.font ??= new FontState();
+      state.layer ? state.layer.font.prerenderedFont = parsePrerenderedFont(bytes) : state.font.prerenderedFont = parsePrerenderedFont(bytes);
+    }
+    @nativeMethod unmapPrerenderedFont() {
+      const state = this;
+      if (state.layer) state.layer.font.prerenderedFont = null;
+      else { state.font ??= new FontState(); state.font.prerenderedFont = null; }
+    }
+    @nativeMethod doUserSelect(...args) {
+      if (args.length < 4) throw new Error('TJS Font.doUserSelect requires flags, caption, prompt and sample text');
+      // The native implementation intentionally returns false unless a
+      // platform font picker is supplied.  Browsers have no synchronous font
+      // picker, so returning 0 preserves that contract without a fake change.
+      return 0;
+    }
+    @nativeMethod getList() {
+      if (!arguments.length) throw new Error('TJS Font.getList requires flags');
+      const result = [];
+      const names = new Set(document?.fonts ? Array.from(document.fonts).map(f => String(f.family || '')).filter(Boolean) : []);
+      result.push(...names);
+      return result;
+    }
+
+    // FontRasterizer.cpp exposes only the FreeType rasterizer in this build
+    // (index 0); invalid values are ignored by the native setter.
+    @nativeProperty get rasterizer() { return rasterizer; }
+    @nativeProperty set rasterizer(value) {
+      const next = Math.trunc(number(value));
+      if (next === 0) rasterizer = 0;
+    }
+    // The native setter deliberately leaves the preference unchanged.  The
+    // browser's default family is the closest platform equivalent.
+    @nativeProperty get defaultFaceName() { return defaultFaceName; }
+    @nativeProperty set defaultFaceName(value) {}
+  }
+  return Font;
+}
+
+export function createTextRenderer(document) {
+  let textCanvas;
+  return function drawText(node, x, y, text, color, opa, aa = true, shadowLevel = 0, shadowColor = 0, shadowWidth = 0, shadowOfsx = 0, shadowOfsy = 0) {
+    opa = normalizeTextOpacity(node, opa);
+    if (opa === 0) return;
+    if (drawPrerenderedText(document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy)) return;
+    const [r, g, b] = colorBytes(color), [sr, sg, sb] = colorBytes(shadowColor);
+    const canvas = textCanvas ??= document.createElement('canvas');
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    const font = node.font, size = Math.abs(font.height) | 0;
+    const fontSpec = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
+    context.font = fontSpec;
+    const angle = (font.angle || 0) * Math.PI / 1800;
+    const measured = measuredTextBounds(context, text, size, font.flags);
+    const draw = (dx, dy, fill) => {
+      const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+      addRotatedTextBounds(bounds, measured, x + dx, y + dy, angle);
+      const region = textCanvasRegion(node, bounds);
+      if (!region) return null;
+      if (canvas.width !== region.width) canvas.width = region.width;
+      if (canvas.height !== region.height) canvas.height = region.height;
+      context.font = fontSpec;
+      context.imageSmoothingEnabled = !!aa;
+      context.clearRect(0, 0, region.width, region.height);
+      context.save();
+      context.translate(x + dx - region.left, y + dy - region.top);
+      context.rotate(-angle);
+      context.fillStyle = fill;
+      context.fillText(text, 0, size * 0.8);
+      // Canvas has no portable strikeout/underline font flags.
+      const metrics = measured.metrics, line = Math.max(1, Math.ceil(size / 14));
+      if (font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
+      if (font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
+      context.restore();
+      return {
+        image: Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height),
+        left: region.left,
+        top: region.top,
+      };
+    };
+    if (shadowLevel) {
+      const shadow = draw(Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), `rgba(${sr},${sg},${sb},1)`);
+      if (shadow) {
+        const blurred = blurGlyphImage(shadow.image, shadowWidth, Math.abs(Math.trunc(shadowLevel)));
+        clipBlit(node, blurred.image, shadow.left + blurred.offsetX, shadow.top + blurred.offsetY, { opa, holdAlpha: !!node.holdAlpha });
+      }
+    }
+    const rendered = draw(0, 0, `rgba(${r},${g},${b},1)`);
+    if (rendered) {
+      if (!aa) for (let i = 3; i < rendered.image.pixels.length; i += 4) rendered.image.pixels[i] = rendered.image.pixels[i] >= 128 ? 255 : 0;
+      clipBlit(node, rendered.image, rendered.left, rendered.top, { opa, holdAlpha: !!node.holdAlpha });
+    }
+  };
+}
