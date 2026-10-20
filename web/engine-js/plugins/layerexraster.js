@@ -35,7 +35,7 @@ export function registerLayerExRaster({ get }) {
     const omega = 2 * Math.PI / lineCount;
     // The wave is centred on the source height and starts at the clip top.
     let rad = -omega * now / period * Math.trunc(srcImage.height / 2) + omega * clipTop;
-    const pixels = srcImage.pixels, target = dstImage.pixels;
+    const pixels = srcImage.pixels, target = dstImage.writablePixels;
     const srcPitch = srcImage.width * 4, dstPitch = dstImage.width * 4;
     for (let row = 0; row < clipHeight; row++, rad += omega) {
       const shift = Math.trunc(Math.sin(rad) * amplitude);

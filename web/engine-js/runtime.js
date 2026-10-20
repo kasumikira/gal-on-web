@@ -209,7 +209,7 @@ export async function createRuntime(options) {
         width: image?.width,
         height: image?.height,
         // GPU-only alpha remains unknown rather than forcing a readback.
-        alpha: image ? (image.gpu ? null : image.pixels.some((value, index) => index % 4 === 3 && value > 0)) : undefined,
+        alpha: image ? (image.cpuValid ? image.pixels.some((value, index) => index % 4 === 3 && value > 0) : null) : undefined,
       });
       const graphics = [];
       for (const node of nodes) {

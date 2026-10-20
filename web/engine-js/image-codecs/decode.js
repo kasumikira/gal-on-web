@@ -7,7 +7,7 @@ function grayscaleImage(image) {
 }
 
 function applyColorKey(image, key) {
-  const p = image.pixels;
+  const p = image.writablePixels;
   if (key === 0x01ffffff) {
     // GraphicsLoaderIntf.cpp TVPMakeAlphaFromAdaptiveColor.
     const colors = [];
@@ -45,14 +45,16 @@ async function decodeWithBrowser(bytes) {
 }
 
 function toImage(decoded, { gray = false } = {}) {
+  // Browser ImageData owns this fresh buffer; adopt it instead of allocating
+  // and copying the entire decoded RGBA image before the layer's own clone.
+  if (!gray) return new Image(decoded.width, decoded.height, { pixels: decoded.pixels });
   const image = new Image(decoded.width, decoded.height, { gray });
+  const pixels = image.writablePixels;
   if (gray) {
     // TVPBLConvert24BitTo8Bit: luma = (54*r + 183*g + 19*b) >> 8.
-    for (let i = 0, j = 0; j < image.pixels.length; i += 4, j++) {
-      image.pixels[j] = (decoded.pixels[i] * 54 + decoded.pixels[i + 1] * 183 + decoded.pixels[i + 2] * 19) >> 8;
+    for (let i = 0, j = 0; j < pixels.length; i += 4, j++) {
+      pixels[j] = (decoded.pixels[i] * 54 + decoded.pixels[i + 1] * 183 + decoded.pixels[i + 2] * 19) >> 8;
     }
-  } else {
-    image.pixels.set(decoded.pixels);
   }
   return image;
 }
@@ -266,6 +268,7 @@ function decodeTLG5(bytes) {
   const bufs = [new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16)];
   let prevRow = null;
   const upper = new Uint8Array(width * 4);
+  const pixels = image.writablePixels;
   for (let yblk = 0; yblk < height; yblk += blockheight) {
     for (let c = 0; c < colors; c++) {
       const mark = bytes[p++];
@@ -280,7 +283,7 @@ function decodeTLG5(bytes) {
     }
     const ylim = Math.min(yblk + blockheight, height);
     for (let y = yblk; y < ylim; y++) {
-      const row = image.pixels.subarray(y * width * 4, (y + 1) * width * 4);
+      const row = pixels.subarray(y * width * 4, (y + 1) * width * 4);
       const rowBufs = bufs.map(buf => buf.subarray((y - yblk) * width));
       if (prevRow) {
         if (colors === 3) tlg5ComposeColors3To4(row, prevRow, rowBufs, width);
@@ -527,6 +530,7 @@ function decodeTLG6(bytes, palettized = false) {
   const pixelbuf = new Uint8Array(width * H_BLOCK * 4 + 4);
   const zeroline = new Uint8Array(width * 4);
   if (colors === 3) for (let x = 0; x < width; x++) zeroline[x * 4 + 3] = 0xff;
+  const pixels = image.writablePixels;
   for (let y = 0; y < height; y += H_BLOCK) {
     const ylim = Math.min(y + H_BLOCK, height);
     const pixelCount = (ylim - y) * width;
@@ -542,10 +546,10 @@ function decodeTLG6(bytes, palettized = false) {
     const ftBase = (y / H_BLOCK) * xBlockCount;
     const skipbytes = (ylim - y) * W_BLOCK;
     for (let yy = y; yy < ylim; yy++) {
-      const curline = image.pixels.subarray(yy * width * 4, (yy + 1) * width * 4);
+      const curline = pixels.subarray(yy * width * 4, (yy + 1) * width * 4);
       const dir = (yy & 1) ^ 1;
       const oddskip = ((ylim - yy - 1) - (yy - y));
-      const up = yy === 0 ? null : image.pixels.subarray((yy - 1) * width * 4, yy * width * 4);
+      const up = yy === 0 ? null : pixels.subarray((yy - 1) * width * 4, yy * width * 4);
       decodeLine(curline, up ?? zeroline, width, xBlockCount, filterTypes, ftBase, skipbytes, pixelbuf, colors === 3 ? 0xff000000 : 0, oddskip, dir, yy - y);
     }
   }

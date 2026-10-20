@@ -1,6 +1,7 @@
 import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner } from '#krkr/native';
 import { number, truth, Closure } from '#krkr/values';
 import { Image, colorBytes, clamp255 } from './bitmap.js';
+import { getGPU } from './gpu.js';
 import { LRUCache } from 'lru-cache';
 
 export class FontState {
@@ -96,24 +97,34 @@ function retrievePrerenderedGlyph(font, glyph) {
   return output;
 }
 
-function clipErase(node, source, left, top, strength) {
+function textClipRect(node, source, left, top) {
   const clip = node.clip ?? { left: 0, top: 0, right: node.image.width, bottom: node.image.height };
-  const dx = Math.max(left, clip.left), dy = Math.max(top, clip.top);
-  const right = Math.min(left + source.width, clip.right), bottom = Math.min(top + source.height, clip.bottom);
-  if (right <= dx || bottom <= dy) return false;
+  const rect = {
+    left: Math.max(0, left, clip.left), top: Math.max(0, top, clip.top),
+    right: Math.min(node.image.width, left + source.width, clip.right),
+    bottom: Math.min(node.image.height, top + source.height, clip.bottom),
+  };
+  return rect.right <= rect.left || rect.bottom <= rect.top ? null : rect;
+}
+
+function clipErase(node, source, left, top, strength) {
+  const rect = textClipRect(node, source, left, top);
+  if (!rect) return false;
   strength = Math.max(0, Math.min(255, Math.trunc(Math.abs(strength))));
-  for (let sy = dy - top, y = dy; y < bottom; y++, sy++) for (let sx = dx - left, x = dx; x < right; x++, sx++) {
+  const destination = node.image.writablePixels;
+  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
     const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
     const coverage = source.pixels[si + 3];
-    node.image.pixels[di + 3] = Math.max(0, Math.trunc(node.image.pixels[di + 3] * (255 - coverage * strength / 255) / 255));
+    destination[di + 3] = Math.max(0, Math.trunc(destination[di + 3] * (255 - coverage * strength / 255) / 255));
   }
-  node.markImageModified({ left: dx, top: dy, right, bottom });
+  node.markImageModified(rect);
   return true;
 }
 
 function blendTextPixel(p, di, source, si, opa, face) {
   const coverage = Math.max(0, Math.min(255, Math.trunc(source[si + 3])));
   const opacity = Math.max(0, Math.min(255, Math.trunc(opa)));
+  if (coverage === 0 || opa === 0) return;
   if (opa < 0) {
     // bmAlphaOnAlpha + negative opacity selects RemoveOpacity in the native
     // renderer.  The source coverage is the removal mask; RGB is untouched.
@@ -150,19 +161,36 @@ function blendTextPixel(p, di, source, si, opa, face) {
   p[di + 3] = outAlpha;
 }
 
+export function clipBlitCPU(node, source, left, top, { opa = 255 } = {}) {
+  const face = node.drawFace ?? 0;
+  if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  if (opa === 0) return false;
+  if (opa < 0) return clipErase(node, source, left, top, opa);
+  const rect = textClipRect(node, source, left, top);
+  if (!rect) return false;
+  const destination = node.image.writablePixels;
+  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
+    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
+    blendTextPixel(destination, di, source.pixels, si, opa, face);
+  }
+  node.markImageModified(rect);
+  return true;
+}
+
 export function clipBlit(node, source, left, top, { opa = 255 } = {}) {
   const face = node.drawFace ?? 0;
   if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
-  if (opa < 0) return clipErase(node, source, left, top, opa);
-  const clip = node.clip ?? { left: 0, top: 0, right: node.image.width, bottom: node.image.height };
-  const dx = Math.max(left, clip.left), dy = Math.max(top, clip.top);
-  const right = Math.min(left + source.width, clip.right), bottom = Math.min(top + source.height, clip.bottom);
-  if (right <= dx || bottom <= dy) return false;
-  for (let sy = dy - top, y = dy; y < bottom; y++, sy++) for (let sx = dx - left, x = dx; x < right; x++, sx++) {
-    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
-    blendTextPixel(node.image.pixels, di, source.pixels, si, opa, face);
-  }
-  node.markImageModified({ left: dx, top: dy, right, bottom });
+  if (opa === 0) return false;
+  const rect = textClipRect(node, source, left, top);
+  if (!rect) return false;
+  const gpu = getGPU();
+  if (!gpu) throw new Error('GPU text compositing requires an initialized GPU renderer');
+  gpu.drawGlyph(node.image, source, left, top, {
+    mode: 100 + face,
+    opacity: opa,
+    clip: node.clip,
+  });
+  node.markImageModified(rect);
   return true;
 }
 
@@ -173,12 +201,13 @@ function prerenderedGlyphImage(font, glyph, color, aa) {
   // TVPToActualColor strips system-color markers and leaves RGB.  Text
   // opacity comes from the `opa` argument, so an ordinary 0xRRGGBB color is
   // fully opaque even though its high byte is zero.
+  const pixels = image.writablePixels;
   for (let i = 0; i < coverage.length; i++) {
     let alpha = coverage[i];
     if (!aa) alpha = alpha >= 128 ? 255 : 0;
     const p = i * 4;
-    image.pixels[p] = r; image.pixels[p + 1] = g; image.pixels[p + 2] = b;
-    image.pixels[p + 3] = alpha;
+    pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b;
+    pixels[p + 3] = alpha;
   }
   return image;
 }
@@ -249,7 +278,8 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
   if (!radius) {
     if (blurLevel === 255) return { image: source, offsetX: 0, offsetY: 0 };
     const image = source.clone();
-    for (let i = 3; i < image.pixels.length; i += 4) image.pixels[i] = Math.min(255, (image.pixels[i] * blurLevel) >> 8);
+    const pixels = image.writablePixels;
+    for (let i = 3; i < pixels.length; i += 4) pixels[i] = Math.min(255, (pixels[i] * blurLevel) >> 8);
     return { image, offsetX: 0, offsetY: 0 };
   }
   const hypot = (x, y) => {
@@ -266,6 +296,7 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
   const levelScale = Math.trunc((1 << 18) / total);
   const weightedKernel = kernel.map(([x, y, weight]) => [x, y, Math.trunc(weight * levelScale * blurLevel / 256)]);
   const image = new Image(source.width + radius * 2, source.height + radius * 2);
+  const pixels = image.writablePixels;
   let hasActive = false;
   let minX = source.width, minY = source.height, maxX = -1, maxY = -1;
   for (let i = 3; i < source.pixels.length; i += 4) {
@@ -286,7 +317,7 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
       for (const [ox, oy, kernelLevel] of weightedKernel) {
         const dst = ((sy + oy + radius) * image.width + sx + ox + radius) * 4 + 3;
         const contribution = Math.trunc(sourceAlpha * kernelLevel / (1 << 18));
-        image.pixels[dst] = Math.min(255, image.pixels[dst] + contribution);
+        pixels[dst] = Math.min(255, pixels[dst] + contribution);
       }
     }
   }
@@ -300,9 +331,9 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
       const sx = x - ox - radius, sy = y - oy - radius;
       if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue;
       const src = (sy * source.width + sx) * 4;
-      image.pixels[dst] = source.pixels[src];
-      image.pixels[dst + 1] = source.pixels[src + 1];
-      image.pixels[dst + 2] = source.pixels[src + 2];
+      pixels[dst] = source.pixels[src];
+      pixels[dst + 1] = source.pixels[src + 1];
+      pixels[dst + 2] = source.pixels[src + 2];
       break;
     }
   }
@@ -355,16 +386,16 @@ function textCanvasRegion(node, bounds) {
   return { left, top, width: right - left, height: bottom - top };
 }
 
-function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0, offsetX = 0, offsetY = 0, angle = 0, blurLevel = 255) {
+function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0, offsetX = 0, offsetY = 0, angle = 0, blurLevel = 255, aa = true) {
   if (!glyphs.length) return false;
   if (!document?.createElement) throw new Error('TJS prerendered font fallback requires a browser canvas');
   blurLevel = Math.max(0, Math.min(255, Math.abs(Math.trunc(blurLevel))));
-  // Horizontal text takes the cached per-character path: each character is
-  // rasterised once per (font, colour, blur) and then blitted, instead of
-  // re-rasterising the whole line on every repaint.
+  // Horizontal text takes the cached per-character path; rotated fallback
+  // text remains a single run so its existing rasterization and blur semantics
+  // are unchanged.
   if (!angle) {
     for (const item of glyphs) {
-      const entry = fallbackGlyphVariant(cache, document, node, item.character, color, shadowWidth, blurLevel);
+      const entry = fallbackGlyphVariant(cache, document, node, item.character, color, shadowWidth, blurLevel, aa);
       if (!entry) continue;
       clipBlit(node, entry.image, item.x + offsetX + entry.left, item.y + offsetY + entry.top, { opa, holdAlpha: !!node.holdAlpha });
     }
@@ -394,8 +425,8 @@ function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0
     context.rotate(-angle);
     context.fillText(item.character, 0, size * 0.8);
     const metrics = context.measureText(item.character), line = Math.max(1, Math.ceil(size / 14));
-    if (node.font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
-    if (node.font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
+    if (flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
+    if (flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
     context.restore();
   }
   const source = Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height);
@@ -405,7 +436,7 @@ function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0
 
 // One browser-rasterised character, positioned by its own bounding box. The
 // caller blits it at `left`/`top` relative to the pen position.
-function renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel) {
+function renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel, aa = true, angle = 0) {
   const size = Math.abs(node.font.height) | 0;
   const flags = node.font.flags;
   const canvas = document.createElement('canvas');
@@ -415,8 +446,12 @@ function renderFallbackGlyph(document, node, character, color, shadowWidth, blur
   const measured = measuredTextBounds(context, character, size, flags);
   let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
   for (const [l, t, r, b] of measured.boxes) {
-    left = Math.min(left, l); top = Math.min(top, t);
-    right = Math.max(right, r); bottom = Math.max(bottom, b);
+    for (const [px, py] of [[l, t], [r, t], [l, b], [r, b]]) {
+      const rx = Math.cos(angle) * px + Math.sin(angle) * py;
+      const ry = -Math.sin(angle) * px + Math.cos(angle) * py;
+      left = Math.min(left, rx); top = Math.min(top, ry);
+      right = Math.max(right, rx); bottom = Math.max(bottom, ry);
+    }
   }
   if (!Number.isFinite(left) || right <= left || bottom <= top) return null;
   const pad = Math.abs(Math.trunc(shadowWidth)) + 2;
@@ -429,19 +464,35 @@ function renderFallbackGlyph(document, node, character, color, shadowWidth, blur
   const [r, g, b] = colorBytes(color);
   context.fillStyle = `rgba(${r},${g},${b},1)`;
   context.translate(-originX, -originY);
+  context.rotate(-angle);
   context.fillText(character, 0, size * 0.8);
   const metrics = context.measureText(character), line = Math.max(1, Math.ceil(size / 14));
   if (flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
   if (flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
   const source = Image.from(context.getImageData(0, 0, width, height).data, width, height);
+  if (!aa) {
+    const pixels = source.writablePixels;
+    for (let i = 3; i < pixels.length; i += 4) pixels[i] = pixels[i] >= 128 ? 255 : 0;
+  }
   const blurred = blurGlyphImage(source, shadowWidth, blurLevel);
   return { image: blurred.image, left: originX + blurred.offsetX, top: originY + blurred.offsetY };
 }
 
-function fallbackGlyphVariant(cache, document, node, character, color, shadowWidth, blurLevel) {
-  const key = `${String(node.font.face)}|${node.font.height}|${node.font.flags}|${character}|${color}|${shadowWidth}|${blurLevel}`;
+function fallbackGlyphVariant(cache, document, node, character, color, shadowWidth, blurLevel, aa = true, angle = 0) {
+  const key = `${String(node.font.face)}|${node.font.height}|${node.font.flags}|${character}|${color}|${aa ? 1 : 0}|${shadowWidth}|${blurLevel}|${angle}`;
   return cachedGlyph(cache, `fallback|${key}`,
-    () => renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel));
+    () => renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel, aa, angle));
+}
+
+function browserGlyphPositions(context, text, x, y, angle) {
+  const glyphs = [];
+  let prefix = '';
+  for (const character of text) {
+    const advance = prefix ? context.measureText(prefix).width : 0;
+    glyphs.push({ character, x: x + Math.cos(angle) * advance, y: y - Math.sin(angle) * advance });
+    prefix += character;
+  }
+  return glyphs;
 }
 
 // TVPGetCharacter uses the mapped glyph's bitmap and advances by IncX/IncY.
@@ -666,52 +717,63 @@ export function createTextRenderer(document) {
   const drawText = function drawText(node, x, y, text, color, opa, aa = true, shadowLevel = 0, shadowColor = 0, shadowWidth = 0, shadowOfsx = 0, shadowOfsy = 0) {
     opa = normalizeTextOpacity(node, opa);
     if (opa === 0) return;
+    const gpu = getGPU();
+    gpu?.beginTextBatch(node.image);
+    try {
     if (drawPrerenderedText(glyphCache, document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy)) return;
-    const [r, g, b] = colorBytes(color), [sr, sg, sb] = colorBytes(shadowColor);
     const canvas = textCanvas ??= document.createElement('canvas');
     const context = canvas.getContext('2d', { willReadFrequently: true });
     const font = node.font, size = Math.abs(font.height) | 0;
     const fontSpec = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
     context.font = fontSpec;
     const angle = (font.angle || 0) * Math.PI / 1800;
-    const measured = measuredTextBounds(context, text, size, font.flags);
-    const draw = (dx, dy, fill) => {
+    const glyphs = browserGlyphPositions(context, text, x, y, angle);
+    const drawRun = (dx, dy, drawColor, blurWidth = 0, blurLevel = 255, threshold = false) => {
+      const measured = measuredTextBounds(context, text, size, font.flags);
       const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
       addRotatedTextBounds(bounds, measured, x + dx, y + dy, angle);
       const region = textCanvasRegion(node, bounds);
-      if (!region) return null;
-      if (canvas.width !== region.width) canvas.width = region.width;
-      if (canvas.height !== region.height) canvas.height = region.height;
-      context.font = fontSpec;
-      context.imageSmoothingEnabled = !!aa;
-      context.clearRect(0, 0, region.width, region.height);
-      context.save();
-      context.translate(x + dx - region.left, y + dy - region.top);
-      context.rotate(-angle);
-      context.fillStyle = fill;
-      context.fillText(text, 0, size * 0.8);
-      // Canvas has no portable strikeout/underline font flags.
-      const metrics = measured.metrics, line = Math.max(1, Math.ceil(size / 14));
-      if (font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
-      if (font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
-      context.restore();
-      return {
-        image: Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height),
-        left: region.left,
-        top: region.top,
-      };
+      if (!region) return false;
+      const key = `run|${JSON.stringify([font.face, font.height, font.flags, text, drawColor, aa, angle,
+        x + dx - region.left, y + dy - region.top, region.width, region.height, blurWidth, blurLevel, threshold])}`;
+      const entry = cachedGlyph(glyphCache, key, () => {
+        if (canvas.width !== region.width) canvas.width = region.width;
+        if (canvas.height !== region.height) canvas.height = region.height;
+        context.font = fontSpec;
+        context.imageSmoothingEnabled = !!aa;
+        context.clearRect(0, 0, region.width, region.height);
+        context.save();
+        context.translate(x + dx - region.left, y + dy - region.top);
+        context.rotate(-angle);
+        const [r, g, b] = colorBytes(drawColor);
+        context.fillStyle = `rgba(${r},${g},${b},1)`;
+        context.fillText(text, 0, size * 0.8);
+        const metrics = measured.metrics, line = Math.max(1, Math.ceil(size / 14));
+        if (font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
+        if (font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
+        context.restore();
+        const image = Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height);
+        if (threshold) {
+          const pixels = image.writablePixels;
+          for (let i = 3; i < pixels.length; i += 4) pixels[i] = pixels[i] >= 128 ? 255 : 0;
+        }
+        const blurred = blurGlyphImage(image, blurWidth, blurLevel);
+        return { image: blurred.image, left: region.left + blurred.offsetX - x - dx, top: region.top + blurred.offsetY - y - dy };
+      });
+      if (!entry) return false;
+      clipBlit(node, entry.image, x + dx + entry.left, y + dy + entry.top, { opa, holdAlpha: !!node.holdAlpha });
+      return true;
     };
-    if (shadowLevel) {
-      const shadow = draw(Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), `rgba(${sr},${sg},${sb},1)`);
-      if (shadow) {
-        const blurred = blurGlyphImage(shadow.image, shadowWidth, Math.abs(Math.trunc(shadowLevel)));
-        clipBlit(node, blurred.image, shadow.left + blurred.offsetX, shadow.top + blurred.offsetY, { opa, holdAlpha: !!node.holdAlpha });
-      }
-    }
-    const rendered = draw(0, 0, `rgba(${r},${g},${b},1)`);
-    if (rendered) {
-      if (!aa) for (let i = 3; i < rendered.image.pixels.length; i += 4) rendered.image.pixels[i] = rendered.image.pixels[i] >= 128 ? 255 : 0;
-      clipBlit(node, rendered.image, rendered.left, rendered.top, { opa, holdAlpha: !!node.holdAlpha });
+    // The browser fallback historically rasterized and blurred the entire
+    // string as one mask. Keep that shadow algorithm intact and cache the run
+    // variant; only ordinary horizontal body glyphs use the per-glyph cache.
+    if (shadowLevel) drawRun(Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), shadowColor,
+      shadowWidth, Math.abs(Math.trunc(shadowLevel)));
+    if (angle === 0 && !(font.flags & (0x0400 | 0x0800))) {
+      drawFallback(glyphCache, document, node, glyphs, color, opa, 0, 0, 0, angle, 255, !!aa);
+    } else drawRun(0, 0, color, 0, 255, !aa);
+    } finally {
+      gpu?.endTextBatch(node.image);
     }
   };
   drawText.finalize = () => glyphCache.clear();

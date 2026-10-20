@@ -1,4 +1,5 @@
 import { mat2d } from 'gl-matrix';
+import { Image } from './bitmap.js';
 
 // All image storage is straight RGBA8, including RGB underneath zero alpha.
 // Only presentation converts to premultiplied colour for the browser.
@@ -20,8 +21,16 @@ precision highp float;
 uniform vec2 targetSize;
 uniform vec4 sourceRect;
 uniform mat3 transform;
+uniform int glyphBatch;
+layout(location = 0) in vec2 glyphPosition;
+layout(location = 1) in vec2 glyphSourcePoint;
 out vec2 sourcePoint;
 void main() {
+  if (glyphBatch != 0) {
+    sourcePoint = glyphSourcePoint;
+    gl_Position = vec4(glyphPosition / targetSize * 2.0 - 1.0, 0, 1);
+    return;
+  }
   vec2 corners[6] = vec2[6](vec2(0,0),vec2(1,0),vec2(0,1),vec2(0,1),vec2(1,0),vec2(1,1));
   sourcePoint = mix(sourceRect.xy, sourceRect.zw, corners[gl_VertexID]);
   vec2 point = (transform * vec3(sourcePoint,1)).xy;
@@ -413,6 +422,57 @@ uint psVariant(uint d, uint s, uint opa, bool hold) {
   return hold ? ((r & 0x00ffffffu) | (d & 0xff000000u)) : r;
 }
 
+// Layer.drawText blends each glyph's coverage with the destination through the
+// draw face's function. The three faces are the reference's text blit selection
+// (bmAlphaOnAlpha / bmAlpha / bmAlphaOnAddAlpha) and are ported verbatim; the
+// draw mode encodes them as 100 + face.
+uint packText(int r, int g, int b, int a) {
+  return (uint(clamp(a, 0, 255)) << 24u) | (uint(clamp(r, 0, 255)) << 16u)
+    | (uint(clamp(g, 0, 255)) << 8u) | uint(clamp(b, 0, 255));
+}
+uint textBlend(uint d, uint s, int opacity, uint face) {
+  uint coverage = s >> 24u;
+  if (opacity < 0) {
+    uint strength = min(uint(-opacity), 255u);
+    uint remain = 65025u - coverage * strength;
+    uint alpha = (d >> 24u) * remain / 65025u;
+    return (d & 0x00ffffffu) | (alpha << 24u);
+  }
+  if (opacity == 0 || coverage == 0u) return d;
+  int alpha = (int(coverage) * opacity) >> 8;
+  int dr = int((d >> 16u) & 255u), dg = int((d >> 8u) & 255u), db = int(d & 255u);
+  int sr = int((s >> 16u) & 255u), sg = int((s >> 8u) & 255u), sb = int(s & 255u);
+  int destAlpha = int(d >> 24u);
+  if (face == 4u) {
+    // bmAlphaOnAddAlpha: additive alpha on both planes.
+    int inverse = 255 - alpha;
+    int unionAlpha = alpha + destAlpha - ((destAlpha * alpha) >> 8);
+    return packText(
+      min(255, ((dr * inverse) >> 8) + ((sr * alpha) >> 8)),
+      min(255, ((dg * inverse) >> 8) + ((sg * alpha) >> 8)),
+      min(255, ((db * inverse) >> 8) + ((sb * alpha) >> 8)),
+      unionAlpha - (unionAlpha >> 8));
+  }
+  if (face == 1u) {
+    // bmAlpha: colour is interpolated, the destination alpha is retained.
+    return packText((dr * 256 + (sr - dr) * int(alpha)) / 256,
+      (dg * 256 + (sg - dg) * int(alpha)) / 256,
+      (db * 256 + (sb - db) * int(alpha)) / 256, destAlpha);
+  }
+  // bmAlphaOnAlpha: source-over in straight RGB with the destination alpha in
+  // the colour ratio.
+  int alphaInt = int(alpha);
+  int outAlpha = 255 - ((255 - alphaInt) * (255 - destAlpha)) / 255;
+  int ratio = 255;
+  if (destAlpha != 0) {
+    uint denominator = uint((255 - alphaInt) * destAlpha + 255 * alphaInt);
+    ratio = int((65025u * uint(alphaInt)) / denominator);
+  }
+  return packText((dr * 256 + (sr - dr) * ratio) / 256,
+    (dg * 256 + (sg - dg) * ratio) / 256,
+    (db * 256 + (sb - db) * ratio) / 256, outAlpha);
+}
+
 // LayerBitmapIntf::PartialBlt dispatch for the source layer's operation mode.
 uint blendPixel(uint d, uint s) {
   uint bits = uint(policy);
@@ -421,9 +481,11 @@ uint blendPixel(uint d, uint s) {
   bool additive = (bits & POLICY_ADDITIVE) != 0u;
   bool copyAlpha = (bits & POLICY_COPY_ALPHA) != 0u;
   if ((bits & POLICY_IGNORE_ALPHA) != 0u || opaque) s |= 0xff000000u;
+  int m = mode;
+  // Text draw faces are dispatched before the layer operation modes.
+  if (m >= 100 && m <= 104) return textBlend(d, s, opacity, uint(m - 100));
   uint opa = uint(opacity);
   if (opa == 0u) return d;
-  int m = mode;
   if (m == 1) {
     if (destAlpha && !copyAlpha) {
       if (opa == 255u) return s | 0xff000000u;
@@ -752,6 +814,55 @@ function createTables(gl) {
   return texture;
 }
 
+// Glyphs are rasterised once (the reference keeps a 1-byte coverage bitmap per
+// character) and packed into a shared RGBA atlas, so text drawing is textured
+// quads on the GPU instead of read-modify-write on the CPU bitmap.
+class GlyphAtlas {
+  constructor(device, size = 2048) {
+    this.device = device;
+    this.size = size;
+    this.image = new Image(size, size, { defer: true });
+    this.x = 0;
+    this.y = 0;
+    this.row = 0;
+  }
+  entry() {
+    const entry = this.device.texture(this.image, true);
+    if (!entry.glyphAtlas) {
+      entry.glyphAtlas = true;
+      this.device.glyphAtlasCount++;
+      this.device.glyphAtlasBytes += entry.width * entry.height * 4;
+    }
+    return entry;
+  }
+  // Shelf packing: glyphs advance left to right, rows grow downwards. A full
+  // atlas returns null and the caller starts a new one (cached glyphs keep a
+  // reference to the atlas they were packed into).
+  add(width, height, pixels) {
+    if (width > this.size || height > this.size) return null;
+    if (this.x + width > this.size) {
+      this.x = 0;
+      this.y += this.row + 1;
+      this.row = 0;
+    }
+    if (this.y + height > this.size) return null;
+    const left = this.x, top = this.y;
+    const entry = this.entry();
+    const gl = this.device.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, left, top, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    this.device.commit(this.image, entry);
+    this.device.stats.uploads++;
+    this.device.stats.uploadedBytes += pixels.byteLength;
+    this.device.stats.glyphUploads++;
+    this.device.stats.glyphUploadedBytes += pixels.byteLength;
+    this.x += width + 1;
+    this.row = Math.max(this.row, height);
+    return { left, top, right: left + width, bottom: top + height };
+  }
+}
+
 class GPUDevice {
   constructor(document) {
     this.canvas = new OffscreenCanvas(1, 1);
@@ -762,12 +873,14 @@ class GPUDevice {
     this.canvas.addEventListener('webglcontextlost', this.onLost);
     this.program = this.compile(VERTEX, FRAGMENT);
     gl.useProgram(this.program);
+    this.glyphBuffer = gl.createBuffer();
     gl.disable(gl.BLEND);
     gl.disable(gl.DITHER);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     this.locations = new Map();
     this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    this.stats = { uploads: 0, uploadedBytes: 0, readbacks: 0, readbackBytes: 0, draws: 0 };
+    this.stats = { uploads: 0, uploadedBytes: 0, glyphUploads: 0, glyphUploadedBytes: 0,
+      readbacks: 0, readbackBytes: 0, snapshots: 0, textGlyphs: 0, textDraws: 0, draws: 0 };
     this.tables = createTables(gl);
     // Like tTVPOGLTexture2D, a bitmap owns its resident texture. Active render
     // targets cannot be evicted: preserving them would require a GPU readback.
@@ -775,6 +888,11 @@ class GPUDevice {
     this.textures = new WeakMap();
     this.imageTextures = new Set();
     this.textureBytes = 0;
+    this.glyphAtlasCount = 0;
+    this.glyphAtlasBytes = 0;
+    this.glyphImages = new WeakMap();
+    this.textBatches = new Map();
+    this.pendingTextReadbacks = new Set();
     this.textureFinalizer = new FinalizationRegistry(entry => this.releaseTexture(entry));
     this.scratch = null;
     this.presenters = new WeakMap();
@@ -818,7 +936,7 @@ class GPUDevice {
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU framebuffer is incomplete');
       this.framebufferValidated = true;
     }
-    return { device: this, texture, framebuffer, width, height, modified: false, filter: gl.NEAREST };
+    return { device: this, texture, framebuffer, width, height, filter: gl.NEAREST };
   }
   texture(image, discard = false) {
     if (this.lost) throw new Error('WebGL context was lost; reload the game');
@@ -836,8 +954,13 @@ class GPUDevice {
       this.textureBytes += entry.width * entry.height * 4;
       this.textureFinalizer.register(image, entry, entry);
     }
-    if (!discard && (image.gpu !== entry || image.externallyWritable)) {
-      const pixels = '_pixels' in image ? image._pixels : image.pixels;
+    const externalWritePending = image.externallyWritable && !this.textBatches.has(image);
+    // An exported writable view can change without an Image method call.
+    // At the next GPU use, explicitly enter the CPU-write contract.
+    if (externalWritePending) image.markCPUWritten();
+    if (!discard && !image.gpuValid) {
+      if (!image.cpuValid) throw new Error('Image has no authoritative source');
+      const pixels = image._pixels;
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, entry.texture);
       if (pixels) {
@@ -850,17 +973,42 @@ class GPUDevice {
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
-      entry.modified = false;
+      image.gpuValid = true;
     }
     image.gpu = entry;
     return entry;
   }
+  moveImageStorage(targetImage, sourceImage) {
+    const previous = this.textures.get(targetImage);
+    if (previous) this.releaseTexture(previous);
+    this.textures.delete(targetImage);
+    const entry = this.textures.get(sourceImage);
+    if (entry) {
+      this.textures.delete(sourceImage);
+      this.textureFinalizer.unregister(entry);
+      entry.image = new WeakRef(targetImage);
+      this.textures.set(targetImage, entry);
+      this.textureFinalizer.register(targetImage, entry, entry);
+    }
+    targetImage.gpu = sourceImage.gpu;
+    targetImage.gpuValid = sourceImage.gpuValid;
+    sourceImage.gpu = null;
+    sourceImage.gpuValid = false;
+  }
   releaseTexture(entry) {
     const image = entry.image.deref();
-    if (image?.gpu === entry) image.gpu = null;
+    if (image?.gpu === entry) {
+      image.gpu = null;
+      image.gpuValid = false;
+    }
+    if (image && this.textures.get(image) === entry) this.textures.delete(image);
     this.textureFinalizer.unregister(entry);
     this.imageTextures.delete(entry);
     this.textureBytes -= entry.width * entry.height * 4;
+    if (entry.glyphAtlas) {
+      this.glyphAtlasCount--;
+      this.glyphAtlasBytes -= entry.width * entry.height * 4;
+    }
     this.gl.deleteFramebuffer(entry.framebuffer);
     this.gl.deleteTexture(entry.texture);
   }
@@ -888,6 +1036,7 @@ class GPUDevice {
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, target.framebuffer);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.scratch.framebuffer);
     gl.blitFramebuffer(rect.left, rect.top, rect.right, rect.bottom, rect.left, rect.top, rect.right, rect.bottom, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    this.stats.snapshots++;
     return this.scratch;
   }
   bind(entry, unit, uniform) {
@@ -933,6 +1082,7 @@ class GPUDevice {
     this.uniform('blurBottom', 'uniform1i', 0);
     this.uniform('blurAlpha', 'uniform1i', 0);
     this.uniform('targetSize', 'uniform2f', target.width, target.height);
+    this.uniform('glyphBatch', 'uniform1i', 0);
     this.uniform('sourceRect', 'uniform4f', rect.left, rect.top, rect.right, rect.bottom);
     this.uniform('transform', 'uniformMatrix3fv', false, [matrix[0], matrix[1], 0, matrix[2], matrix[3], 0, matrix[4], matrix[5], 1]);
   }
@@ -954,8 +1104,10 @@ class GPUDevice {
     } = options;
     const clip = this.clip(targetImage, options.clip);
     if (sourceRect.right <= sourceRect.left || sourceRect.bottom <= sourceRect.top) return;
-    // LayerBitmapIntf::Blt returns before any primitive at opacity zero.
-    if (opacity <= 0) return;
+    const textMode = mode >= 100 && mode <= 104;
+    // Ordinary blits reject non-positive opacity. Text uses negative opacity
+    // for RemoveOpacity, while zero remains a no-op.
+    if (opacity === 0 || opacity < 0 && !textMode) return;
     const corners = [
       [sourceRect.left, sourceRect.top],
       [sourceRect.right, sourceRect.top],
@@ -970,6 +1122,26 @@ class GPUDevice {
     clip.bottom = Math.min(clip.bottom, Math.ceil(Math.max(...ys)));
     if (clip.right <= clip.left || clip.bottom <= clip.top) return;
     const source = this.texture(sourceImage), target = this.texture(targetImage);
+    // CopyRect's full-channel integer translation does not read destination
+    // pixels. Blit it directly instead of snapshotting and running the blend
+    // shader; self-copies still use the existing snapshot path.
+    if (sourceImage !== targetImage && mode === 1 && copySourceAlpha && opacity === 255
+      && !holdAlpha && !maskOnly && !ignoreSourceAlpha && !opaque && !motion && !smooth
+      && matrix[0] === 1 && matrix[1] === 0 && matrix[2] === 0 && matrix[3] === 1
+      && Number.isInteger(matrix[4]) && Number.isInteger(matrix[5])) {
+      const left = clip.left - matrix[4], top = clip.top - matrix[5];
+      const right = clip.right - matrix[4], bottom = clip.bottom - matrix[5];
+      if (left >= 0 && top >= 0 && right <= source.width && bottom <= source.height) {
+        const gl = this.gl;
+        gl.disable(gl.SCISSOR_TEST);
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source.framebuffer);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, target.framebuffer);
+        gl.blitFramebuffer(left, top, right, bottom, clip.left, clip.top, clip.right, clip.bottom, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+        this.stats.draws++;
+        this.commit(targetImage, target);
+        return;
+      }
+    }
     const filter = smooth ? this.gl.LINEAR : this.gl.NEAREST;
     if (source.filter !== filter) {
       const gl = this.gl;
@@ -978,7 +1150,13 @@ class GPUDevice {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
       source.filter = filter;
     }
-    const destination = this.snapshot(target, sourceImage === targetImage ? this.clip(targetImage) : clip);
+    // Full-opacity copies and opaque normal compositing overwrite the target.
+    // They do not need its previous contents. Keep snapshots for self-draws
+    // and all blends that actually depend on destination colour or alpha.
+    const overwrite = !maskOnly && !holdAlpha && opacity === 255 && (
+      !motion && mode === 1 && copySourceAlpha || motion && opaque && mode === 0);
+    const destination = sourceImage !== targetImage && overwrite
+      ? source : this.snapshot(target, sourceImage === targetImage ? this.clip(targetImage) : clip);
     const inverse = mat2d.invert(new Float64Array(6), matrix);
     if (!inverse) return;
     this.setup(target, sourceImage === targetImage ? destination : source, clip, [1,0,0,1,0,0], clip, destination);
@@ -1000,20 +1178,169 @@ class GPUDevice {
     this.commit(targetImage, target);
   }
   commit(image, entry) {
-    entry.modified = true;
+    image.gpu = entry;
+    image.markGPUWritten();
     if (image.externallyWritable) {
-      const pixels = this.read(entry);
-      if (image._pixels) image._pixels.set(pixels); else image._pixels = pixels;
-      image.gpu = null;
+      if (this.textBatches.has(image)) this.pendingTextReadbacks.add(image);
+      else this.syncExternalImage(image);
     }
   }
-  clip(image, rect = { left: 0, top: 0, right: image.width, bottom: image.height }) {
+  beginTextBatch(image) {
+    if (!this.textBatches.has(image) && image.externallyWritable) this.texture(image);
+    const batch = this.textBatches.get(image);
+    if (batch) batch.depth++;
+    else this.textBatches.set(image, { depth: 1, commands: [] });
+  }
+  endTextBatch(image) {
+    const batch = this.textBatches.get(image);
+    if (!batch) throw new Error('GPU text batch is not active');
+    if (batch.depth > 1) {
+      batch.depth--;
+      return;
+    }
+    this.drawGlyphBatch(image, batch.commands);
+    this.textBatches.delete(image);
+    if (this.pendingTextReadbacks.delete(image) && !image.cpuValid) {
+      this.syncExternalImage(image);
+    }
+  }
+  syncExternalImage(image) {
+    // The CPU view is now current too; the GPU copy remains authoritative.
+    image.materialize();
+  }
+  clip(image, rect = null) {
+    rect ??= { left: 0, top: 0, right: image.width, bottom: image.height };
     return {
       left: Math.max(0, Math.floor(rect.left)),
       top: Math.max(0, Math.floor(rect.top)),
       right: Math.min(image.width, Math.ceil(rect.right)),
       bottom: Math.min(image.height, Math.ceil(rect.bottom))
     };
+  }
+  atlas() {
+    return this.glyphAtlas ??= new GlyphAtlas(this);
+  }
+  // Packs one rasterised glyph (RGBA, colour already applied) and returns the
+  // atlas plus its rectangle.
+  addGlyph(width, height, pixels) {
+    let atlas = this.atlas();
+    let rect = atlas.add(width, height, pixels);
+    if (!rect) {
+      atlas = this.glyphAtlas = new GlyphAtlas(this);
+      rect = atlas.add(width, height, pixels);
+    }
+    if (!rect) throw new Error(`GPU glyph atlas is too small for ${width}x${height}`);
+    return { atlas, rect };
+  }
+  glyph(image) {
+    let glyph = this.glyphImages.get(image);
+    if (glyph) return glyph;
+    const pixels = image.pixels;
+    let left = image.width, top = image.height, right = 0, bottom = 0;
+    for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+      if (!pixels[(y * image.width + x) * 4 + 3]) continue;
+      left = Math.min(left, x); top = Math.min(top, y);
+      right = Math.max(right, x + 1); bottom = Math.max(bottom, y + 1);
+    }
+    glyph = right <= left || bottom <= top
+      ? { atlas: null, rect: null, bounds: null }
+      : { ...this.addGlyph(image.width, image.height, pixels), bounds: { left, top, right, bottom } };
+    this.glyphImages.set(image, glyph);
+    return glyph;
+  }
+  // Collect rasterized glyphs until the text call ends. Nonoverlapping glyph
+  // quads can share one destination snapshot and draw submission; intersecting
+  // quads are flushed in order so the reference blend result is preserved.
+  drawGlyph(targetImage, glyph, left, top, options = {}) {
+    const batch = this.textBatches.get(targetImage);
+    if (batch) {
+      batch.commands.push({ source: glyph?.rect ? null : glyph, glyph: glyph?.rect ? glyph : null, left, top, options });
+      return true;
+    }
+    if (!glyph?.rect) glyph = this.glyph(glyph);
+    if (!glyph.rect) return false;
+    const { rect } = glyph;
+    return this.draw(targetImage, glyph.atlas.image, {
+      ...options,
+      sourceRect: rect,
+      matrix: [1, 0, 0, 1, left - rect.left, top - rect.top],
+    });
+  }
+  drawGlyphBatch(targetImage, commands) {
+    this.stats.textGlyphs += commands.length;
+    let group = null;
+    const overlaps = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+    const flush = () => {
+      if (!group) return;
+      const { atlas, mode, opacity, quads, bounds } = group;
+      const clip = {
+        left: Math.max(0, Math.floor(bounds.left)), top: Math.max(0, Math.floor(bounds.top)),
+        right: Math.min(targetImage.width, Math.ceil(bounds.right)), bottom: Math.min(targetImage.height, Math.ceil(bounds.bottom)),
+      };
+      if (clip.right <= clip.left || clip.bottom <= clip.top) { group = null; return; }
+      const source = this.texture(atlas.image), target = this.texture(targetImage);
+      const destination = this.snapshot(target, clip), gl = this.gl;
+      this.setup(target, source, { left: 0, top: 0, right: atlas.size, bottom: atlas.size }, [1, 0, 0, 1, 0, 0], clip, destination);
+      this.uniform('glyphBatch', 'uniform1i', 1);
+      this.uniform('operation', 'uniform1i', 0);
+      this.uniform('mode', 'uniform1i', mode);
+      this.uniform('opacity', 'uniform1i', opacity);
+      this.uniform('opaque', 'uniform1i', 0);
+      this.uniform('policy', 'uniform1i', 0);
+      this.uniform('explicitCoverage', 'uniform1i', 0);
+      this.uniform('smoothSampling', 'uniform1i', 0);
+      const vertices = new Float32Array(quads.length * 6 * 4);
+      let offset = 0;
+      for (const quad of quads) {
+        const { bounds: b, source: s } = quad;
+        const u0 = quad.entry.rect.left + s.left, v0 = quad.entry.rect.top + s.top;
+        const u1 = quad.entry.rect.left + s.right, v1 = quad.entry.rect.top + s.bottom;
+        for (const [x, y, u, v] of [
+          [b.left, b.top, u0, v0], [b.right, b.top, u1, v0], [b.left, b.bottom, u0, v1],
+          [b.left, b.bottom, u0, v1], [b.right, b.top, u1, v0], [b.right, b.bottom, u1, v1],
+        ]) {
+          vertices[offset++] = x; vertices[offset++] = y; vertices[offset++] = u; vertices[offset++] = v;
+        }
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.glyphBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STREAM_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+      gl.drawArrays(gl.TRIANGLES, 0, vertices.length / 4);
+      this.stats.draws++;
+      this.stats.textDraws++;
+      this.commit(targetImage, target);
+      group = null;
+    };
+    for (const command of commands) {
+      const entry = command.glyph ?? this.glyph(command.source);
+      if (!entry.bounds) continue;
+      const clip = this.clip(targetImage, command.options.clip);
+      const source = entry.bounds;
+      const bounds = {
+        left: Math.max(command.left + source.left, clip.left),
+        top: Math.max(command.top + source.top, clip.top),
+        right: Math.min(command.left + source.right, clip.right),
+        bottom: Math.min(command.top + source.bottom, clip.bottom),
+      };
+      if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) continue;
+      const mode = command.options.mode ?? 2, opacity = command.options.opacity ?? 255;
+      const canJoin = group && group.atlas === entry.atlas && group.mode === mode && group.opacity === opacity
+        && group.quads.every(quad => !overlaps(quad.bounds, bounds));
+      if (!canJoin) flush();
+      if (!group) group = { atlas: entry.atlas, mode, opacity, quads: [], bounds: { ...bounds } };
+      group.quads.push({ entry, bounds, source: {
+        left: bounds.left - command.left, top: bounds.top - command.top,
+        right: bounds.right - command.left, bottom: bounds.bottom - command.top,
+      } });
+      group.bounds.left = Math.min(group.bounds.left, bounds.left);
+      group.bounds.top = Math.min(group.bounds.top, bounds.top);
+      group.bounds.right = Math.max(group.bounds.right, bounds.right);
+      group.bounds.bottom = Math.max(group.bounds.bottom, bounds.bottom);
+    }
+    flush();
   }
   fill(image, rect, rgba, maskOnly = false) {
     const clip = this.clip(image, rect);
@@ -1202,7 +1529,10 @@ class GPUDevice {
     // can block for an entire frame while exporting the WebGL drawing buffer.
     context.drawImage(this.canvas, 0, 0);
   }
-  diagnostics() { return { ...this.stats, textureBytes: this.textureBytes }; }
+  diagnostics() {
+    return { ...this.stats, textureBytes: this.textureBytes, textureCount: this.imageTextures.size,
+      glyphAtlasCount: this.glyphAtlasCount, glyphAtlasBytes: this.glyphAtlasBytes };
+  }
   stop() {}
   finalize() {
     for (const entry of this.imageTextures) this.releaseTexture(entry);

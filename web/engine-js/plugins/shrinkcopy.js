@@ -78,7 +78,7 @@ export function registerShrinkCopy({ get }) {
       const r1 = (y - diffY) * ratioY;
       rows.push(axisWeights(r1, r1 + ratioY, ssh));
     }
-    const pixels = srcImage.pixels, target = dstImage.pixels;
+    const pixels = srcImage.pixels, target = dstImage.writablePixels;
     const srcPitch = siw * 4, dstPitch = diw * 4, area = ratioX * ratioY;
     for (let y = 0; y < rows.length; y++) {
       const row = rows[y], dy = (dty + dsy + y) * dstPitch;
@@ -120,7 +120,7 @@ export function registerShrinkCopy({ get }) {
     const width = Math.ceil(siw / stepX), height = Math.ceil(sih / stepY);
     await callScript(nativeOwner(this), 'setImageSize', [width, height]);
     const dstImage = this.node.image;
-    const target = dstImage.pixels;
+    const target = dstImage.writablePixels;
     const srcPitch = siw * 4, dstPitch = dstImage.width * 4;
     const xGroups = Math.trunc(siw / stepX), xRemainder = siw - xGroups * stepX;
     const yGroups = Math.trunc(sih / stepY), yRemainder = sih - yGroups * stepY;

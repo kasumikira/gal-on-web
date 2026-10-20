@@ -44,46 +44,64 @@ export class Image {
       ? new Uint8ClampedArray(this.width * this.height)
       : new Uint8ClampedArray(this.width * this.height * 4)));
     this.gpu = null;
+    // Authority is independent of allocation/residency. A read adds a valid
+    // copy; a write invalidates only the other source. Deferred CPU storage
+    // represents the initial transparent-black image until first use.
+    this.cpuValid = true;
+    this.gpuValid = false;
   }
-  // CPU access makes the bytes authoritative; the next GPU use uploads them.
-  // GPU storage is reused by the device even after a CPU read/write cycle.
   get pixels() {
-    if (this.gpu) return this.materialize();
+    if (!this.cpuValid) {
+      if (!this.gpuValid) throw new Error('Image has no authoritative source');
+      const data = this.gpu.device.read(this.gpu);
+      if (this._pixels) this._pixels.set(data); else this._pixels = data;
+      this.cpuValid = true;
+    }
     return this._pixels ??= new Uint8ClampedArray(this.width * this.height * (this.gray ? 1 : 4));
+  }
+  get writablePixels() {
+    const pixels = this.pixels;
+    this.markCPUWritten();
+    return pixels;
+  }
+  markCPUWritten() {
+    this._pointSample = null;
+    this.cpuValid = true;
+    this.gpuValid = false;
+  }
+  markGPUWritten() {
+    this._pointSample = null;
+    this.gpuValid = true;
+    this.cpuValid = false;
+    // External writable views must keep their backing array for synchronization.
+    if (!this.externallyWritable) this._pixels = null;
   }
   set pixels(value) {
     this._pixels = value;
-    this.gpu = null;
+    this.markCPUWritten();
   }
   materialize() {
-    if (!this.gpu) return this.pixels;
-    // Uploading CPU pixels does not invalidate their copy. Only GPU writes
-    // require a readback before returning a writable CPU buffer.
-    const data = !this.gpu.modified && this._pixels ? this._pixels : this.gpu.device.read(this.gpu);
-    const pixels = this._pixels ??= data;
-    if (pixels !== data) pixels.set(data);
-    this.gpu = null;
-    return pixels;
+    return this.pixels;
   }
   static from(pixels, width, height, { gray = false } = {}) {
     const img = new Image(width, height, { gray });
-    img.pixels.set(pixels);
+    img.writablePixels.set(pixels);
     return img;
   }
   clone() {
-    if (this.gpu) {
+    if (this.gpuValid) {
       const copy = new Image(this.width, this.height, { defer: true });
       this.gpu.device.copy(copy, this);
       return copy;
     }
-    return Image.from(this._pixels ?? this.pixels, this.width, this.height, { gray: this.gray });
+    return Image.from(this.pixels, this.width, this.height, { gray: this.gray });
   }
   resized(width, height, color = 0) {
     if (width === this.width && height === this.height) return this;
-    if (this.gpu) {
+    if (this.gpuValid) {
       const gpu = this.gpu.device;
       const next = new Image(width, height, { defer: true });
-      next.fill({ left: 0, top: 0, right: width, bottom: height }, color);
+      gpu.fill(next, { left: 0, top: 0, right: width, bottom: height }, colorBytes(color));
       gpu.draw(next, this, {
         sourceRect: { left: 0, top: 0, right: Math.min(width, this.width), bottom: Math.min(height, this.height) },
         mode: 1, copySourceAlpha: true,
@@ -91,12 +109,36 @@ export class Image {
       return next;
     }
     const next = new Image(width, height, { gray: this.gray });
-    if (!this.gray) next.fill({ left: 0, top: 0, right: width, bottom: height }, color);
-    const stride = this.gray ? 1 : 4, row = Math.min(width, this.width) * stride;
-    for (let y = 0; y < Math.min(height, this.height); y++) {
-      next.pixels.set(this.pixels.subarray(y * this.width * stride, y * this.width * stride + row), y * width * stride);
+    const copyWidth = Math.min(width, this.width), copyHeight = Math.min(height, this.height);
+    // SetSizeWithFill preserves the overlap and fills only the newly exposed
+    // strips. Fresh typed arrays already contain transparent black.
+    if (!this.gray && color !== 0) {
+      next.fill({ left: copyWidth, top: 0, right: width, bottom: copyHeight }, color);
+      next.fill({ left: 0, top: copyHeight, right: width, bottom: height }, color);
+    }
+    const stride = this.gray ? 1 : 4, row = copyWidth * stride;
+    const target = next.writablePixels, source = this.pixels;
+    for (let y = 0; y < copyHeight; y++) {
+      target.set(source.subarray(y * this.width * stride, y * this.width * stride + row), y * width * stride);
     }
     return next;
+  }
+  // Layer resizing mutates its bitmap, as SetSizeWithFill does in the native
+  // backend. Transfer the replacement storage and release the old texture now,
+  // rather than retaining every intermediate size until a GC finalizer runs.
+  resize(width, height, color = 0) {
+    const next = this.resized(width, height, color);
+    if (next === this) return this;
+    const { cpuValid, gpuValid } = next;
+    getGPU()?.moveImageStorage(this, next);
+    this.width = next.width;
+    this.height = next.height;
+    this._pixels = next._pixels;
+    this._pointSample = null;
+    this.cpuValid = cpuValid;
+    this.gpuValid = gpuValid;
+    this.externallyWritable = next.externallyWritable;
+    return this;
   }
   // Preserve identity and independently copy all RGBA channels, including
   // colour underneath a zero mask. GPU copies never pass through Canvas 2D.
@@ -106,26 +148,32 @@ export class Image {
       this.width = src.width;
       this.height = src.height;
       this._pixels = null;
-      this.gpu = null;
+      this.markCPUWritten();
     }
     // Resident sources stay on the GPU, including transition snapshots. A CPU
     // copy would need another full upload as soon as the copy is rendered.
-    if (src.gpu) {
+    if (src.gpuValid) {
       src.gpu.device.copy(this, src);
     } else {
-      const source = src._pixels ?? src.pixels;
+      const source = src.pixels;
       const target = this._pixels ??= new Uint8ClampedArray(source.length);
       target.set(source);
-      this.gpu = null;
+      this.markCPUWritten();
     }
     return this;
   }
   index(x, y) { return y * this.width + x; }
   point(x, y) {
     if (x < 0 || y < 0 || x >= this.width || y >= this.height) throw new Error('TJS range error');
-    if (this.gpu) {
+    if (!this.cpuValid && this.gpuValid) {
+      // Mouse move/down/up/click can test the same unchanged pixel. Retain
+      // just the latest sample instead of synchronizing the GPU each time.
+      const sample = this._pointSample;
+      if (sample && sample.x === x && sample.y === y) return sample.color;
       const p = this.gpu.device.read(this.gpu, { left: x, top: y, right: x + 1, bottom: y + 1 });
-      return (p[3] << 24) + (p[0] << 16) + (p[1] << 8) + p[2];
+      const color = (p[3] << 24) + (p[0] << 16) + (p[1] << 8) + p[2];
+      this._pointSample = { x, y, color };
+      return color;
     }
     if (this.gray) return this.pixels[this.index(x, y)];
     const base = this.index(x, y) * 4, p = this.pixels;
@@ -133,10 +181,10 @@ export class Image {
   }
   setPoint(x, y, color) {
     if (this.gray) {
-      this.pixels[this.index(x, y)] = color & 0xff;
+      this.writablePixels[this.index(x, y)] = color & 0xff;
       return;
     }
-    const base = this.index(x, y) * 4, p = this.pixels;
+    const base = this.index(x, y) * 4, p = this.writablePixels;
     p[base] = (color >>> 16) & 0xff; p[base + 1] = (color >>> 8) & 0xff;
     p[base + 2] = color & 0xff; p[base + 3] = (color >>> 24) & 0xff;
   }
@@ -147,33 +195,15 @@ export class Image {
     if (r <= l || b <= t) return false;
     const [cr, cg, cb, ca] = colorBytes(color);
     const gpu = getGPU();
-    const full = l === 0 && t === 0 && r === this.width && b === this.height;
-    // A full clear has the same known result on both sides. Preserve residency
-    // for the next GPU operation and valid CPU bytes for the next text draw.
-    // Dropping the texture here forces an entire layer upload on each redraw.
-    if (!this.gray && !maskOnly && full && this.gpu && this._pixels) {
-      gpu.fill(this, { left: l, top: t, right: r, bottom: b }, [cr, cg, cb, ca]);
-      new Uint32Array(this._pixels.buffer, this._pixels.byteOffset, this.width * this.height)
-        .fill((ca << 24 | cb << 16 | cg << 8 | cr) >>> 0);
-      // Externally writable images are materialized by GPUDevice.commit.
-      if (this.gpu) this.gpu.modified = false;
-      return true;
-    }
-    // Preserve GPU-authoritative contents on partial fills. Reading the whole
-    // image to clear a rectangle needlessly stalls the render pipeline. CPU
-    // text planes stay on the CPU when their bytes are still authoritative.
-    if (!this.gray && (this._pixels === null || this.gpu?.modified && (!full || maskOnly))) {
+    if (!this.gray && this.gpuValid) {
       gpu.fill(this, { left: l, top: t, right: r, bottom: b }, [cr, cg, cb, ca], maskOnly);
       return true;
     }
-    // A complete overwrite needs none of the previous GPU contents. Keep the
-    // existing CPU allocation for text drawing without synchronously reading
-    // back the texture that is about to be erased.
-    if (!maskOnly && full) this.gpu = null;
+    const bytes = this.writablePixels;
     // The supported Windows/browser runtime is little-endian: fill complete
     // RGBA pixels as words instead of assigning four channels per pixel.
     if (!maskOnly || this.gray) {
-      const pixels = this.gray ? this.pixels : new Uint32Array(this.pixels.buffer, this.pixels.byteOffset, this.width * this.height);
+      const pixels = this.gray ? bytes : new Uint32Array(bytes.buffer, bytes.byteOffset, this.width * this.height);
       const value = this.gray ? color & 255 : (ca << 24 | cb << 16 | cg << 8 | cr) >>> 0;
       if (l === 0 && r === this.width) pixels.fill(value, t * this.width, b * this.width);
       else for (let y = t; y < b; y++) pixels.fill(value, this.index(l, y), this.index(r, y));
@@ -182,7 +212,7 @@ export class Image {
     for (let y = t; y < b; y++) {
       let base = this.index(l, y) * 4;
       for (let x = l; x < r; x++) {
-        this.pixels[base + 3] = ca;
+        bytes[base + 3] = ca;
         base += 4;
       }
     }
@@ -232,10 +262,11 @@ export class Image {
   // Copy both main and mask planes (TVP_BB_COPY_MAIN | TVP_BB_COPY_MASK).
   copyRect(x, y, src, rect, { main = true, mask = true } = {}) {
     const gpu = getGPU();
-    // Same rule as fill(): a plane that owns CPU bytes stays CPU-authoritative,
-    // otherwise a GPU copy marks the texture modified and the next CPU text draw
-    // has to read the whole plane back.
-    if (!this.gray && !src.gray && this._pixels === null) {
+    // Keep copies on the GPU whenever either bitmap has newer GPU contents.
+    // A materialized CPU buffer can still be stale after a GPU draw; testing
+    // only for a missing buffer would read the full image back just to copy a
+    // small rectangle.
+    if (!this.gray && !src.gray && (this.gpuValid || src.gpuValid)) {
       if (!main && !mask) return true;
       const source = src === this ? src.clone() : src;
       const sourceRect = { left: Math.max(0, rect.left), top: Math.max(0, rect.top),
@@ -257,22 +288,24 @@ export class Image {
       // TypedArray.set handles horizontal overlap. Copy bottom-up when a
       // self-copy moves rows down, so no full-image temporary is needed.
       const backwards = src === this && dy > top;
+      const source = src.pixels, target = this.writablePixels;
       for (let row = backwards ? bottom - top - 1 : 0;
         backwards ? row >= 0 : row < bottom - top; row += backwards ? -1 : 1) {
         const offset = ((top + row) * src.width + left) * stride;
-        this.pixels.set(src.pixels.subarray(offset, offset + bytes), ((dy + row) * this.width + dx) * stride);
+        target.set(source.subarray(offset, offset + bytes), ((dy + row) * this.width + dx) * stride);
       }
       return true;
     }
     if (src === this) src = src.clone();
+    const p = this.writablePixels, q = src.pixels;
     for (let sy = rect.top; sy < rect.bottom; sy++) {
       const dy = y + sy - rect.top;
       if (dy < 0 || dy >= this.height || sy < 0 || sy >= src.height) continue;
       for (let sx = rect.left; sx < rect.right; sx++) {
         const dx = x + sx - rect.left;
         if (dx < 0 || dx >= this.width || sx < 0 || sx >= src.width) continue;
-        if (this.gray) { this.pixels[this.index(dx, dy)] = src.pixels[src.index(sx, sy)]; continue; }
-        const d = this.index(dx, dy) * 4, s = src.index(sx, sy) * 4, p = this.pixels, q = src.pixels;
+        if (this.gray) { p[this.index(dx, dy)] = q[src.index(sx, sy)]; continue; }
+        const d = this.index(dx, dy) * 4, s = src.index(sx, sy) * 4;
         if (main) { p[d] = q[s]; p[d + 1] = q[s + 1]; p[d + 2] = q[s + 2]; }
         if (mask) p[d + 3] = q[s + 3];
       }

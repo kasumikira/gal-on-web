@@ -35,11 +35,12 @@ function makeGlyphImage(glyph, color, aa) {
   if (bytes.length < width * height * stride) throw new Error('TJS failed glyph for drawGlyph: truncated bitmap');
   const [r, g, b] = colorBytes(color);
   const image = new Image(width, height);
+  const pixels = image.writablePixels;
   for (let i = 0; i < width * height; i++) {
     let alpha = bytes[i * stride];
     if (!aa) alpha = alpha >= 128 ? 255 : 0;
     const p = i * 4;
-    image.pixels[p] = r; image.pixels[p + 1] = g; image.pixels[p + 2] = b; image.pixels[p + 3] = alpha;
+    pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b; pixels[p + 3] = alpha;
   }
   return image;
 }

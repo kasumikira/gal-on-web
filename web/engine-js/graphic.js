@@ -1,7 +1,7 @@
 // GraphicsLoaderIntf.cpp: storage lookup, decoded-image cache and _m/_p siblings.
 import { Image } from './bitmap.js';
 import { LRUCache } from 'lru-cache';
-import { loadGraphic } from './image-codecs/decode.js';
+import { loadGraphicAsync as loadGraphic } from './image-codecs/async-decode.js';
 
 const GRAPHIC_CACHE_BYTES = 128 * 1024 * 1024;
 const GRAPHIC_EXTENSIONS = ['.tlg', '.png', '.jpg', '.jpeg', '.bmp', '.webp'];
@@ -17,7 +17,7 @@ function tiledImage(image, width, height) {
 }
 
 function alphaColorMat(image, color) {
-  const rgb = [(color >> 16) & 255, (color >> 8) & 255, color & 255], p = image.pixels;
+  const rgb = [(color >> 16) & 255, (color >> 8) & 255, color & 255], p = image.writablePixels;
   for (let i = 0; i < p.length; i += 4) {
     for (let c = 0; c < 3; c++) p[i + c] = rgb[c] + ((p[i + c] - rgb[c]) * p[i + 3] >> 8);
     p[i + 3] = 255;
@@ -56,7 +56,8 @@ export function createGraphicLoader(storage) {
         if (maskPath) {
           const mask = tiledImage((await loadGraphic({ read: () => storage.read(maskPath), name: maskPath }, 0, { gray: true })).image, width, height);
           if (mask.width !== result.image.width || mask.height !== result.image.height) throw new Error('TJS mask size mismatch');
-          for (let i = 0; i < mask.pixels.length; i++) result.image.pixels[i * 4 + 3] = mask.pixels[i];
+          const pixels = result.image.writablePixels, maskPixels = mask.pixels;
+          for (let i = 0; i < maskPixels.length; i++) pixels[i * 4 + 3] = maskPixels[i];
         }
         const provincePath = await sibling(base, '_p', '');
         if (provincePath) {

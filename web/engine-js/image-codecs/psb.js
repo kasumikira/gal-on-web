@@ -1,5 +1,6 @@
 // ObjSource equivalent: decode one PSB icon entry into an engine Image, lazily.
 // SourceCache.cpp ensureTexture_guess (RL / palette / raw 32bpp paths).
+import { Image } from '../bitmap.js';
 const decodedSources = new WeakMap();
 export function decodeSource(iconNode) {
   if (!iconNode) return null;
@@ -26,7 +27,6 @@ export function decodeSource(iconNode) {
   let source8 = null, source32 = null;
   if (compressed) {
     if (hasPalette) source8 = decodeRL8(pixelData, pixelCount);
-    else source32 = decodeRL32(pixelData, pixelCount);
   } else if (hasPalette) source8 = pixelData;
   else source32 = pixelData;
   const rgba = new Uint8ClampedArray(pixelCount * 4);
@@ -39,6 +39,10 @@ export function decodeSource(iconNode) {
       palette[i] = readWord(paletteBytes, i * 4);
     }
     expandPalette(rgba, source8, pixelCount, palette);
+  } else if (compressed) {
+    // Decode directly into RGBA: no intermediate full-size BGRA allocation
+    // or second pass over the decompressed image.
+    decodeRL32(pixelData, new Uint32Array(rgba.buffer));
   } else {
     for (let i = 0; i < pixelCount; i++) {
       const word = readWord(source32, i * 4);
@@ -49,7 +53,11 @@ export function decodeSource(iconNode) {
       rgba[i * 4 + 3] = (word >>> 24) & 0xff;
     }
   }
-  const result = { width, height, originX, originY, clip, pixels: rgba, path: iconNode.path };
+  // Cache the renderable image itself: timeline seeks must not wrap the same
+  // decoded pixels in a new GPU texture owner on every source resolution.
+  const result = Object.assign(new Image(width, height, { pixels: rgba }), {
+    blank: false, originX, originY, clip, path: iconNode.path,
+  });
   sources.set(iconNode.offset, result);
   return result;
 }
@@ -76,22 +84,27 @@ function decodeRL8(source, pixelCount) {
   return out;
 }
 // SourceCache.cpp decodeObjSourceRL32_guess (word fill).
-function decodeRL32(source, pixelCount) {
-  const out = new Uint32Array(pixelCount);
+function decodeRL32(source, out) {
+  const pixelCount = out.length;
   let cursor = 0, written = 0;
   while (cursor < source.length) {
     const marker = source[cursor++];
     if (marker & 0x80) {
-      const count = (marker & 0x7f) + 3, value = readWord(source, cursor);
+      const count = (marker & 0x7f) + 3, value = rgbaWord(source, cursor);
       cursor += 4;
-      for (let i = 0; i < count && written < pixelCount; i++) out[written++] = value;
+      out.fill(value, written, Math.min(pixelCount, written + count));
+      written += count;
     } else {
       const count = marker + 1;
-      for (let i = 0; i < count && written < pixelCount; i++) { out[written++] = readWord(source, cursor); cursor += 4; }
+      for (let i = 0; i < count && written < pixelCount; i++) { out[written++] = rgbaWord(source, cursor); cursor += 4; }
       if (written >= pixelCount) break;
     }
   }
-  return new Uint8Array(out.buffer, 0, pixelCount * 4);
+}
+// Little-endian RGBA storage: swap the red and blue bytes of a BGRA word.
+function rgbaWord(bytes, offset) {
+  const word = readWord(bytes, offset);
+  return (word & 0xff00ff00) | ((word >>> 16) & 0xff) | ((word & 0xff) << 16);
 }
 // TVPBLExpand8BitTo32BitPal: palette entries are native ARGB values.
 function expandPalette(rgba, indexes, pixelCount, palette) {

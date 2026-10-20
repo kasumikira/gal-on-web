@@ -298,7 +298,7 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
         node.width = image.width;
         node.height = image.height;
       } else {
-        node.image.pixels.set(image.pixels);
+        node.image.writablePixels.set(image.pixels);
       }
       node.imageModified = true;
       if (s.onLayerChange) s.onLayerChange();

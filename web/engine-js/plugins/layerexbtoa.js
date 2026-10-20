@@ -51,7 +51,7 @@ export function registerLayerExBTOA({ get }) {
     const node = this.node, image = node?.image;
     if (!image) invalid('dest must be Layer.');
     const width = image.width >> 1, height = image.height;
-    const pixels = image.pixels, pitch = image.width * 4;
+    const pixels = image.writablePixels, pitch = image.width * 4;
     for (let y = 0; y < height; y++) {
       const row = y * pitch;
       for (let x = 0; x < width; x++) pixels[row + x * 4 + 3] = pixels[row + (width + x) * 4 + 2];
@@ -66,7 +66,7 @@ export function registerLayerExBTOA({ get }) {
     const node = this.node, image = node?.image;
     if (!image) invalid('dest must be Layer.');
     const width = image.width, height = image.height >> 1;
-    const pixels = image.pixels, pitch = image.width * 4;
+    const pixels = image.writablePixels, pitch = image.width * 4;
     for (let y = 0; y < height; y++) {
       const source = (height + y) * pitch, target = y * pitch;
       for (let x = 0; x < width; x++) pixels[target + x * 4 + 3] = pixels[source + x * 4 + 2];
@@ -79,7 +79,7 @@ export function registerLayerExBTOA({ get }) {
   Layer.defineMember('fillAlpha', async function() {
     const node = this.node, image = node?.image;
     if (!image) invalid('dest must be Layer.');
-    const clip = clipOf(node, image), pixels = image.pixels, pitch = image.width * 4;
+    const clip = clipOf(node, image), pixels = image.writablePixels, pitch = image.width * 4;
     for (let y = 0; y < clip.height; y++) {
       const row = (clip.top + y) * pitch;
       for (let x = 0; x < clip.width; x++) pixels[row + (clip.left + x) * 4 + 3] = 0xff;
@@ -95,7 +95,7 @@ export function registerLayerExBTOA({ get }) {
     if (!image) invalid('src must be Layer.');
     const clip = clipOf(node, image), province = provinceOf(node, image);
     const limit = trunc(number(threshold)), on = trunc(number(matched)), off = trunc(number(otherwise));
-    const src = image.pixels, dst = province.pixels, pitch = image.width * 4;
+    const src = image.pixels, dst = province.writablePixels, pitch = image.width * 4;
     let mode = 0;
     if (limit >= 0 && limit < 256) {
       const match = on >= 0 && on < 256, other = off >= 0 && off < 256;
@@ -149,7 +149,7 @@ export function registerLayerExBTOA({ get }) {
     ddx -= clip.left;
     ddy -= clip.top;
     const addAlpha = node.type === LT_ADD_ALPHA;
-    const pixels = image.pixels, srcPixels = srcImage.pixels;
+    const pixels = image.writablePixels, srcPixels = srcImage.pixels;
     const pitch = image.width * 4, srcPitch = srcImage.width * 4;
     const area = calcClipArea(ddx, ddy, clip.width, clip.height, ssx, ssy, srcImage.width, srcImage.height, width, height);
     const paintAlpha = (left, top, right, bottom, value, multiply) => {
@@ -240,7 +240,7 @@ export function registerLayerExBTOA({ get }) {
     const thresholdByte = limit >= 0 && limit < 256 ? limit : 1;
     const area = calcClipArea(ddx, ddy, clip.width, clip.height, ssx, ssy, srcImage.width, srcImage.height, width, height);
     if (!area) return;
-    const pixels = image.pixels, srcPixels = srcImage.pixels;
+    const pixels = image.writablePixels, srcPixels = srcImage.pixels;
     const pitch = image.width * 4, srcPitch = srcImage.width * 4;
     for (let y = 0; y < area.h; y++) {
       const target = (clip.top + area.dy + y) * pitch + (clip.left + area.dx) * 4;
@@ -262,7 +262,7 @@ export function registerLayerExBTOA({ get }) {
     const clip = clipOf(node, image), province = provinceOf(node, image);
     const wanted = trunc(number(index)) & 0xff;
     const [r, g, b, a] = argbBytes(trunc(number(color)));
-    const pixels = image.pixels, indexes = province.pixels, pitch = image.width * 4;
+    const pixels = image.writablePixels, indexes = province.pixels, pitch = image.width * 4;
     for (let y = 0; y < clip.height; y++) {
       const row = (clip.top + y) * pitch + clip.left * 4;
       const source = (clip.top + y) * province.width + clip.left;
@@ -288,7 +288,7 @@ export function registerLayerExBTOA({ get }) {
     const value = trunc(number(index)) & 0xff;
     const limit = trunc(number(threshold));
     const clip = clipOf(node, image), province = provinceOf(node, image);
-    const pixels = image.pixels, indexes = province.pixels, pitch = image.width * 4;
+    const pixels = image.pixels, indexes = province.writablePixels, pitch = image.width * 4;
     let minX = -1, minY = -1, maxX = -1, maxY = -1;
     for (let y = 0; y < clip.height; y++) {
       const row = (clip.top + y) * pitch + clip.left * 4;

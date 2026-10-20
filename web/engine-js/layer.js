@@ -154,7 +154,7 @@ export function createLayerClass(document, {
       const w = Math.max(width, node.image.width),
         h = Math.max(height, node.image.height);
       if (w !== node.image.width || h !== node.image.height) {
-        node.image = node.image.resized(w, h, node.neutralColor);
+        node.image = node.image.resize(w, h, node.neutralColor);
         if (node.province) node.province = node.province.resized(w, h);
         node.clip = null;
         node.imageModified = true;
@@ -240,7 +240,7 @@ export function createLayerClass(document, {
     }
     if (width + node.imageLeft < node.width) node.imageLeft = node.width - width;
     if (height + node.imageTop < node.height) node.imageTop = node.height - height;
-    node.image = node.image.resized(width, height, node.neutralColor);
+    node.image = node.image.resize(width, height, node.neutralColor);
     if (node.province) node.province = node.province.resized(width, height);
     node.clip = null;
     node.imageModified = true;
@@ -684,6 +684,9 @@ export function createLayerClass(document, {
     getMainPixel(x, y) {
       if (arguments.length < 2) throw new Error('TJS Layer.getMainPixel requires 2 arguments');
       const node = this.node;
+      // Scripts scan images pixel by pixel. Synchronize once and retain both
+      // valid copies instead of issuing a GPU readback for every coordinate.
+      node.image.materialize();
       return node.image.point(Math.trunc(number(x)), Math.trunc(number(y))) & 0xffffff;
     }
     @nativeMethod
@@ -698,6 +701,7 @@ export function createLayerClass(document, {
     getMaskPixel(x, y) {
       if (arguments.length < 2) throw new Error('TJS Layer.getMaskPixel requires 2 arguments');
       const node = this.node;
+      node.image.materialize();
       return node.image.point(Math.trunc(number(x)), Math.trunc(number(y))) >>> 24 & 0xff;
     }
     @nativeMethod
@@ -705,7 +709,7 @@ export function createLayerClass(document, {
       if (arguments.length < 3) throw new Error('TJS Layer.setMaskPixel requires 3 arguments');
       const node = this.node;
       const base = node.image.index(Math.trunc(number(x)), Math.trunc(number(y))) * 4;
-      node.image.pixels[base + 3] = clamp255(Math.trunc(number(value)));
+      node.image.writablePixels[base + 3] = clamp255(Math.trunc(number(value)));
       node.imageModified = true;
       updateTree(node);
     }
@@ -722,7 +726,7 @@ export function createLayerClass(document, {
       node.province ??= new Image(node.image.width, node.image.height, {
         gray: true
       });
-      node.province.pixels[node.province.index(Math.trunc(number(x)), Math.trunc(number(y)))] = Math.trunc(number(value)) & 0xff;
+      node.province.writablePixels[node.province.index(Math.trunc(number(x)), Math.trunc(number(y)))] = Math.trunc(number(value)) & 0xff;
       node.imageModified = true;
       updateTree(node);
     }
@@ -1127,8 +1131,9 @@ export function createLayerClass(document, {
     get mainImageBufferForWrite() {
       const node = this.node;
       node.imageModified = true;
+      const pixels = node.image.writablePixels;
       node.image.externallyWritable = true;
-      return new Uint8Array(node.image.pixels.buffer, node.image.pixels.byteOffset, node.image.pixels.byteLength);
+      return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     }
     @nativeProperty
     get mainImageBufferPitch() {
@@ -1140,7 +1145,8 @@ export function createLayerClass(document, {
       node.province ??= new Image(node.image.width, node.image.height, {
         gray: true
       });
-      return new Uint8Array(node.province.pixels.buffer, node.province.pixels.byteOffset, node.province.pixels.byteLength);
+      const pixels = node.province.pixels;
+      return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     }
     @nativeProperty
     get provinceImageBufferForWrite() {
@@ -1149,7 +1155,8 @@ export function createLayerClass(document, {
         gray: true
       });
       node.imageModified = true;
-      return new Uint8Array(node.province.pixels.buffer, node.province.pixels.byteOffset, node.province.pixels.byteLength);
+      const pixels = node.province.writablePixels;
+      return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     }
     @nativeProperty
     get provinceImageBufferPitch() {

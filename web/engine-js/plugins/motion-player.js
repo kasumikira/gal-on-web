@@ -304,7 +304,7 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
         if (iconImage) image = iconImage;
       }
     }
-    node.source = { blank: false, ...image };
+    node.source = image;
   }
 
   @nativeClass('Player')
@@ -625,7 +625,7 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
       for (const item of parent.children) {
         if (!item.accumulated.visible) continue;
         const source = item.source;
-        if (source && source.width && source.pixels) {
+        if (source && source.width && !source.blank) {
           const { matrix, posX, posY } = itemTransform(item, state.drawAffine);
           gpu.draw(node.image, source, {
             matrix: [matrix[0], matrix[1], matrix[2], matrix[3], posX, posY],

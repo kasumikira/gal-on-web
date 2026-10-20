@@ -49,15 +49,17 @@ registerTransition('universal', async ({ option, required, loadGraphic, width, h
   const { image } = await loadGraphic(ruleName, 0x02ffffff, { gray: true });
   // GraphicsLoaderIntf.cpp expands undersized requested images by tiling.
   const rule = new Image(Math.max(width, image.width), Math.max(height, image.height), { gray: true });
+  const rulePixels = rule.writablePixels, imagePixels = image.pixels;
   for (let y = 0; y < rule.height; y++) for (let x = 0; x < rule.width; x++) {
     const offset = image.index(x % image.width, y % image.height);
-    rule.pixels[rule.index(x, y)] = image.gray ? image.pixels[offset]
-      : (image.pixels[offset * 4] * 54 + image.pixels[offset * 4 + 1] * 183 + image.pixels[offset * 4 + 2] * 19) >> 8;
+    rulePixels[rule.index(x, y)] = image.gray ? imagePixels[offset]
+      : (imagePixels[offset * 4] * 54 + imagePixels[offset * 4 + 1] * 183 + imagePixels[offset * 4 + 2] * 19) >> 8;
   }
   const ruleRGBA = new Image(rule.width, rule.height);
-  for (let i = 0; i < rule.pixels.length; i++) {
-    ruleRGBA.pixels[i * 4] = rule.pixels[i];
-    ruleRGBA.pixels[i * 4 + 3] = 255;
+  const rgbaPixels = ruleRGBA.writablePixels;
+  for (let i = 0; i < rulePixels.length; i++) {
+    rgbaPixels[i * 4] = rulePixels[i];
+    rgbaPixels[i * 4 + 3] = 255;
   }
   return {
     maxPhase: 255 + vague,

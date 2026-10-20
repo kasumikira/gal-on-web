@@ -24,7 +24,7 @@ function colorBytes(value) {
 }
 
 function fillColor(image, color) {
-  const p = image.pixels;
+  const p = image.writablePixels;
   const [r, g, b, a] = color;
   for (let i = 0; i < p.length; i += 4) {
     p[i] = r; p[i + 1] = g; p[i + 2] = b; p[i + 3] = a;
@@ -54,9 +54,10 @@ function checkedSize(src1, src2, width, height) {
 }
 
 function renderBlend(frame, src1, src2, width, height, opacity, type) {
+  const output = frame.writablePixels, first = src1.pixels, second = src2.pixels;
   for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
     const i = (y * width + x) * 4;
-    blendTransitionPixel(frame.pixels, i, src1.pixels, i, src2.pixels, i, opacity, type);
+    blendTransitionPixel(output, i, first, i, second, i, opacity, type);
   }
 }
 
@@ -71,6 +72,7 @@ async function createWave({ option, required, width, height, type }) {
     maxPhase: time,
     render(frame, src1, src2, phase) {
       checkedSize(src1, src2, width, height);
+      const output = frame.writablePixels, first = src1.pixels, second = src2.pixels;
       const curTime = phaseTime(phase, time);
       let t = curTime;
       const half = time / 2;
@@ -92,11 +94,11 @@ async function createWave({ option, required, width, height, type }) {
           const di = (row + x) * 4;
           const sx = x - d;
           if (sx < 0 || sx >= width) {
-            frame.pixels[di] = background[0]; frame.pixels[di + 1] = background[1];
-            frame.pixels[di + 2] = background[2]; frame.pixels[di + 3] = background[3];
+            output[di] = background[0]; output[di + 1] = background[1];
+            output[di + 2] = background[2]; output[di + 3] = background[3];
           } else {
             const si = (row + sx) * 4;
-            blendTransitionPixel(frame.pixels, di, src1.pixels, si, src2.pixels, si, blend, type);
+            blendTransitionPixel(output, di, first, si, second, si, blend, type);
           }
         }
       }
@@ -111,6 +113,7 @@ async function createMosaic({ option, required, width, height, type }) {
     maxPhase: time,
     render(frame, src1, src2, phase) {
       checkedSize(src1, src2, width, height);
+      const output = frame.writablePixels, first = src1.pixels, second = src2.pixels;
       const curTime = phaseTime(phase, time);
       let t = curTime;
       const half = time / 2;
@@ -135,7 +138,7 @@ async function createMosaic({ option, required, width, height, type }) {
           const my = Math.max(0, Math.min(height - 1, top + halfBlock));
           const si = (my * width + mx) * 4;
           for (let y = trow; y < bottom; y++) for (let x = l; x < right; x++)
-            blendTransitionPixel(frame.pixels, (y * width + x) * 4, src1.pixels, si, src2.pixels, si, blend, type);
+            blendTransitionPixel(output, (y * width + x) * 4, first, si, second, si, blend, type);
         }
       }
     },
@@ -160,6 +163,7 @@ async function createTurn({ option, required, width, height, type }) {
     maxPhase: time,
     render(frame, src1, src2, phase) {
       checkedSize(src1, src2, width, height);
+      const output = frame.writablePixels, first = src1.pixels, second = src2.pixels;
       const curTime = phaseTime(phase, time);
       const total = 64 + (xcount + ycount) * 2;
       const turnPhase = Math.floor(curTime * total / time) - ycount * 2;
@@ -169,22 +173,22 @@ async function createTurn({ option, required, width, height, type }) {
         const left = tx * 64, top = ty * 64;
         const right = Math.min(width, left + 64), bottom = Math.min(height, top + 64);
         if (p === 0 || p === 63) {
-          const source = p === 0 ? src1.pixels : src2.pixels;
+          const source = p === 0 ? first : second;
           for (let y = top; y < bottom; y++) for (let x = left; x < right; x++)
-            copyPixel(frame.pixels, (y * width + x) * 4, source, (y * width + x) * 4);
+            copyPixel(output, (y * width + x) * 4, source, (y * width + x) * 4);
           continue;
         }
         for (let line = 0; line < bottom - top; line++) {
           const params = turnTransParam(p, line);
-          const source = p < 32 ? src1.pixels : src2.pixels;
+          const source = p < 32 ? first : second;
           const start = Math.max(0, params[0]);
           const end = Math.min(64, params[0] + params[1]);
           for (let x = left; x < right; x++) {
             const local = x - left;
             const di = ((top + line) * width + x) * 4;
             if (local < start || local >= end) {
-              frame.pixels[di] = bg[0]; frame.pixels[di + 1] = bg[1];
-              frame.pixels[di + 2] = bg[2]; frame.pixels[di + 3] = bg[3];
+              output[di] = bg[0]; output[di + 1] = bg[1];
+              output[di + 2] = bg[2]; output[di + 3] = bg[3];
               continue;
             }
             const n = local - params[0];
@@ -192,12 +196,12 @@ async function createTurn({ option, required, width, height, type }) {
             const sy = (params[3] + params[7] * n) >> 16;
             const gx = left + sx, gy = top + sy;
             if (gx < 0 || gx >= width || gy < 0 || gy >= height) {
-              frame.pixels[di] = bg[0]; frame.pixels[di + 1] = bg[1];
-              frame.pixels[di + 2] = bg[2]; frame.pixels[di + 3] = bg[3];
+              output[di] = bg[0]; output[di + 1] = bg[1];
+              output[di + 2] = bg[2]; output[di + 3] = bg[3];
             } else {
               const si = (gy * width + gx) * 4;
-              if (gloss) blendWhite(frame.pixels, di, source, si, gloss);
-              else copyPixel(frame.pixels, di, source, si);
+              if (gloss) blendWhite(output, di, source, si, gloss);
+              else copyPixel(output, di, source, si);
             }
           }
         }
@@ -252,6 +256,7 @@ function swapPoints(width, height, twist, time, curTime, source) {
 }
 
 function drawQuad(frame, source, points, width, height) {
+  const output = frame.writablePixels, pixels = source.pixels;
   const p0 = points[0], p1 = points[1], p2 = points[2];
   const ux = p1[0] - p0[0], uy = p1[1] - p0[1];
   const vx = p2[0] - p0[0], vy = p2[1] - p0[1];
@@ -271,7 +276,7 @@ function drawQuad(frame, source, points, width, height) {
     if (sx0 < 0 || sx0 > source.width - 1 || sy0 < 0 || sy0 > source.height - 1) continue;
     const sx = Math.max(0, Math.min(source.width - 1, Math.round(sx0)));
     const sy = Math.max(0, Math.min(source.height - 1, Math.round(sy0)));
-    copyPixel(frame.pixels, (y * width + x) * 4, source.pixels, (sy * source.width + sx) * 4);
+    copyPixel(output, (y * width + x) * 4, pixels, (sy * source.width + sx) * 4);
   }
 }
 
@@ -361,6 +366,7 @@ async function createRipple({ option, required, width, height, type }) {
     render(frame, src1, src2, phase) {
       checkedSize(src1, src2, width, height);
       const curTime = phaseTime(phase, time);
+      const output = frame.writablePixels, first = src1.pixels, second = src2.pixels;
       const blend = Math.min(255, Math.trunc(curTime * 255 / time));
       let wavePhase = Math.trunc(speed * (1 / TAU) * (1 / 1000) * curTime * rippleWidth) % rippleWidth;
       if (wavePhase < 0) wavePhase = 0;
@@ -387,7 +393,7 @@ async function createRipple({ option, required, width, height, type }) {
         const [sx0, sy0] = getOffset(x, y);
         const sx = reflect(sx0, width), sy = reflect(sy0, height);
         const di = (y * width + x) * 4, si = (sy * width + sx) * 4;
-        blendTransitionPixel(frame.pixels, di, src1.pixels, si, src2.pixels, si, blend, type);
+        blendTransitionPixel(output, di, first, si, second, si, blend, type);
       }
     },
   };
