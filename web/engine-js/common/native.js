@@ -116,6 +116,10 @@ export async function readScript(object, name, { ignoreProperty = false, optiona
   }
 }
 
+export function readScriptTyped(object, name, { ignoreProperty = false } = {}) {
+  return bindingOf(object).vm.getTyped(nativeReference(object), name, ignoreProperty);
+}
+
 export function callScript(object, name, args = [], { receiver = object, ignoreMissing = false } = {}) {
   return bindingOf(object).vm.callMember(nativeReference(object), name, nativeReference(receiver), args, ignoreMissing);
 }
@@ -253,7 +257,9 @@ export function brandNativeClass(klass, name) {
 
 function prepareClass(klass) {
   if (classes.has(klass)) return;
-  const descriptor = { members: new Map(), instances: new NativeStates(klass) };
+  // `statics` keeps the static flag for members declared before the class is
+  // exported to a VM (plugins usually run afterwards, decorators never carry it).
+  const descriptor = { members: new Map(), statics: new Set(), instances: new NativeStates(klass) };
   classes.set(klass, descriptor);
   Object.defineProperties(klass, {
     members: { get: () => descriptor.members, configurable: true },
@@ -264,26 +270,34 @@ function prepareClass(klass) {
       return state;
     }, configurable: true },
     of: { value(owner) { return this.state(owner); }, configurable: true },
-    defineMember: { value(member, value) {
+    defineMember: { value(member, value, options = {}) {
       // Plugin attachments must also reach a class already exported to TJS.
+      // Explicit class-level entries use the JS class as receiver. Instance
+      // attachments still resolve their native state through the VM.
+      if (options.static) descriptor.statics.add(member);
+      else descriptor.statics.delete(member);
       const vm = descriptor.instances.vm;
       if (vm) {
         const id = vm.encode(klass);
-        try { registerNativeMember(klass, member, value, vm, id); }
+        try { registerNativeMember(klass, member, value, vm, id, !!options.static); }
         finally { vm.releaseHandle(id); }
       }
       descriptor.members.set(member, value);
       return this;
     }, configurable: true },
-    defineProperty: { value(member, getter, setter) { return this.defineMember(member, new NativeProperty(getter, setter)); }, configurable: true },
+    defineProperty: { value(member, getter, setter, options = {}) { return this.defineMember(member, new NativeProperty(getter, setter), options); }, configurable: true },
   });
 }
 
-function registerNativeMember(klass, name, member, interop, id) {
+function registerNativeMember(klass, name, member, interop, id, forceStatic = false) {
   const property = member instanceof NativeProperty;
-  const isStatic = property ? member.static : typeof member === 'function' && member[kNativeMember]?.static;
+  const isStatic = forceStatic || (property ? member.static : typeof member === 'function' && member[kNativeMember]?.static);
   if (isStatic) {
-    interop.setEncoded(id, name, property ? member : member.bind(klass), 0x10000 | 0x200 | 0x800);
+    const value = property ? new NativeProperty(
+      member.getter ? () => readNativeProperty(member, klass) : undefined,
+      member.setter ? (_, value) => writeNativeProperty(member, klass, value) : undefined,
+    ) : member.bind(klass);
+    interop.setEncoded(id, name, value, 0x10000 | 0x200 | 0x800);
   } else if (!isNativeClass(member) && (typeof member === 'function' || property)) {
     const callback = interop.storeHost(({ receiver, args, operation }) =>
       property
@@ -448,7 +462,7 @@ export function encodeNativeValue(value, interop) {
     if (!id) return interop.fail();
     interop.rememberExport(value, id);
     for (const [memberName, member] of members) {
-      registerNativeMember(value, memberName, member, interop, id);
+      registerNativeMember(value, memberName, member, interop, id, classes.get(value)?.statics.has(memberName) ?? false);
     }
     return id;
   }

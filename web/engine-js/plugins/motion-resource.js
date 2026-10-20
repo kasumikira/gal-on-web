@@ -1,7 +1,7 @@
 // Motion::ResourceManager, ported from plugins/motionplayer/ResourceManager.cpp.
 // Owns the PSB module cache keyed by the placed path, the source lookup used by
 // node source resolution, and the layer-id allocator.
-import { PSBFile } from './psb.js';
+import { PSBFile, decodePSBContainer } from './psb.js';
 
 const basename = path => String(path).replaceAll('\\', '/').split(/[\/>]/).at(-1);
 
@@ -23,10 +23,12 @@ export class MotionResourceManager {
     if (!placed) throw new Error(`Motion::ResourceManager: file not found '${path}'.`);
     const cached = this.modules.get(placed);
     if (cached) return cached;
-    const bytes = await this.storage.read(placed);
-    // .pbd / .mtn may be an mdf/zlib container; the PSB parser only handles the
-    // raw form, so a mismatch is a real, reported failure rather than silence.
-    const file = new PSBFile(bytes);
+    const bytes = await decodePSBContainer(await this.storage.read(placed));
+    // .pbd / .mtn may be an mdf/zlib container; decodePSBContainer unwraps it
+    // exactly like PSBRawFile.cpp tryDecodeMdf_guess does before parsing.
+    let file;
+    try { file = new PSBFile(bytes); }
+    catch (error) { throw new Error(`${error.message} (${placed})`); }
     const root = file.root;
     const id = root.get('id');
     if (!id || id.toText() !== 'motion') throw new Error(`this psb file is not motion file: ${placed}`);
@@ -112,3 +114,5 @@ export class MotionResourceManager {
 }
 
 export { basename };
+
+

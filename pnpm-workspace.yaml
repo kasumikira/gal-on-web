@@ -1,2 +1,4 @@
 allowBuilds:
   esbuild: true
+patchedDependencies:
+  libarchive.js@2.0.2: patches/libarchive.js@2.0.2.patch

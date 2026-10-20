@@ -8,6 +8,8 @@
 
 插件入口接收 `registerGlobal(name, value)`、`registerMembers(target, members)` 和已有宿主服务。新增类使用前者；向已有对象扩展方法使用后者。已注册 Native 类也可使用 `Class.defineMember(name, member)`。修改普通 JS 对象或 `Class.members` 本身不会更新已注册的 TJS 成员。
 
+向原版 Array/Dictionary 等脚本对象追加函数时，绑定层保留 TJS 调用提供的接收者，不将函数永久绑定到类对象。普通 JS 服务的方法仍绑定其宿主对象。插件上下文的 `readScript`、`callScript` 可访问包括普通 JS 全局服务在内的脚本成员，查询和调用经 VM API 完成；脚本追加或覆盖的成员不能从原始 JS 对象字段推断。对象结果仍遵循 retain/dispose 契约。
+
 `Plugins.link()` 等待插件注册完成才标记加载成功。插件只注册自身负责的接口；未实现插件报告缺失，不注入其它插件的空接口。业务实现仍留在 JS，注册和参数转换交给绑定层。
 
 ## 1. 业务类和装饰器
@@ -48,6 +50,10 @@ class Counter {
 
 插件在类已导出后追加接口时，使用 `Class.defineMember(name, methodOrProperty)` 或 `Class.defineProperty(name, getter, setter)`，同步注册到原版类；直接修改 `Class.members` 仅用于导出前组装声明。
 
+类级入口使用 `Class.defineMember(name, fn, { static: true })`；函数的 `this` 是 JS 类。程序化属性使用 `Class.defineProperty(name, getter, setter, options)`：getter 接收 `owner`，setter 接收 `(owner, value)`，默认 owner 为实例 native 状态；`options.static` 为 true 时 owner 为 JS 类。这与装饰器访问器通过 `this` 访问状态的语法不同。静态声明保存在 JS 类描述符中，导出前后均可追加，不记录脚本引擎内部引用关系。
+
+`NCB_ATTACH_FUNCTION` 仅说明向某个 dispatch 注册函数，不足以判定实例/静态语义。须核对函数是否使用 `objthis` 以及脚本调用方式：例如 `setDefaultAheads` 不依赖实例，`getSample` 则读取接收者的音频数据。
+
 无 `@nativeConstructor` 时，普通 JS 构造器接收脚本构造参数。有该装饰器时，普通构造器只建立基础字段，异步初始化放入被装饰的方法：
 
 ```js
@@ -71,6 +77,7 @@ async initialize(path) {
 | `script(object)` | 取得脚本访问影子；不延长引用期限 |
 | `nativeOwner(state)` | 通过 API 取得对应脚本 owner；不等于 retain |
 | `readScript(object, name, options)` | await 属性读取；`ignoreProperty` 请求原始成员，`optional` 仅容许该成员缺失 |
+| `readScriptTyped(object, name, options)` | await 成员读取，返回 `{ type, value, text }`；保留原版 int/real 分类，`ignoreProperty` 请求原始成员 |
 | `writeScript(object, name, value)` | await 脚本赋值，包括 setter 执行 |
 | `callScript(object, name, args, options)` | await 成员调用；默认接收者为 object，`receiver` 显式指定，`ignoreMissing` 仅用于契约允许缺失的事件 |
 | `invalidateScriptValue(object)` | await 原版对象失效及 native 终结；用于原版明确要求 invalidate 的清理路径，不代替 dispose |
@@ -90,9 +97,38 @@ await script(target).onClick(x, y);
 
 脚本属性可能执行 getter，不能将代理当作普通 JS 数据对象使用。赋值用 `writeScript`，让调用方能等待 setter。Array/Dictionary 的同步视图是绑定 API，不是本地数据副本；原始成员访问也不等于正常属性访问，不用它绕过 getter 或异步契约。
 
+Array 影子的 `.length` 通过原版 `TJSGetArrayElementCount` 查询实际元素数，不执行可覆盖的 `count` getter。需要脚本可见的 `count` 属性语义时，仍使用 `await readScript(array, 'count')`。
+
 Native 参数需要原版类型转换时，使用 `#krkr/values` 的 `string`、`number`、`integer`、`truth`。不要对脚本影子使用 JS `String(value)` 或模板插值来实现 TJS 字符串转换：JS 会尝试调用代理的 `toString/valueOf`，既不符合原版 Variant 转换，也可能启动未等待的脚本调用。
 
 普通 JS 对象、数组、Map、函数和浏览器资源由 V8 管理；TJS 对象使用统一影子，元数据只有 API 端点与不透明句柄。业务不访问 `_tjs_*`、WASM 内存或内部句柄，不缓存脚本对象的上下文、引用关系或有效性。类型、状态和实例查询走已有 API。新增底层操作集中到绑定层。
+
+### 保留成员的 TJS 类型
+
+序列化等需要区分 `int 1` 与 `real 1` 的接口使用 `readScriptTyped`，不要从 JS `typeof` 或是否有小数反推。`type` 与 `#krkr/values` 导出的 `TJSValueType` 比较：`VOID`、`OBJECT`、`STRING`、`OCTET`、`INTEGER`、`REAL`。这是一项 API 查询结果，不是脚本对象的本地状态副本。
+
+`value` 与普通读取结果一致：安全整数为 number，大整数为 bigint，实数为 number，Octet 为独立字节副本，对象为不透明影子，空对象为 null。函数同属 `OBJECT`，不可只靠 JS `typeof value === 'object'` 判断。`text` 仅对 INTEGER/REAL 提供原版 Variant 的字符串转换结果，避免序列化大整数时经 JS Number 丢失精度；它不是完整结构化序列化结果。
+
+```js
+import { readScriptTyped, retainScriptValue, disposeScriptValue } from '#krkr/native';
+import { TJSValueType } from '#krkr/values';
+
+async function formatNumber(object, name) {
+  const held = retainScriptValue(object);
+  try {
+    const item = await readScriptTyped(held, name, { ignoreProperty: true });
+    try {
+      if (item.type === TJSValueType.INTEGER) return `int ${item.text}`;
+      if (item.type === TJSValueType.REAL) return `real ${item.text}`;
+      throw new Error('Expected a TJS numeric member');
+    } finally { await disposeScriptValue(item.value); }
+  } finally { await disposeScriptValue(held); }
+}
+```
+
+调用后按契约释放 `item.value`；对原始值调用 dispose 是无操作，不能 dispose 外层普通 JS 结果记录来代替释放其中的影子。普通读取会执行 getter 并传播缺失成员错误；`ignoreProperty: true` 沿用原始读取 API，跳过 getter，缺失成员返回 VOID。跨后续异步使用时仍遵循原有引用契约。
+
+此能力复用现有 WASM 成员读取、类型查询及值转换 API，没有新增 C++ 导出或修改原版类/闭包的接收者规则。
 
 ## 3. 借用与延长
 

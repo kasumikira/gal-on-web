@@ -8,6 +8,39 @@ import { number } from '#krkr/values';
 import { callScript, script, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { Image } from './bitmap.js';
 import { getGPU } from './gpu.js';
+import { setKeyState, clearKeyStates } from './key-state.js';
+
+// WindowIntf.cpp TVPWindow::WndProc works in Win32 virtual-key codes. Browsers
+// report the same numbers in keyCode for letters, digits, navigation and
+// modifier keys, so use it first and fall back to an explicit table for keys a
+// browser reports as 0 (modifier keys used to be dropped entirely, which is why
+// games never saw Ctrl/Shift/Alt).
+const NAMED_KEY_CODES = {
+  Enter: 0x0d, Escape: 0x1b, Space: 0x20, Tab: 0x09, Backspace: 0x08,
+  ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28,
+  Insert: 0x2d, Delete: 0x2e, Home: 0x24, End: 0x23, PageUp: 0x21, PageDown: 0x22,
+  CapsLock: 0x14, Pause: 0x13, ScrollLock: 0x91, NumLock: 0x90, PrintScreen: 0x2c,
+  ContextMenu: 0x5d, Shift: 0x10, Control: 0x11, Alt: 0x12, Meta: 0x5b,
+};
+const KEY_CODE_ALIASES = {
+  ControlLeft: 0x11, ControlRight: 0x11, ShiftLeft: 0x10, ShiftRight: 0x10,
+  AltLeft: 0x12, AltRight: 0x12, MetaLeft: 0x5b, MetaRight: 0x5c,
+};
+// Side-specific virtual keys for System.getKeyState (VK_LCONTROL and friends).
+const SIDE_KEY_CODES = {
+  ControlLeft: 0xa2, ControlRight: 0xa3, ShiftLeft: 0xa0,
+  ShiftRight: 0xa1, AltLeft: 0xa4, AltRight: 0xa5,
+};
+export function virtualKeyCode(event) {
+  const code = event.keyCode || KEY_CODE_ALIASES[event.code] || NAMED_KEY_CODES[event.key];
+  if (code) return code;
+  return event.key?.length === 1 ? event.key.toUpperCase().charCodeAt(0) : 0;
+}
+export function virtualKeySide(event) {
+  return SIDE_KEY_CODES[event.code] ?? 0;
+}
+// DOM button order (left, middle, right, X1, X2) to VK_LBUTTON..VK_XBUTTON2.
+const BUTTON_KEY_CODES = [0x01, 0x04, 0x02, 0x05, 0x06];
 
 // LayerManager.cpp GetMostFrontChildAt: visible check, rect test in the
 // parent's coordinates, then children from the front (Children is stored
@@ -273,7 +306,7 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
     listen(view, 'gamepadconnected', deviceChange);
     listen(view, 'gamepaddisconnected', deviceChange);
     listen(view, 'focus', () => invoke(state.owner, 'onActivate', []));
-    listen(view, 'blur', () => invoke(state.owner, 'onDeactivate', []));
+    listen(view, 'blur', () => { clearKeyStates(); return invoke(state.owner, 'onDeactivate', []); });
     state.releaseMouseCapture = () => {
       if (capture.node?.window === state) {
         releaseCapture();
@@ -304,6 +337,9 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
 
     const pointerEvent = (type, handler) => listen(state.canvas, type, e => {
       if (type === 'wheel') e.preventDefault();
+      // System.getKeyState polls mouse buttons too (TVPGetKeyMouseAsyncState).
+      if (type === 'pointerdown') setKeyState(BUTTON_KEY_CODES[e.button], true);
+      else if (type === 'pointerup') setKeyState(BUTTON_KEY_CODES[e.button], false);
       const action = () => handler(e);
       const result = enqueueEvent(action);
       result.catch(error => reportEventFailure(type, error));
@@ -488,8 +524,6 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
     // LayerManager.cpp PrimaryKeyDown/PrimaryKeyUp/PrimaryKeyPress: the focused
     // layer receives the event, otherwise the primary layer's default handler
     // runs; the Window object also carries onKeyDown/onKeyUp/onKeyPress.
-    const keyCode = e => ({ Enter: 13, Escape: 27, Space: 32, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Backspace: 8, Tab: 9 }[e.key]
-      ?? (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
     const keyTarget = () => {
       if (state.focusedLayer) return state.focusedLayer;
       return state.primaryLayer ? Layer.peekNode(state.primaryLayer.owner) : null;
@@ -500,7 +534,10 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
       invoke(state.owner, name, name === 'onKeyPress' ? [key] : [key, shift]);
     };
     const dispatchKey = (name, e, process) => {
-      const key = keyCode(e);
+      const key = virtualKeyCode(e);
+      const down = name === 'onKeyDown';
+      // System.getKeyState polls this table (TVPGetAsyncKeyState).
+      setKeyState(virtualKeySide(e) || key, down);
       if (!key) return;
       const shift = (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 4 : 0) | (e.altKey ? 2 : 0);
       const node = keyTarget();
@@ -510,7 +547,7 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
     listen(document, 'keydown', e => dispatchKey('onKeyDown', e, 1));
     listen(document, 'keyup', e => dispatchKey('onKeyUp', e, 1));
     listen(document, 'keypress', e => {
-      const key = e.key.length === 1 ? e.key.charCodeAt(0) : keyCode(e);
+      const key = e.key.length === 1 ? e.key.charCodeAt(0) : virtualKeyCode(e);
       if (!key) return;
       const shift = (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 4 : 0) | (e.altKey ? 2 : 0);
       const node = keyTarget();

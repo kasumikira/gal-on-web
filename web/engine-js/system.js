@@ -2,6 +2,9 @@ import { config } from './global.js';
 // System class from cpp/core/base/SystemIntf.cpp and cpp/core/base/impl/SystemImpl.cpp.
 // The browser supplies the platform values in place of the native platform layer.
 import { v4 as uuidv4 } from 'uuid';
+import { readScript, disposeScriptValue } from '#krkr/native';
+import { TextStreamDecoder } from './text-stream.js';
+import { queryKeyState } from './key-state.js';
 const FRAME_INTERVAL_60_MS = 1000 / 60;
 const FRAME_TIME_EPSILON_MS = 1e-6;
 
@@ -75,6 +78,43 @@ export function createSystem({ vm, enqueueEvent, storage }) {
       });
     });
   };
+  // SystemImpl.cpp InitRegisterData / TVPReadRegValue: the registry is emulated
+  // by RegisterData.tjs in the app data path (executed as an expression). Keys
+  // split on '\' or '/' and walk nested dictionaries; a missing file or key
+  // yields void, which is the browser's answer for "value not present".
+  let registerData, registerDataLoaded = false;
+  const readRegisterData = async () => {
+    if (registerDataLoaded) return;
+    const name = storage.normalize('/RegisterData.tjs');
+    if (!await storage.exists(name)) {
+      registerDataLoaded = true;
+      return;
+    }
+    const decoder = new TextStreamDecoder();
+    registerData = await vm.source(
+      await decoder.read(await storage.read(name)), 'RegisterData.tjs', 0, undefined, true);
+    registerDataLoaded = true;
+  };
+  const walkRegisterData = async path => {
+    const parts = String(path).split(/[\\/]+/).filter(Boolean);
+    if (!parts.length) return undefined;
+    await readRegisterData();
+    let node = registerData, owned = false;
+    for (const part of parts) {
+      if (node === null || node === undefined || typeof node !== 'object') {
+        if (owned) await disposeScriptValue(node);
+        return undefined;
+      }
+      const next = await readScript(node, part, { ignoreProperty: true, optional: true });
+      if (owned) await disposeScriptValue(node);
+      node = next;
+      owned = true;
+      if (node === undefined) return undefined;
+    }
+    if (typeof node === 'string' || typeof node === 'number' || typeof node === 'boolean') return node;
+    if (owned) await disposeScriptValue(node);
+    return undefined;
+  };
   const api = {
     addContinuousHandler(handler) {
       if (!active) throw new Error('System is disposed');
@@ -141,6 +181,12 @@ export function createSystem({ vm, enqueueEvent, storage }) {
       if (values.length < 2) throw new Error('System.setArgument requires a name and value');
       args[String(values[0])] = String(values[1]);
     },
+    // SystemImpl.cpp 785: one path argument; without RegisterData.tjs every
+    // lookup is void.
+    readRegValue(...values) {
+      if (!values.length) throw new Error('System.readRegValue requires a path');
+      return walkRegisterData(String(values[0]));
+    },
     // SystemImpl.cpp createAppLock: single-process lock. The browser tab is
     // inherently single-instance per origin, so the lock always succeeds.
     createAppLock(...values) {
@@ -174,7 +220,12 @@ export function createSystem({ vm, enqueueEvent, storage }) {
       if (values.length < 2) throw new Error('System.assignMessage requires a code and a message');
       messages.set(Number(values[0]),String(values[1]));
     },
-    getKeyState() { return 0; },
+    // SystemImpl.cpp 726: (code, getcurrent = true). The browser side keeps the
+    // state in key-state.js, fed by the compositor's key/pointer handlers.
+    getKeyState(...values) {
+      if (!values.length) throw new Error('System.getKeyState requires a key code');
+      return queryKeyState(Math.trunc(Number(values[0])), values.length < 2 ? true : !!values[1]);
+    },
     toActualColor(value) { return Math.trunc(Number(value)); },
     clearGraphicCache() {},
     touchImages() { return {}; },

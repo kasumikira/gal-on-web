@@ -57,11 +57,23 @@ export function typeCategory(tag) {
 
 const decoder = new TextDecoder('utf-8');
 const encoder = new TextEncoder();
+// PSBRawFile.cpp tryDecodeMdf_guess: motion data shipped as .mtn/.pbd may be an
+// "mdf\0" container — signature, u32 decoded size, zlib stream. The reference
+// unwraps it before parsing, so every loader must run the bytes through here.
+export async function decodePSBContainer(bytes) {
+  if (bytes.length < 0x0b || u32(bytes, 0) !== 0x0066646d) return bytes;
+  const stream = new Blob([bytes.subarray(8)]).stream().pipeThrough(new DecompressionStream('deflate'));
+  const decoded = new Uint8Array(await new Response(stream).arrayBuffer());
+  if (sig32(decoded, 0) !== 0x00425350) throw new Error('psb: mdf payload is not a PSB file');
+  return decoded;
+}
 export class PSBFile {
   constructor(bytes) {
     this.bytes = bytes;
     if (bytes.length < 0x40) throw new Error('psb: file too small');
-    if (sig32(bytes, 0) !== 0x00425350 && sig32(bytes, 0) !== 0x0066646d) throw new Error('psb: invalid signature');
+    const signature = sig32(bytes, 0);
+    if (signature === 0x0066646d) throw new Error('psb: mdf container must be decoded with decodePSBContainer');
+    if (signature !== 0x00425350) throw new Error('psb: invalid signature');
     this.version = u16(bytes, 4);
     this.encrypt = u16(bytes, 6);
     this.encryptData = u32(bytes, 8);
@@ -72,7 +84,13 @@ export class PSBFile {
     this.chunkLengths = u32(bytes, 28);
     this.chunkData = u32(bytes, 32);
     this.entries = u32(bytes, 36);
-    if (bytes.length < this.encryptData || bytes.length < this.entries) throw new Error('psb: offsets outside file');
+    // PSBRawFile.cpp PSBRawOwner::Refresh(true): every table offset must be
+    // inside the buffer, and the encryption/entry pointers must be strictly so.
+    const size = bytes.length;
+    if (!(size > this.encryptData && size >= this.names && size >= this.strings &&
+          size >= this.stringsData && size >= this.chunkOffsets && size >= this.chunkLengths &&
+          size >= this.chunkData && size > this.entries))
+      throw new Error(`psb: offsets outside file (size ${size}, encryptData ${this.encryptData}, entries ${this.entries})`);
     this.nameCharset = new PackedArray(bytes, this.names);
     this.nameData = new PackedArray(bytes, this.names + this.nameCharset.byteLength);
     this.nameIndexes = new PackedArray(bytes, this.names + this.nameCharset.byteLength + this.nameData.byteLength);

@@ -2,6 +2,10 @@ import { scriptBinding } from '#krkr/native';
 
 // Script values are opaque handles. Context construction and queries run in TJS2.
 export const SHADOW = Symbol('TJS shadow');
+// Public value kinds returned by the WASM API, not JS typeof categories.
+export const TJSValueType = Object.freeze({
+  VOID: 0, OBJECT: 1, STRING: 2, OCTET: 3, INTEGER: 4, REAL: 5,
+});
 // Primitive conversions use TJS2's stateless Variant operations.
 let primitiveRuntime;
 export function setPrimitiveRuntime(vm) { primitiveRuntime = vm; }

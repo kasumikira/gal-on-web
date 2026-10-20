@@ -20,7 +20,7 @@
 
 首次使用 CMake Tools 按 .vscode/settings.json 配置本目录，生成 out/kirikiri/CMakeCache.txt。之后执行 pnpm build:vm。依赖安装位置为 out/vcpkg_installed；配置和编译缓存位于 out/kirikiri。
 
-构建脚本生成并发布 web/engine-js/tjs-runtime/tjs-runtime.js 与 tjs-runtime.wasm。前者是同一模块的加载器。pnpm build:js 将该唯一 WASM 模块打包到前端产物中。
+构建脚本生成并发布 web/engine-js/tjs-runtime/tjs-runtime.js 与 tjs-runtime.wasm。前者是同一模块的加载器。pnpm build:js 将该脚本运行时打包到前端产物中；libarchive.js 等可选资源依赖的 WASM 不属于脚本引擎。
 
 Bison 语法和日期词表按输入依赖在构建目录生成。源码修正直接保存在代码中，不在 CMake 配置期间字符串替换或生成修补副本。内嵌 JS 使用 clang-format off/on，避免 C++ 格式化破坏 JS 运算符。
 
@@ -30,4 +30,4 @@ Bison 语法和日期词表按输入依赖在构建目录生成。源码修正�
 
 scriptsEx 使用直接注册替代跨 DLL 的 ncbind 注册，属性调用直接使用同模块 dispatch；脚本对象操作方法体沿用原版。浏览器存储和文本编码通过平台接口接入 JS 资源层。
 
-JS WeakMap 仅分配宿主对象的身份编号，不缓存脚本句柄、有效性或所有权。C++ 维护身份到导出项、dispatch 到导出项和 owner 到持有值的索引；删除索引和提取 Variant 均发生在可能重入的释放之前。同一身份的导出选择以及持有值的释放按句柄升序处理，保持原先有序表的行为。
+JS WeakMap 保存宿主身份、类声明元数据和影子的 API 端点/不透明句柄，不记录脚本对象的调用关系、有效性或所有权。C++ 维护身份到导出项、dispatch 到导出项和 owner 到持有值的索引；删除索引和提取 Variant 均发生在可能重入的释放之前。同一身份的导出选择以及持有值的释放按句柄升序处理，保持原先有序表的行为。

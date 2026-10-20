@@ -103,11 +103,24 @@ export class Storages {
     const file = this.files.get(path);
     if (!file) throw new Error(`Archive not found: ${path}`);
     const backend = file.saved ? this.saveStorage : this.gameStorage;
-    const archive = await new XP3Archive(
-      { read: (offset, length) => backend.read(file.path, offset, length) },
-      this.extractionFilter?.apply,
-    ).open();
+    const source = { read: (offset, length) => backend.read(file.path, offset, length) };
+    // StorageImpl.cpp TVPOpenArchive selects by file contents, not extension.
+    const header = await source.read(0, 19);
+    const sevenZip = [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].every((byte, i) => header[i] === byte);
+    const archive = sevenZip
+      ? await (await import('./seven-zip.js')).openSevenZip(source, file.size)
+      : await new XP3Archive(source, this.extractionFilter?.apply).open(header);
     this.archives.set(path,archive); return archive;
+  }
+  async closeArchive(name) {
+    const path = this.normalize(name), archive = this.archives.get(path);
+    if (!archive) return;
+    await archive.finalize?.();
+    this.archives.delete(path);
+  }
+  async finalize() {
+    await Promise.all([...this.archives.values()].map(archive => archive.finalize?.()));
+    this.archives.clear();
   }
   async exists(path) {
     const found = this.findMedia(path);
@@ -170,9 +183,9 @@ export class Storages {
     if (!path || this.findMedia(path) || path.includes('>')) return false;
     const file = this.files.get(path);
     if (!file?.saved || !this.saveStorage) return false;
+    await this.closeArchive(path);
     if (!await this.saveStorage.delete(file.path)) return false;
     this.files.delete(path);
-    this.archives.delete(path);
     this.autoPathTable = undefined;
     this.revision++;
     return true;
@@ -185,9 +198,9 @@ export class Storages {
     if (!this.saveStorage || this.findMedia(path) || path.includes('>')) {
       throw new Error(`Storage is read-only: ${name}`);
     }
+    await this.closeArchive(path);
     await this.saveStorage.write(path, bytes.slice());
     this.files.set(path, { path, size: bytes.byteLength, saved: true });
-    this.archives.delete(path);
     this.autoPathTable = undefined;
     this.revision++;
   }

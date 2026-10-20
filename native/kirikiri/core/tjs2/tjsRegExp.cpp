@@ -19,6 +19,33 @@
 
 namespace TJS {
 
+    // TJS/Boost regex uses four hexadecimal digits after \x. Oniguruma's
+    // Perl syntax requires braces for Unicode code points in UTF-16 patterns.
+    static ttstr TJSNormalizeRegExpEscapes(const tjs_char *pattern) {
+        std::u16string result;
+        const auto hex = [](tjs_char ch) {
+            return (ch >= u'0' && ch <= u'9') ||
+                (ch >= u'a' && ch <= u'f') || (ch >= u'A' && ch <= u'F');
+        };
+        while (*pattern) {
+            if (*pattern == u'\\' && pattern[1]) {
+                result += *pattern++;
+                if (*pattern == u'x' && hex(pattern[1]) && hex(pattern[2]) &&
+                    hex(pattern[3]) && hex(pattern[4])) {
+                    result += u"x{";
+                    result.append(pattern + 1, 4);
+                    result += u'}';
+                    pattern += 5;
+                } else {
+                    result += *pattern++;
+                }
+            } else {
+                result += *pattern++;
+            }
+        }
+        return ttstr(result.c_str());
+    }
+
     //---------------------------------------------------------------------------
     // Flags
     //---------------------------------------------------------------------------
@@ -301,8 +328,9 @@ TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/ _compile) {
             _this->RegEx = nullptr;
         }
         OnigErrorInfo einfo;
-        int r = onig_new(&(_this->RegEx), (UChar *)exprstart,
-                         (UChar *)(expr.c_str() + expr.length()),
+        const ttstr pattern = TJSNormalizeRegExpEscapes(exprstart);
+        int r = onig_new(&(_this->RegEx), (UChar *)pattern.c_str(),
+                         (UChar *)(pattern.c_str() + pattern.length()),
                          flags & ((ONIG_OPTION_MAXBIT << 1) - 1),
                          ONIG_ENCODING_UTF16_LE, ONIG_SYNTAX_PERL, &einfo);
         if(r) {
@@ -644,8 +672,9 @@ void tTJSNC_RegExp::Compile(tjs_int numparams, tTJSVariant **param,
         _this->RegEx = nullptr;
     }
     OnigErrorInfo einfo;
-    int r = onig_new(&(_this->RegEx), (UChar *)expr.c_str(),
-                     (UChar *)(expr.c_str() + expr.length()),
+    const ttstr pattern = TJSNormalizeRegExpEscapes(expr.c_str());
+    int r = onig_new(&(_this->RegEx), (UChar *)pattern.c_str(),
+                     (UChar *)(pattern.c_str() + pattern.length()),
                      flags & ((ONIG_OPTION_MAXBIT << 1) - 1),
                      ONIG_ENCODING_UTF16_LE, ONIG_SYNTAX_PERL, &einfo);
     if(r) {

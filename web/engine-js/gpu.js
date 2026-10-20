@@ -800,7 +800,7 @@ class GPUDevice {
   }
   create(width, height) {
     const gl = this.gl;
-    if (width > this.maxTextureSize || height > this.maxTextureSize) throw new Error(`GPU image exceeds texture limit: ${width}x${height}`);
+    if (width <= 0 || height <= 0 || width > this.maxTextureSize || height > this.maxTextureSize) throw new Error(`GPU image has invalid dimensions: ${width}x${height}`);
     const texture = gl.createTexture();
     const framebuffer = gl.createFramebuffer();
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -808,10 +808,16 @@ class GPUDevice {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU framebuffer is incomplete');
+    // Every target uses one immutable, sized RGBA8 colour attachment. Validate
+    // this layout once; querying every allocation synchronously drains the GPU
+    // command queue during rapid layer creation (notably Ctrl skip).
+    if (!this.framebufferValidated) {
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU framebuffer is incomplete');
+      this.framebufferValidated = true;
+    }
     return { device: this, texture, framebuffer, width, height, modified: false, filter: gl.NEAREST };
   }
   texture(image, discard = false) {

@@ -28,7 +28,10 @@ export async function createRuntime(options) {
   const { entry, gameStorage, saveStorage, wasmURL, document, inform, message } = config;
   const storage = new Storages(gameStorage, saveStorage, entry + '>');
   await storage.initialize();
-  if (!await storage.exists(storage.normalize(entry))) throw new Error(`Game entry not found: ${entry}`);
+  if (!await storage.exists(storage.normalize(entry))) {
+    await storage.finalize();
+    throw new Error(`Game entry not found: ${entry}`);
+  }
   storage.addAutoPath('/');
   storage.extractionFilter = await createXP3Filter(storage, wasmURL, message);
   const gpu = initializeGPU(document);
@@ -37,6 +40,7 @@ export async function createRuntime(options) {
   try {
     vm = await new TJSInterop(wasmURL).init(global);
   } catch (error) {
+    await storage.finalize();
     await storage.extractionFilter?.finalize();
     gpu.finalize();
     throw error;
@@ -47,17 +51,30 @@ export async function createRuntime(options) {
   };
   for (const [name, value] of Object.entries(initializeConstants())) register(name, value);
   register('Rect', createRectClass());
-  register('Plugins', new Plugins({
+  let plugins;
+  plugins = new Plugins({
     global,
     storage,
     registerGlobal: register,
-    registerMembers: (target, members) => vm.registerMembers(target, members),
+    registerMembers: (target, members, options) => vm.registerMembers(target, members, options),
+    callScript: (object, name, args = [], { receiver = object, ignoreMissing = false } = {}) =>
+      vm.callMember(object, name, receiver, args, ignoreMissing),
+    readScript: async (object, name, { ignoreProperty = false, optional = false } = {}) => {
+      try { return await vm.get(object, name, ignoreProperty); }
+      catch (error) {
+        if (optional && error.message === `TJS member not found: ${name}`) return undefined;
+        throw error;
+      }
+    },
+    // PackinOne-style loaders link their sub-plugins through the registry.
+    link: name => plugins.link(name),
     get(name) {
       const value = global[name];
       if (value === undefined) throw new Error(`Plugin service is not available: ${name}`);
       return value;
     },
-  }));
+  });
+  register('Plugins', plugins);
   register('BasicDrawDevice', createBasicDrawDeviceClass());
   register('Window', createWindowClass(global.BasicDrawDevice));
   register('MenuItem', createMenuItemClass(global.Window));
@@ -260,6 +277,7 @@ export async function createRuntime(options) {
         for (const resource of resources) await resource.finalize?.();
         await vm.dispose();
       } finally {
+        await storage.finalize();
         await storage.extractionFilter?.finalize();
         gpu.finalize();
         if (audioContext) {

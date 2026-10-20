@@ -365,8 +365,6 @@ extern "C"
     }
     EMSCRIPTEN_KEEPALIVE int tjs_array_count(Runtime *r, int id)
     {
-        tTJSVariant count;
-        success(r->value(id).AsObjectClosureNoAddRef().PropGet(0, TJS_W("count"), nullptr, &count, nullptr));
-        return count.AsInteger();
+        return TJSGetArrayElementCount(r->value(id).AsObjectNoAddRef());
     }
 }

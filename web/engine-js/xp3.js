@@ -21,8 +21,8 @@ function chunkEnd(data, offset, limit) {
 }
 export class XP3Archive {
   constructor(source, filter) { this.source = source; this.filter = filter; this.entries = new Map(); }
-  async open() {
-    const header = await this.source.read(0, 19);
+  async open(header) {
+    header ??= await this.source.read(0, 19);
     if (!signature.every((byte, i) => header[i] === byte)) throw new Error('Invalid XP3 signature');
     let pointer = u64(view(header), 11);
     for (;;) {

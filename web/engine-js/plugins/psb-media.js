@@ -1,4 +1,4 @@
-import { PSBFile, PSBNode } from './psb.js';
+import { PSBFile, PSBNode, decodePSBContainer } from './psb.js';
 
 // psbfile.dll's PSBMedia (PSBMedia.cpp): the "psb://<container>/<path>"
 // storage media.  The container is a separate storage name that the ordinary
@@ -13,7 +13,10 @@ export function registerPSBMedia(storage) {
     const placed = await storage.getPlacedPath(slash<0?local:local.slice(0,slash));
     if (!placed) return null;
     if (cached && cached.placed===placed && cached.revision===storage.revision) return cached.file;
-    const file = new PSBFile(await storage.read(placed));
+    const bytes = await decodePSBContainer(await storage.read(placed));
+    let file;
+    try { file = new PSBFile(bytes); }
+    catch (error) { throw new Error(`${error.message} (${placed})`); }
     cached = { placed, revision:storage.revision, file };
     return file;
   };
@@ -48,3 +51,5 @@ export function registerPSBMedia(storage) {
     },
   });
 }
+
+

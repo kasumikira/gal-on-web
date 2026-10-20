@@ -1,6 +1,6 @@
 import { TextStreamDecoder, streamOffset, encodeTextStream } from "./text-stream.js";
 import { TJSRuntime } from "./tjs-runtime/runtime.js";
-import { Closure, SHADOW, unwrap, setPrimitiveRuntime, clearPrimitiveRuntime } from "#krkr/values";
+import { Closure, SHADOW, TJSValueType, unwrap, setPrimitiveRuntime, clearPrimitiveRuntime } from "#krkr/values";
 import {
   createNativeProperty,
   encodeNativeValue,
@@ -21,6 +21,8 @@ const INTERPRETER_CLASSES = [
   "KAGParser",
   "Scripts",
 ];
+const TJS_MEMBER_ENSURE_IGNORE_PROPERTY = 0x0a00;
+const TJS_HIDDEN_MEMBER = 0x1000;
 
 // Synchronous member access reads raw stored variants only. Script getters and
 // calls always enter the asynchronous get/set/call path and can suspend in JSPI.
@@ -514,7 +516,7 @@ export class TJSInterop {
     }
     return id;
   }
-  setEncoded(id, name, value, flags = 2560) {
+  setEncoded(id, name, value, flags = TJS_MEMBER_ENSURE_IGNORE_PROPERTY) {
     this.withString(name, (p) => {
       const encoded = this.encode(value);
       try {
@@ -631,10 +633,11 @@ export class TJSInterop {
     this.global[name] = value;
     return value;
   }
-  registerMembers(target, members) {
+  registerMembers(target, members, { hidden = false } = {}) {
+    const flags = hidden ? TJS_MEMBER_ENSURE_IGNORE_PROPERTY | TJS_HIDDEN_MEMBER : undefined;
     for (const [name, value] of Object.entries(members)) {
       if (isNativeClass(target)) target.defineMember(name, value);
-      else this.rawSet(target, name, typeof value === 'function' ? value.bind(target) : value);
+      else this.rawSet(target, name, typeof value === 'function' && !scriptBinding(target) ? value.bind(target) : value, flags);
     }
   }
   async source(
@@ -677,6 +680,22 @@ export class TJSInterop {
         ),
       ),
     );
+  }
+  async getTyped(value, name, ignoreProperty = false) {
+    return this.withAsyncReference(value, async id => {
+      const arrayIndex = ignoreProperty && Array.isArray(unwrap(value)) && /^-?\d+$/.test(String(name));
+      const result = ignoreProperty
+        ? arrayIndex
+          ? this.module._tjs_object_get_by_num_raw(this.runtime, id, Number(name))
+          : this.withString(name, p => this.module._tjs_object_get_raw(this.runtime, id, p))
+        : await this.withString(name, p => this.module._tjs_object_get(this.runtime, id, p, 0));
+      if (!result) this.fail();
+      const type = this.module._tjs_value_type(this.runtime, result);
+      const text = type === TJSValueType.INTEGER || type === TJSValueType.REAL
+        ? this.decode(this.module._tjs_value_convert(this.runtime, result, 3))
+        : undefined;
+      return { type, value: this.decode(result), text };
+    });
   }
   async set(value, name, member, ensure = false, ignoreProperty = false) {
     return this.withAsyncReference(value, async (id) =>

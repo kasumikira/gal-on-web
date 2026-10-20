@@ -76,7 +76,7 @@ export class Image {
       this.gpu.device.copy(copy, this);
       return copy;
     }
-    return Image.from(this.pixels, this.width, this.height, { gray: this.gray });
+    return Image.from(this._pixels ?? this.pixels, this.width, this.height, { gray: this.gray });
   }
   resized(width, height, color = 0) {
     if (width === this.width && height === this.height) return this;
@@ -108,10 +108,12 @@ export class Image {
       this._pixels = null;
       this.gpu = null;
     }
+    // Resident sources stay on the GPU, including transition snapshots. A CPU
+    // copy would need another full upload as soon as the copy is rendered.
     if (src.gpu) {
       src.gpu.device.copy(this, src);
     } else {
-      const source = src.pixels;
+      const source = src._pixels ?? src.pixels;
       const target = this._pixels ??= new Uint8ClampedArray(source.length);
       target.set(source);
       this.gpu = null;
@@ -145,10 +147,29 @@ export class Image {
     if (r <= l || b <= t) return false;
     const [cr, cg, cb, ca] = colorBytes(color);
     const gpu = getGPU();
-    if (!this.gray && (this.gpu || this._pixels === null)) {
+    const full = l === 0 && t === 0 && r === this.width && b === this.height;
+    // A full clear has the same known result on both sides. Preserve residency
+    // for the next GPU operation and valid CPU bytes for the next text draw.
+    // Dropping the texture here forces an entire layer upload on each redraw.
+    if (!this.gray && !maskOnly && full && this.gpu && this._pixels) {
+      gpu.fill(this, { left: l, top: t, right: r, bottom: b }, [cr, cg, cb, ca]);
+      new Uint32Array(this._pixels.buffer, this._pixels.byteOffset, this.width * this.height)
+        .fill((ca << 24 | cb << 16 | cg << 8 | cr) >>> 0);
+      // Externally writable images are materialized by GPUDevice.commit.
+      if (this.gpu) this.gpu.modified = false;
+      return true;
+    }
+    // Preserve GPU-authoritative contents on partial fills. Reading the whole
+    // image to clear a rectangle needlessly stalls the render pipeline. CPU
+    // text planes stay on the CPU when their bytes are still authoritative.
+    if (!this.gray && (this._pixels === null || this.gpu?.modified && (!full || maskOnly))) {
       gpu.fill(this, { left: l, top: t, right: r, bottom: b }, [cr, cg, cb, ca], maskOnly);
       return true;
     }
+    // A complete overwrite needs none of the previous GPU contents. Keep the
+    // existing CPU allocation for text drawing without synchronously reading
+    // back the texture that is about to be erased.
+    if (!maskOnly && full) this.gpu = null;
     // The supported Windows/browser runtime is little-endian: fill complete
     // RGBA pixels as words instead of assigning four channels per pixel.
     if (!maskOnly || this.gray) {
@@ -211,7 +232,10 @@ export class Image {
   // Copy both main and mask planes (TVP_BB_COPY_MAIN | TVP_BB_COPY_MASK).
   copyRect(x, y, src, rect, { main = true, mask = true } = {}) {
     const gpu = getGPU();
-    if (!this.gray && !src.gray && (this.gpu || src.gpu)) {
+    // Same rule as fill(): a plane that owns CPU bytes stays CPU-authoritative,
+    // otherwise a GPU copy marks the texture modified and the next CPU text draw
+    // has to read the whole plane back.
+    if (!this.gray && !src.gray && this._pixels === null) {
       if (!main && !mask) return true;
       const source = src === this ? src.clone() : src;
       const sourceRect = { left: Math.max(0, rect.left), top: Math.max(0, rect.top),

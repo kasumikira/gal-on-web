@@ -1198,6 +1198,7 @@ export function createLayerClass(document, {
   // Exposed for the compositor and the Window wiring.
   Layer.advanceTransition = advanceTransition;
   Layer.stop = () => {
+    drawText.finalize();
     stopTransitionScheduling();
     if (!Layer.instances.vm) return;
     for (const state of Layer.instances.values()) stopTransitionScheduling(state.node);

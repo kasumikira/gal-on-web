@@ -1,6 +1,7 @@
 import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner } from '#krkr/native';
 import { number, truth, Closure } from '#krkr/values';
 import { Image, colorBytes, clamp255 } from './bitmap.js';
+import { LRUCache } from 'lru-cache';
 
 export class FontState {
   constructor() {
@@ -182,6 +183,34 @@ function prerenderedGlyphImage(font, glyph, color, aa) {
   return image;
 }
 
+// The message layer repaints the whole visible line on every reveal step, so the
+// same glyph is rasterised and blurred dozens of times per line. Cache the final
+// glyph variant (coloured + shadow blur) per (font, glyph, colour, aa, blur) and
+// turn the repeated work into cheap blits. Keep pixel storage bounded per
+// runtime, with an entry cap for key and object overhead.
+const GLYPH_CACHE_BYTES = 16 * 1024 * 1024;
+const GLYPH_CACHE_ENTRIES = 4096;
+let nextFontCacheId = 1;
+const fontCacheIds = new WeakMap();
+function fontCacheId(font) {
+  let id = fontCacheIds.get(font);
+  if (!id) fontCacheIds.set(font, id = nextFontCacheId++);
+  return id;
+}
+function cachedGlyph(cache, key, create) {
+  const entry = cache.get(key);
+  if (entry !== undefined) return entry;
+  const created = create();
+  const bytes = created?.image?.pixels.byteLength;
+  if (bytes > 0 && bytes <= GLYPH_CACHE_BYTES) cache.set(key, created);
+  return created;
+}
+function prerenderedGlyphVariant(cache, font, glyph, color, aa, blurWidth, blurLevel) {
+  const key = `${fontCacheId(font)}|${glyph.offset}|${glyph.width}x${glyph.height}|${color}|${aa ? 1 : 0}|${blurWidth}|${blurLevel}`;
+  return cachedGlyph(cache, `prerendered|${key}`, () =>
+    blurGlyphImage(prerenderedGlyphImage(font, glyph, color, aa), blurWidth, blurLevel));
+}
+
 // LayerBitmapImpl::ApplyFont derives these offsets from the rasterizer ascent.
 // Canvas does not expose the native rasterizer's ascent, so use its measured
 // glyph ascent when available and retain the same integer/trigonometric rules.
@@ -326,9 +355,21 @@ function textCanvasRegion(node, bounds) {
   return { left, top, width: right - left, height: bottom - top };
 }
 
-function drawFallback(document, node, glyphs, color, opa, shadowWidth = 0, offsetX = 0, offsetY = 0, angle = 0, blurLevel = 255) {
+function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0, offsetX = 0, offsetY = 0, angle = 0, blurLevel = 255) {
   if (!glyphs.length) return false;
   if (!document?.createElement) throw new Error('TJS prerendered font fallback requires a browser canvas');
+  blurLevel = Math.max(0, Math.min(255, Math.abs(Math.trunc(blurLevel))));
+  // Horizontal text takes the cached per-character path: each character is
+  // rasterised once per (font, colour, blur) and then blitted, instead of
+  // re-rasterising the whole line on every repaint.
+  if (!angle) {
+    for (const item of glyphs) {
+      const entry = fallbackGlyphVariant(cache, document, node, item.character, color, shadowWidth, blurLevel);
+      if (!entry) continue;
+      clipBlit(node, entry.image, item.x + offsetX + entry.left, item.y + offsetY + entry.top, { opa, holdAlpha: !!node.holdAlpha });
+    }
+    return true;
+  }
   const canvas = document.createElement('canvas');
   const context = canvas.getContext('2d', { willReadFrequently: true });
   const size = Math.abs(node.font.height) | 0;
@@ -346,7 +387,6 @@ function drawFallback(document, node, glyphs, color, opa, shadowWidth = 0, offse
   canvas.width = region.width; canvas.height = region.height;
   context.font = font;
   context.imageSmoothingEnabled = true;
-  blurLevel = Math.max(0, Math.min(255, Math.abs(Math.trunc(blurLevel))));
   context.fillStyle = `rgba(${r},${g},${b},1)`;
   for (const item of glyphs) {
     context.save();
@@ -363,10 +403,51 @@ function drawFallback(document, node, glyphs, color, opa, shadowWidth = 0, offse
   return clipBlit(node, blurred.image, region.left + blurred.offsetX, region.top + blurred.offsetY, { opa, holdAlpha: !!node.holdAlpha });
 }
 
+// One browser-rasterised character, positioned by its own bounding box. The
+// caller blits it at `left`/`top` relative to the pen position.
+function renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel) {
+  const size = Math.abs(node.font.height) | 0;
+  const flags = node.font.flags;
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const font = `${flags & 0x0200 ? 'bold ' : ''}${flags & 0x0100 ? 'italic ' : ''}${size}px "${String(node.font.face).replace(/"/g, '')}", sans-serif`;
+  context.font = font;
+  const measured = measuredTextBounds(context, character, size, flags);
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+  for (const [l, t, r, b] of measured.boxes) {
+    left = Math.min(left, l); top = Math.min(top, t);
+    right = Math.max(right, r); bottom = Math.max(bottom, b);
+  }
+  if (!Number.isFinite(left) || right <= left || bottom <= top) return null;
+  const pad = Math.abs(Math.trunc(shadowWidth)) + 2;
+  const originX = Math.floor(left) - pad, originY = Math.floor(top) - pad;
+  const width = Math.max(1, Math.ceil(right) + pad - originX);
+  const height = Math.max(1, Math.ceil(bottom) + pad - originY);
+  canvas.width = width; canvas.height = height;
+  context.font = font;
+  context.imageSmoothingEnabled = true;
+  const [r, g, b] = colorBytes(color);
+  context.fillStyle = `rgba(${r},${g},${b},1)`;
+  context.translate(-originX, -originY);
+  context.fillText(character, 0, size * 0.8);
+  const metrics = context.measureText(character), line = Math.max(1, Math.ceil(size / 14));
+  if (flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
+  if (flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
+  const source = Image.from(context.getImageData(0, 0, width, height).data, width, height);
+  const blurred = blurGlyphImage(source, shadowWidth, blurLevel);
+  return { image: blurred.image, left: originX + blurred.offsetX, top: originY + blurred.offsetY };
+}
+
+function fallbackGlyphVariant(cache, document, node, character, color, shadowWidth, blurLevel) {
+  const key = `${String(node.font.face)}|${node.font.height}|${node.font.flags}|${character}|${color}|${shadowWidth}|${blurLevel}`;
+  return cachedGlyph(cache, `fallback|${key}`,
+    () => renderFallbackGlyph(document, node, character, color, shadowWidth, blurLevel));
+}
+
 // TVPGetCharacter uses the mapped glyph's bitmap and advances by IncX/IncY.
 // Returning false when a character is absent lets the normal browser font
 // renderer handle the mixed mapped/fallback case as the native rasterizer does.
-function drawPrerenderedText(document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy) {
+function drawPrerenderedText(cache, document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy) {
   const font = node.font?.prerenderedFont;
   if (!font) return false;
   opa = normalizeTextOpacity(node, opa);
@@ -402,17 +483,16 @@ function drawPrerenderedText(document, node, x, y, text, color, opa, aa, shadowL
   }
   const drawSet = (set, drawColor, drawOpa, ox = 0, oy = 0, blurWidth = 0, blurLevel = 255) => {
     for (const item of set) {
-      const source = prerenderedGlyphImage(font, item.glyph, drawColor, aa);
-      const blurred = blurGlyphImage(source, blurWidth, blurLevel);
+      const blurred = prerenderedGlyphVariant(cache, font, item.glyph, drawColor, aa, blurWidth, blurLevel);
       clipBlit(node, blurred.image, item.x + ox + blurred.offsetX, item.y + oy + blurred.offsetY, { opa: drawOpa, holdAlpha: !!node.holdAlpha });
     }
   };
   if (shadowLevel) {
     drawSet(glyphs, shadowColor, opa, Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), shadowWidth, Math.abs(Math.trunc(shadowLevel)));
-    drawFallback(document, node, fallback, shadowColor, opa, shadowWidth, Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), ascent.angle, shadowLevel);
+    drawFallback(cache, document, node, fallback, shadowColor, opa, shadowWidth, Math.trunc(shadowOfsx), Math.trunc(shadowOfsy), ascent.angle, shadowLevel);
   }
   drawSet(glyphs, color, opa);
-  drawFallback(document, node, fallback, color, opa, 0, 0, 0, ascent.angle);
+  drawFallback(cache, document, node, fallback, color, opa, 0, 0, 0, ascent.angle);
   return true;
 }
 
@@ -578,10 +658,15 @@ export function createFontClass(document, { storage, Rect } = {}) {
 
 export function createTextRenderer(document) {
   let textCanvas;
-  return function drawText(node, x, y, text, color, opa, aa = true, shadowLevel = 0, shadowColor = 0, shadowWidth = 0, shadowOfsx = 0, shadowOfsy = 0) {
+  const glyphCache = new LRUCache({
+    max: GLYPH_CACHE_ENTRIES,
+    maxSize: GLYPH_CACHE_BYTES,
+    sizeCalculation: entry => entry.image.pixels.byteLength,
+  });
+  const drawText = function drawText(node, x, y, text, color, opa, aa = true, shadowLevel = 0, shadowColor = 0, shadowWidth = 0, shadowOfsx = 0, shadowOfsy = 0) {
     opa = normalizeTextOpacity(node, opa);
     if (opa === 0) return;
-    if (drawPrerenderedText(document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy)) return;
+    if (drawPrerenderedText(glyphCache, document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy)) return;
     const [r, g, b] = colorBytes(color), [sr, sg, sb] = colorBytes(shadowColor);
     const canvas = textCanvas ??= document.createElement('canvas');
     const context = canvas.getContext('2d', { willReadFrequently: true });
@@ -629,4 +714,6 @@ export function createTextRenderer(document) {
       clipBlit(node, rendered.image, rendered.left, rendered.top, { opa, holdAlpha: !!node.holdAlpha });
     }
   };
+  drawText.finalize = () => glyphCache.clear();
+  return drawText;
 }

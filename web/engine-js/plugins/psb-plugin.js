@@ -1,5 +1,5 @@
 import { nativeClass, nativeMethod, nativeProperty } from '#krkr/native';
-import { PSBFile as PSBFileReader } from './psb.js';
+import { PSBFile as PSBFileReader, decodePSBContainer } from './psb.js';
 import { registerPSBMedia } from './psb-media.js';
 import { psbVariant } from './psb-value.js';
 
@@ -14,11 +14,14 @@ export function registerPSBFile({ storage, registerGlobal }) {
     }
     @nativeMethod async load(value) {
       if (typeof value !== 'string' && !(value instanceof Uint8Array)) throw new Error('invalid argument for PSBFile.load()');
-      const bytes = typeof value === 'string' ? await storage.read(value) : value.slice();
-      this.file = new PSBFileReader(bytes);
+      const bytes = await decodePSBContainer(typeof value === 'string' ? await storage.read(value) : value.slice());
+      try { this.file = new PSBFileReader(bytes); }
+      catch (error) { throw new Error(`${error.message} (${typeof value === 'string' ? value : 'octet'})`); }
       return 1;
     }
     @nativeProperty get root() { return psbVariant(this.file?.root); }
   }
   registerGlobal('PSBFile', PSBFile);
 }
+
+

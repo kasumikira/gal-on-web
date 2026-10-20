@@ -17,6 +17,7 @@
     "chardet": "2.1.0",
     "fft.js": "4.0.4",
     "gl-matrix": "3.4.4",
+    "libarchive.js": "2.0.2",
     "lru-cache": "11.5.3",
     "mediabunny": "1.61.3",
     "uuid": "14.0.3"

@@ -83,6 +83,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   const clear = state => {
     stopPlay(state);
     state.buffer = null; state.frequency = 0; state.position = 0;
+    state.sampleData = null;
     state.codecGain = 1;
     state.paused = false; state.looping = false;
     state.flags.fill(0);
@@ -134,6 +135,50 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       setStatus(state, 'stop');
     }
   };
+  // PCMConvertLoopFloat32ToInt16 (WaveFormatConverter.cpp 40): scale by 32767,
+  // clamp, round half away from zero.
+  const floatToInt16 = value => {
+    const scaled = value * 32767;
+    if (scaled > 32767) return 32767;
+    if (scaled < -32768) return -32768;
+    return scaled < 0 ? Math.trunc(scaled - 0.5) : Math.trunc(scaled + 0.5);
+  };
+  // GetVisBuffer (WaveImpl.cpp 4063) copies the samples at the play cursor plus
+  // `ahead` samples. The DirectSound ring buffer becomes the decoded track:
+  // looping buffers wrap around, one-shot buffers report silence past the end
+  // instead of replaying their beginning. Float samples convert like
+  // CopyVisBuffer (WaveImpl.cpp 4040), including the mono downmix
+  // (WaveIntf.cpp 108).
+  const readVisSamples = (state, dest, numsamples, channels, ahead) => {
+    if (!state.useVisBuffer || !state.buffer || !state.bufferPlaying) return 0;
+    const source = state.buffer, sourceChannels = source.numberOfChannels;
+    if (channels !== 1 && channels !== sourceChannels) return 0;
+    const count = Math.trunc(number(numsamples)), total = source.length;
+    if (!(count > 0) || !total) return 0;
+    const data = state.sampleData ??= Array.from({ length: sourceChannels }, (_, channel) => source.getChannelData(channel));
+    const looping = !!state.looping;
+    const start = Math.trunc(currentPosition(state) * source.sampleRate / 1000) + Math.trunc(number(ahead));
+    for (let index = 0; index < count; index++) {
+      const raw = start + index;
+      const at = looping ? ((raw % total) + total) % total : raw;
+      if (at < 0 || at >= total) {
+        if (channels === 1) dest[index] = 0;
+        else for (let channel = 0; channel < sourceChannels; channel++) dest[index * sourceChannels + channel] = 0;
+        continue;
+      }
+      if (channels === 1) {
+        // Downmix: sum * 32768/channels, then clamp and round half away
+        // (WaveIntf.cpp 131). Mono input keeps the same rounding path.
+        const scale = 32768 / sourceChannels;
+        let sum = 0;
+        for (let channel = 0; channel < sourceChannels; channel++) sum += data[channel][at] * scale;
+        dest[index] = sum > 0 ? Math.min(32767, Math.trunc(sum + 0.5)) : Math.max(-32768, Math.trunc(sum - 0.5));
+      } else {
+        for (let channel = 0; channel < sourceChannels; channel++) dest[index * sourceChannels + channel] = floatToInt16(data[channel][at]);
+      }
+    }
+    return count;
+  };
 
   @nativeClass('WaveSoundBuffer')
   class Wave {
@@ -141,8 +186,8 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       return {
         owner, status: 'unload', volume: 100000, volume2: 100000, looping: false,
         position: 0, frequency: 0, paused: false, pan: 0, posX: 0, posY: 0, posZ: 0,
-        filters: nativeOwnedArray(owner), flags: new Int32Array(16),
-        buffer: null, source: undefined, gain: undefined, codecGain: 1, activeFilters: [],
+        filters: nativeOwnedArray(owner), flags: new Int32Array(16), useVisBuffer: false,
+        buffer: null, sampleData: null, source: undefined, gain: undefined, codecGain: 1, activeFilters: [],
         bufferPlaying: false, startedAt: 0, playStart: 0,
         fading: false, fadeTarget: 0, fadeCount: 0, blankLeft: 0, deltaVolume: 0, fadeTimer: null,
       };
@@ -204,6 +249,20 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       else if (!state.fadeTimer) state.fadeTimer = setInterval(() => beat(state), BEAT);
     }
     @nativeMethod stopFade() { stopFade(this, true, false); }
+    // The engine's WaveSoundBuffer exposes finalize for the per-instance device
+    // state; the game's VoiceSoundBuffer calls it from its own finalize before
+    // invalidation (system/voice.tjs). Release the audio path without detaching
+    // the owner reference, which the invalidate hook still owns. TJS also calls
+    // a member named finalize during invalidation, so this runs at most twice
+    // and both paths are idempotent.
+    @nativeMethod finalize() {
+      const state = this;
+      if (state.fadeTimer) { clearInterval(state.fadeTimer); state.fadeTimer = null; }
+      state.fading = false;
+      stopPlay(state);
+      state.buffer = null;
+      state.position = 0;
+    }
     @nativeMethod setPos(x, y, z) {
       if (arguments.length < 3) throw new Error('TJS WaveSoundBuffer.setPos requires 3 arguments');
       const state = this;
@@ -228,6 +287,11 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     @nativeProperty get status() { return this.status; }
     @nativeProperty get filters() { return this.filters; }
     @nativeProperty get flags() { return createNativeInstance(WaveFlags, { buffer: Wave.state(nativeOwner(this)) }); }
+    // WaveImpl.cpp 4005: visualization data is only produced while this flag is
+    // set. The reference allocates a DirectSound ring buffer on enable; the port
+    // reads the decoded AudioBuffer instead, so only the flag is kept.
+    @nativeProperty get useVisBuffer() { return Number(this.useVisBuffer); }
+    @nativeProperty set useVisBuffer(value) { this.useVisBuffer = !!truth(value); }
     @nativeProperty get volume() { return this.volume; }
     @nativeProperty set volume(value) { this.volume = clampVolume(value); applyGain(this); }
     @nativeProperty get volume2() { return this.volume2; }
@@ -414,6 +478,11 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   // WaveFlags is a standalone native class; the buffer's `flags` property is a
   // view of its loop manager's flag array.
   Wave.WaveFlags = WaveFlags;
+  // Plugin-side view access for getSample.dll and derived plugins. The reference
+  // plugin fills its own short[] through getVisBuffer, so the port keeps the same
+  // entry point but hands the buffer over as a host Int16Array.
+  Wave.readVisSamples = (state, dest, numsamples, channels = 1, ahead = 0) =>
+    readVisSamples(state, dest, numsamples, channels, ahead);
   // The class-valued member stays a member value: encodeNativeValue registers
   // it as a linked class rather than a script getter.
   Wave.members.set('PhaseVocoder', Phase);

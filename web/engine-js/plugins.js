@@ -8,6 +8,18 @@ import { registerExtrans } from './plugins/extrans.js';
 import { registerTextRender } from './plugins/textrender.js';
 import { registerLayerExDraw } from './plugins/layerex-draw.js';
 import { registerGamepad } from './plugins/gamepad.js';
+import { registerSaveStruct } from './plugins/savestruct.js';
+import { registerGetSample } from './plugins/getsample.js';
+import { registerGetAbout } from './plugins/getabout.js';
+import { registerWindowEx } from './plugins/windowex.js';
+import { registerPackinOne } from './plugins/packinone.js';
+import { registerWin32Dialog } from './plugins/win32dialog.js';
+import { registerFftGraph } from './plugins/fftgraph.js';
+import { registerKirikiroid2 } from './plugins/kirikiroid2.js';
+import { registerDirList } from './plugins/dirlist.js';
+import { registerShrinkCopy } from './plugins/shrinkcopy.js';
+import { registerLayerExRaster } from './plugins/layerexraster.js';
+import { registerLayerExBTOA } from './plugins/layerexbtoa.js';
 
 // The native distribution exposes these plugin entry points even when a game
 // does not use every one of them. Unported entries report their status without
@@ -16,28 +28,34 @@ const emptyPluginNames = [
   'alphamovie.dll', 'drawdeviced3d.dll', 'drawdeviced3dz.dll',
   'extkagparser.dll', 'kagparserex.dll', 'kagparserexb.dll',
   'kaichotrans.dll', 'layereximage.dll',
-  'layerexsave.dll', 'packinone.dll',
-  'addfont.dll', 'dirlist.dll', 'expat.dll', 'extnagano.dll',
-  'getabout.dll', 'getsample.dll', 'gfxeffect.dll', 'json.dll',
-  'fftgraph.dll', 'kirikiroid2.dll', 'layerexalpha.dll',
-  'layerexareaaverage.dll', 'layerexbtoa.dll', 'layerexmovie.dll',
-  'layerexraster.dll', 'layerexshimmer.dll', 'lzfs.dll',
+  'layerexsave.dll',
+  'expat.dll', 'extnagano.dll',
+  'gfxeffect.dll', 'json.dll',
+  'layerexalpha.dll',
+  'layerexareaaverage.dll', 'layerexmovie.dll',
+  'layerexshimmer.dll', 'lzfs.dll',
   'minizip.dll', 'multiimage.dll', 'perspective.dll',
-  'savestruct.dll', 'scriptsex.dll',
-  'shrinkcopy.dll', 'sqlite3.dll', 'util_generic.dll',
+  'scriptsex.dll',
+  'sqlite3.dll', 'util_generic.dll',
   'util_graph.dll', 'util_system.dll', 'varfile.dll',
-  'win32dialog.dll', 'windowex.dll', 'wutcwf.dll', 'xp3filter.dll',
+  'wutcwf.dll', 'xp3filter.dll',
 ];
 
 // Ogg decoding is handled by WaveSoundBuffer.open through Web Audio, with both
 // Vorbis and Opus gain-query callbacks already exposed by the browser backend.
 const browserBackedPluginNames = ['wuvorbis.dll', 'wuopus.dll'];
 const registerBrowserBackedPlugin = () => {};
+// Plugins whose interface the core already provides: addFont.cpp attaches
+// System.addFont, which system.js implements with FontFace.
+const coreBackedPluginNames = ['addfont.dll'];
+const registerCoreBackedPlugin = () => {};
 
 const builtinPlugins = [
   ...emptyPluginNames.map(name => ({ names: [name], load: () => reportUnimplemented(`Plugins.link("${name}"): 插件尚未实现`) })),
   ...browserBackedPluginNames.map(name => ({ names: [name], load: registerBrowserBackedPlugin })),
+  ...coreBackedPluginNames.map(name => ({ names: [name], load: registerCoreBackedPlugin })),
   { names: ['fstat.dll'], load: registerFstat },
+  { names: ['savestruct.dll'], load: registerSaveStruct },
   { names: ['csvparser.dll'], load: context => {
     const decoder = new TextStreamDecoder();
     return registerCSVParser(context, async name => decoder.read(await context.storage.read(name)));
@@ -48,6 +66,17 @@ const builtinPlugins = [
   { names: ['textrender.dll'], load: registerTextRender },
   { names: ['layerexdraw.dll'], load: registerLayerExDraw },
   { names: ['gamepad.dll'], load: registerGamepad },
+  { names: ['getsample.dll'], load: registerGetSample },
+  { names: ['getabout.dll'], load: registerGetAbout },
+  { names: ['windowex.dll'], load: registerWindowEx },
+  { names: ['packinone.dll'], load: registerPackinOne },
+  { names: ['win32dialog.dll'], load: registerWin32Dialog },
+  { names: ['fftgraph.dll'], load: registerFftGraph },
+  { names: ['kirikiroid2.dll'], load: registerKirikiroid2 },
+  { names: ['dirlist.dll'], load: registerDirList },
+  { names: ['shrinkcopy.dll'], load: registerShrinkCopy },
+  { names: ['layerexraster.dll'], load: registerLayerExRaster },
+  { names: ['layerexbtoa.dll'], load: registerLayerExBTOA },
 ];
 
 export class Plugins {
@@ -97,3 +126,6 @@ export class Plugins {
     return result;
   }
 }
+
+
+

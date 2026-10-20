@@ -1,0 +1,162 @@
+diff --git a/src/webworker/archive-reader.js b/src/webworker/archive-reader.js
+index 8509a711b24851f00236d6d1810b6478de945170..2221c43e18f0fe934189f7b0e6072a0b0bddc024 100644
+--- a/src/webworker/archive-reader.js
++++ b/src/webworker/archive-reader.js
+@@ -17,6 +17,9 @@ export class ArchiveReader {
+     this._wasmModule = wasmModule;
+     this._runCode = wasmModule.runCode;
+     this._file = null;
++    this._filePtr = null;
++    this._fileLength = 0;
++    this._archive = null;
+     this._passphrase = null;
+     this._locale = "en_US.UTF-8";
+   }
+@@ -26,11 +29,12 @@ export class ArchiveReader {
+    * @param {File} file
+    */
+   async open(file) {
+-    if (this._file !== null) {
++    if (this._filePtr !== null) {
+       console.warn("Closing previous file");
+       this.close();
+     }
+     const fileData = await this._loadFile(file);
++    this._file = file;
+     this._fileLength = fileData.length;
+     this._filePtr = fileData.ptr;
+   }
+@@ -39,10 +43,15 @@ export class ArchiveReader {
+    * Close archive
+    */
+   close() {
+-    this._runCode.closeArchive(this._archive);
+-    this._wasmModule._free(this._filePtr);
++    if (this._archive) {
++      this._runCode.closeArchive(this._archive);
++    }
++    if (this._filePtr !== null) {
++      this._wasmModule._free(this._filePtr);
++    }
+     this._file = null;
+     this._filePtr = null;
++    this._fileLength = 0;
+     this._archive = null;
+   }
+ 
+@@ -57,14 +66,24 @@ export class ArchiveReader {
+       this._passphrase,
+       this._locale,
+     );
+-    this._runCode.getNextEntry(this._archive);
+-    const status = this._runCode.hasEncryptedEntries(this._archive);
+-    if (status === 0) {
+-      return false;
+-    } else if (status > 0) {
+-      return true;
+-    } else {
+-      return null;
++    const archive = this._archive;
++    try {
++      this._runCode.getNextEntry(archive);
++      const status = this._runCode.hasEncryptedEntries(archive);
++      if (status === 0) {
++        return false;
++      } else if (status > 0) {
++        return true;
++      } else {
++        return null;
++      }
++    } finally {
++      if (archive) {
++        this._runCode.closeArchive(archive);
++      }
++      if (this._archive === archive) {
++        this._archive = null;
++      }
+     }
+   }
+ 
+@@ -90,44 +109,54 @@ export class ArchiveReader {
+    * @param {string} except don't skip extraction for this entry
+    */
+   *entries(skipExtraction = false, except = null) {
+-    this._archive = this._runCode.openArchive(
++    const archive = this._runCode.openArchive(
+       this._filePtr,
+       this._fileLength,
+       this._passphrase,
+       this._locale,
+     );
+-    let entry;
+-    while (true) {
+-      entry = this._runCode.getNextEntry(this._archive);
+-      if (entry === 0) break;
++    this._archive = archive;
++    try {
++      let entry;
++      while (true) {
++        entry = this._runCode.getNextEntry(archive);
++        if (entry === 0) break;
+ 
+-      const entryData = {
+-        size: this._runCode.getEntrySize(entry),
+-        path: this._runCode.getEntryName(entry),
+-        type: TYPE_MAP[this._runCode.getEntryType(entry)],
+-        lastModified: this._runCode.getEntryLastModified(entry),
+-        ref: entry,
+-      };
++        const entryData = {
++          size: this._runCode.getEntrySize(entry),
++          path: this._runCode.getEntryName(entry),
++          type: TYPE_MAP[this._runCode.getEntryType(entry)],
++          lastModified: this._runCode.getEntryLastModified(entry),
++          ref: entry,
++        };
+ 
+-      if (entryData.type === "FILE") {
+-        let fileName = entryData.path.split("/");
+-        entryData.fileName = fileName[fileName.length - 1];
+-      }
++        if (entryData.type === "FILE") {
++          let fileName = entryData.path.split("/");
++          entryData.fileName = fileName[fileName.length - 1];
++        }
+ 
+-      if (skipExtraction && except !== entryData.path) {
+-        this._runCode.skipEntry(this._archive);
+-      } else {
+-        const ptr = this._runCode.getFileData(this._archive, entryData.size);
+-        if (ptr < 0) {
+-          throw new Error(this._runCode.getError(this._archive));
++        if (skipExtraction && except !== entryData.path) {
++          this._runCode.skipEntry(archive);
++        } else {
++          const ptr = this._runCode.getFileData(archive, entryData.size);
++          if (ptr < 0) {
++            throw new Error(this._runCode.getError(archive));
++          }
++          entryData.fileData = this._wasmModule.HEAPU8.slice(
++            ptr,
++            ptr + entryData.size,
++          );
++          this._wasmModule._free(ptr);
+         }
+-        entryData.fileData = this._wasmModule.HEAPU8.slice(
+-          ptr,
+-          ptr + entryData.size,
+-        );
+-        this._wasmModule._free(ptr);
++        yield entryData;
++      }
++    } finally {
++      if (archive) {
++        this._runCode.closeArchive(archive);
++      }
++      if (this._archive === archive) {
++        this._archive = null;
+       }
+-      yield entryData;
+     }
+   }
+ 
