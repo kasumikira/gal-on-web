@@ -2,7 +2,7 @@ import { createRuntime } from './engine-js/runtime.js';
 import wasmURL from './engine-js/tjs-runtime/tjs-runtime.wasm?url';
 
 const status = document.getElementById('status');
-const GAME_RANGE_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const GAME_RANGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 let runtime;
 let sampler;
 
@@ -65,7 +65,7 @@ try {
 // Backends return owned Uint8Array ranges; paths retain the spelling from list().
 function createHTTPGameStorage(entries) {
   const files = new Map(entries.map(file => [file.path, file]));
-  const cache = createRangeCache('galweb-game-ranges', GAME_RANGE_CACHE_MAX_BYTES);
+  const cache = createRangeCache(GAME_RANGE_CACHE_MAX_BYTES);
   const versions = new Map();
   async function version(file) {
     const url = new URL(file.url ?? file.URL, location.href).href;
@@ -101,67 +101,35 @@ function createHTTPGameStorage(entries) {
   };
 }
 
-// IndexedDB serializes these transactions across tabs. Keep recency separately
-// so a cache hit never rewrites its payload; account and evict atomically.
-function createRangeCache(name, maxBytes) {
-  const database = new Promise((resolve, reject) => {
-    const request = indexedDB.open(name, 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      db.createObjectStore('data');
-      db.createObjectStore('lru', { keyPath: 'key' }).createIndex('used', 'used');
-      db.createObjectStore('state').put({ bytes: 0, tick: 0 }, 'total');
-    };
-    request.onsuccess = () => {
-      request.result.onversionchange = () => request.result.close();
-      resolve(request.result);
-    };
-    request.onerror = () => reject(request.error);
-  });
-  async function transact(key, bytes) {
-    const db = await database;
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(['data', 'lru', 'state'], 'readwrite');
-      const data = tx.objectStore('data');
-      const lru = tx.objectStore('lru');
-      const state = tx.objectStore('state');
-      let result;
-      tx.oncomplete = () => resolve(result);
-      tx.onabort = () => reject(tx.error);
-      const lookup = lru.get(key);
-      lookup.onsuccess = () => {
-        const previous = lookup.result;
-        if (bytes === undefined && !previous) return;
-        const total = state.get('total');
-        total.onsuccess = () => {
-          const counters = total.result;
-          lru.put({ key, size: bytes?.byteLength ?? previous.size, used: ++counters.tick });
-          if (bytes === undefined) {
-            data.get(key).onsuccess = event => { result = event.target.result; };
-          } else {
-            data.put(bytes, key);
-            counters.bytes += bytes.byteLength - (previous?.size ?? 0);
-          }
-          if (counters.bytes <= maxBytes) {
-            state.put(counters, 'total');
-            return;
-          }
-          lru.index('used').openCursor().onsuccess = event => {
-            const cursor = event.target.result;
-            counters.bytes -= cursor.value.size;
-            data.delete(cursor.primaryKey);
-            cursor.delete();
-            if (counters.bytes > maxBytes) cursor.continue();
-            else state.put(counters, 'total');
-          };
-        };
-      };
-    });
-  }
+// Keep ranges only for this page session, evicting least recently used data at the byte limit.
+function createRangeCache(maxBytes) {
+  const data = new Map();
+  let cachedBytes = 0;
   return {
     maxBytes,
-    get: key => transact(key),
-    put: (key, bytes) => bytes.byteLength <= maxBytes ? transact(key, bytes) : Promise.resolve(),
+    get(key) {
+      const bytes = data.get(key);
+      if (bytes === undefined) return undefined;
+      data.delete(key);
+      data.set(key, bytes);
+      return bytes.slice();
+    },
+    put(key, bytes) {
+      if (bytes.byteLength > maxBytes) return;
+      const previous = data.get(key);
+      if (previous !== undefined) {
+        cachedBytes -= previous.byteLength;
+        data.delete(key);
+      }
+      const copy = bytes.slice();
+      data.set(key, copy);
+      cachedBytes += copy.byteLength;
+      while (cachedBytes > maxBytes) {
+        const [oldestKey, oldestBytes] = data.entries().next().value;
+        data.delete(oldestKey);
+        cachedBytes -= oldestBytes.byteLength;
+      }
+    },
   };
 }
 
