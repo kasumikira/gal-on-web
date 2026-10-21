@@ -1,4 +1,5 @@
 import { config, initializeGlobals } from './global.js';
+import { initializeImageCodec } from './image-codecs/wasm.js';
 import { initializeGPU } from './gpu.js';
 import { TJSInterop } from './wasm-vm.js';
 import { Closure } from '#krkr/values';
@@ -6,7 +7,7 @@ import { Storages } from './storage.js';
 import { createXP3Filter } from './xp3-filter.js';
 import { createWindowClass, createBasicDrawDeviceClass } from './window.js';
 import { createLayerClass } from './layer.js';
-import { createFontClass } from './font.js';
+import { createFontClass, TEXT_BLEND } from './font.js';
 import { createBitmapClass } from './bitmap-native.js';
 import { attachCompositor } from './layer-composite.js';
 import { createGraphicLoader } from './graphic.js';
@@ -24,6 +25,7 @@ import { nativeOwner, defineNativeClass, NativeProperty, installNativeStubs, uni
 import { nativeGlobals } from '#krkr/native-api';
 
 export async function createRuntime(options) {
+  await initializeImageCodec();
   initializeGlobals(options);
   const { entry, gameStorage, saveStorage, wasmURL, document, inform, message } = config;
   const storage = new Storages(gameStorage, saveStorage, entry + '>');
@@ -34,7 +36,7 @@ export async function createRuntime(options) {
   }
   storage.addAutoPath('/');
   storage.extractionFilter = await createXP3Filter(storage, wasmURL, message);
-  const gpu = initializeGPU(document);
+  const gpu = initializeGPU(document, TEXT_BLEND);
   const global = Object.create(null);
   let vm;
   try {
@@ -96,7 +98,8 @@ export async function createRuntime(options) {
     }
     return name;
   };
-  const loadGraphic = createGraphicLoader(storage);
+  const graphicCache = createGraphicLoader(storage);
+  const loadGraphic = graphicCache.load;
   const loadLayerGraphic = async (name, key, opts) => loadGraphic(await resolveGraphicName(name), key, opts);
   register('Bitmap', createBitmapClass({ storage, loadGraphic: loadLayerGraphic }));
   const Layer = createLayerClass(document, {
@@ -167,6 +170,9 @@ export async function createRuntime(options) {
   let audioContext;
   const getAudioContext = () => audioContext ??= new document.defaultView.AudioContext();
   register('WaveSoundBuffer', createWaveSoundBufferClass(storage, getAudioContext, { enqueueEvent }));
+  // PhaseVocoder is a global native class in the reference, in addition to the
+  // linked WaveSoundBuffer.PhaseVocoder member.
+  if (global.WaveSoundBuffer?.PhaseVocoder) register('PhaseVocoder', global.WaveSoundBuffer.PhaseVocoder);
   // VideoOverlay decodes with mediabunny and renders through layer1/layer2
   // (KRMovieLayer's vomLayer path).
   register('VideoOverlay', createVideoOverlayClass({
@@ -179,7 +185,7 @@ export async function createRuntime(options) {
     // The JS plugin registry does not search native debug DLL directories.
     dllSearchForDebug:0,
   }));
-  const system = createSystem({vm,enqueueEvent,storage});
+  const system = createSystem({vm,enqueueEvent,storage,graphicCache});
   register('System', system.api);
   register('Pad', createPadClass());
   for (const name of nativeGlobals) {
@@ -279,6 +285,9 @@ export async function createRuntime(options) {
       } finally {
         await storage.finalize();
         await storage.extractionFilter?.finalize();
+        // Drop decoded images (and their resident GPU textures) before the
+        // device tears itself down.
+        graphicCache.clear();
         gpu.finalize();
         if (audioContext) {
           await audioContext.close();

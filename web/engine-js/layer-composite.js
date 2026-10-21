@@ -7,8 +7,72 @@ import { config } from './global.js';
 import { number } from '#krkr/values';
 import { callScript, script, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { Image } from './bitmap.js';
-import { getGPU } from './gpu.js';
+import { getGPU, QUAD_VERTEX } from './gpu.js';
 import { setKeyState, clearKeyStates } from './key-state.js';
+
+// The compositor is the only consumer of this program: copy the finished frame
+// into the default framebuffer (TVPAlphaColorMat on black) and then hand the
+// drawing buffer to the window's 2D canvas.
+const PRESENT_FRAGMENT = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D sourceTexture;
+uniform vec2 sourceSize;
+in vec2 sourcePoint;
+out vec4 colour;
+uint packARGB(vec4 c) {
+  uvec4 b = uvec4(round(clamp(c, 0.0, 1.0) * 255.0));
+  return (b.a << 24u) | (b.r << 16u) | (b.g << 8u) | b.b;
+}
+uint sampleTexel(int x, int y) {
+  ivec2 size = ivec2(sourceSize);
+  return packARGB(texelFetch(sourceTexture, clamp(ivec2(x, y), ivec2(0), size - 1), 0));
+}
+void main() {
+  // Default framebuffer origin is bottom-left: TVPAlphaColorMat on black.
+  uint flipped = sampleTexel(int(floor(sourcePoint.x)), int(sourceSize.y) - 1 - int(floor(sourcePoint.y)));
+  float sa = float(flipped >> 24u);
+  vec3 premultiplied = vec3(
+    float((flipped >> 16u) & 255u) * sa / 256.0,
+    float((flipped >> 8u) & 255u) * sa / 256.0,
+    float(flipped & 255u) * sa / 256.0);
+  colour = vec4(floor(premultiplied) / 255.0, 1.0);
+}`;
+
+const presentPrograms = new WeakMap();
+const presenters = new WeakMap();
+function presentProgram(gpu) {
+  let program = presentPrograms.get(gpu);
+  if (!program) {
+    program = gpu.compile(QUAD_VERTEX, PRESENT_FRAGMENT);
+    presentPrograms.set(gpu, program);
+    gpu.onDispose(() => { gpu.gl.deleteProgram(program); presentPrograms.delete(gpu); });
+  }
+  return program;
+}
+export function present(gpu, image, canvas) {
+  const source = gpu.texture(image);
+  const gl = gpu.gl;
+  if (gpu.canvas.width !== image.width) gpu.canvas.width = image.width;
+  if (gpu.canvas.height !== image.height) gpu.canvas.height = image.height;
+  const full = { left: 0, top: 0, right: image.width, bottom: image.height };
+  try {
+    gpu.setup({ framebuffer: null, width: image.width, height: image.height },
+      source, full, [1, 0, 0, 1, 0, 0], gpu.clip(image), source, presentProgram(gpu));
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  } finally {
+    gl.useProgram(gpu.program);
+  }
+  let context = presenters.get(canvas);
+  if (!context) {
+    context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('GPU presentation requires CanvasRenderingContext2D');
+    presenters.set(canvas, context);
+  }
+  // Copy the rendered canvas directly. Safari's transferToImageBitmap path
+  // can block for an entire frame while exporting the WebGL drawing buffer.
+  context.drawImage(gpu.canvas, 0, 0);
+}
 
 // WindowIntf.cpp TVPWindow::WndProc works in Win32 virtual-key codes. Browsers
 // report the same numbers in keyCode for letters, digits, navigation and
@@ -79,12 +143,13 @@ export async function findLayerAt(root, x, y, {
 // HitTestNoVisibleCheck via HitType/HitThreshold: the alpha plane of the main
 // image (or the province plane) decides, in image coordinates.
 function hitTestPixel(node, lx, ly) {
+  if (node.hitType === 0 && node.hitThreshold > 255) return false;
   const image = node.hitType === 1 ? node.province : node.image;
   if (!image || !image.width || !image.height) return node.hitType === 0 && node.hitThreshold <= 0;
   // The image is placed at (imageLeft, imageTop) relative to the layer rect.
   const ix = lx - node.imageLeft, iy = ly - node.imageTop;
   if (ix < 0 || iy < 0 || ix >= image.width || iy >= image.height) return false;
-  if (image.gray) return image.pixels[image.index(ix, iy)] !== 0;
+  if (image.gray) return image.point(ix, iy) !== 0;
   if (node.hitType === 0 && node.hitThreshold <= 0) return true;
   return (image.point(ix, iy) >>> 24) >= node.hitThreshold;
 }
@@ -155,7 +220,7 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
     if (image?.width && image.height) {
       gpu.draw(target, image, {
         matrix: [1, 0, 0, 1, x + (transition?.withchildren ? 0 : node.imageLeft), y + (transition?.withchildren ? 0 : node.imageTop)],
-        clip, opacity, opaque: node.type === 1, mode: 0, motion: true,
+        clip, opacity, opaque: node.type === 1, mode: 0, motion: true, windowComposite: true,
       });
     }
     if (!transition?.withchildren) for (const child of node.children) {
@@ -231,9 +296,11 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
     }
     if (!frame.width || !frame.height) return;
     const clip = { left: 0, top: 0, right: frame.width, bottom: frame.height };
-    gpu.fill(frame, clip, [0, 0, 0, 0]);
+    // This frame is displayed on an opaque black canvas. Accumulate over
+    // black now so fixed-function source-over needs no destination snapshots.
+    gpu.fill(frame, clip, [0, 0, 0, 255]);
     if (state.primaryLayer) drawImage(gpu, frame, Layer.peekNode(state.primaryLayer.owner), 0, 0, 255, clip);
-    gpu.present(frame, state.canvas);
+    present(gpu, frame, state.canvas);
     const rendering = gpu.diagnostics();
     stats.textureBytes = rendering.textureBytes;
     stats.uploadedBytes = rendering.uploadedBytes;

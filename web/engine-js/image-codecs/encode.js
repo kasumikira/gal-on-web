@@ -2,7 +2,22 @@
 // SaveTLG6.cpp; the encoder intentionally uses the valid raw TLG5 planes and
 // fixed MED/filter-zero TLG6 path, leaving the native compressor's optional
 // ratio search out of this browser implementation.
-import { TLG6GolombBitLengthTable } from './decode.js';
+const GOLOMB_N = 4;
+const GOLOMB_COMPRESSED = [
+  [3, 7, 15, 27, 63, 108, 223, 448, 130],
+  [3, 5, 13, 24, 51, 95, 192, 384, 257],
+  [2, 5, 12, 21, 39, 86, 155, 320, 384],
+  [2, 3, 9, 18, 33, 61, 129, 258, 511],
+];
+const TLG6GolombBitLengthTable = [];
+for (let n = 0; n < GOLOMB_N; n++) {
+  const table = new Uint8Array(GOLOMB_N * 2 * 128);
+  let a = 0;
+  for (let i = 0; i < 9; i++) {
+    for (let j = 0; j < GOLOMB_COMPRESSED[n][i]; j++) table[a++] = i;
+  }
+  TLG6GolombBitLengthTable[n] = table;
+}
 
 const TLG5_HEADER = Uint8Array.from([0x54, 0x4c, 0x47, 0x35, 0x2e, 0x30, 0x00, 0x72, 0x61, 0x77, 0x1a]);
 const TLG6_HEADER = Uint8Array.from([0x54, 0x4c, 0x47, 0x36, 0x2e, 0x30, 0x00, 0x72, 0x61, 0x77, 0x1a]);

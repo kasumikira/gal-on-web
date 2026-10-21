@@ -52,4 +52,4 @@ WASM 通过 JSPI 等待 JS 宿主操作，宿主也能调用脚本。正常调�
 
 正式项目为 `native/kirikiri`。`core/tjs2` 保存语言核心，`core/base` 保存 KAGParser、ScriptMgnIntf 与平台声明，`core/utils` 保存原版工具，`plugins` 保存脚本工具扩展；`runtime.cpp` 保存运行时状态，`runtime-api.cpp`、`runtime-host.cpp`、`runtime-platform.cpp` 分别提供导出 API、宿主绑定和平台接入。
 
-`pnpm build:vm` 生成一个 WASM 运行时及其 JS 加载器；`pnpm build:js` 从 `web/index.html` 打包游戏页面到 `web/build`，同目录的 `main.js` 通过 ES import 加载引擎代码。构建缓存位于 `out/kirikiri`，依赖位于 `out/vcpkg_installed`。工具链见 [原生项目说明](../native/kirikiri/README.md)。
+`pnpm build:vm` 生成一个 WASM 运行时及其 JS 加载器；`pnpm build:js` 从 `web/index.html` 打包游戏页面到 `web/build`，同目录的 `main.js` 通过 ES import 加载引擎代码。Go 构建通过 `//go:embed` 把 `web/build` 编入二进制，运行时不再读取该目录。构建缓存位于 `out/kirikiri`，依赖位于 `out/vcpkg_installed`。工具链见 [原生项目说明](../native/kirikiri/README.md)。

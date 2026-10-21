@@ -13,7 +13,6 @@ try {
   if (!response.ok) throw new Error(`游戏清单读取失败：${response.status}`);
   const game = await response.json();
   document.title = game.title;
-  if (game.engine !== 'krkr-js') throw new Error(`尚未接入引擎：${game.engine}`);
   runtime = await createRuntime({
     gameStorage: createHTTPGameStorage(game.files),
     // Save storage: the dev server keeps saves in SQLite (tests/savedata.sqlite);

@@ -89,17 +89,15 @@ export function createBitmapClass({ storage, loadGraphic } = {}) {
     }
     @nativeMethod independ(copy = true) {
       const state = drawableBitmap(this);
-      // Every Image owns its own pixel array.  Cloning for the copy=true case
-      // preserves the native operation's observable isolation; the no-copy
-      // branch is already independent because there is no shared backing
-      // texture in this browser implementation.
-      if (truth(copy)) state.image = state.image.clone();
+      // BitmapIntf.cpp Independ/IndependNoCopy: a bitmap that is not shared is
+      // already independent; otherwise separate (optionally keeping pixels).
+      state.image.detach(arguments.length ? truth(copy) : true);
     }
     @nativeMethod setSize(width, height) {
       if (arguments.length < 2) throw new Error('TJS Bitmap.setSize requires 2 arguments');
       const state = drawableBitmap(this), w = integer(width), h = integer(height);
       if (w <= 0 || h <= 0) throw new Error('TJS cannot create an empty Bitmap');
-      state.image = state.image.resized(w, h, 0).clone();
+      state.image.resize(w, h, 0);
     }
     @nativeMethod copyFrom(source) {
       if (!arguments.length) throw new Error('TJS Bitmap.copyFrom requires a Bitmap');
@@ -134,14 +132,14 @@ export function createBitmapClass({ storage, loadGraphic } = {}) {
       const state = drawableBitmap(this);
       const width = integer(value);
       if (width <= 0) throw new Error('TJS cannot create an empty Bitmap');
-      state.image = state.image.resized(width, state.image.height, 0).clone();
+      state.image.resize(width, state.image.height, 0);
     }
     @nativeProperty get height() { return drawableBitmap(this).image.height; }
     @nativeProperty set height(value) {
       const state = drawableBitmap(this);
       const height = integer(value);
       if (height <= 0) throw new Error('TJS cannot create an empty Bitmap');
-      state.image = state.image.resized(state.image.width, height, 0).clone();
+      state.image.resize(state.image.width, height, 0);
     }
     @nativeProperty get loading() {
       const state = this;

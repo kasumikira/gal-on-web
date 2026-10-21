@@ -1,14 +1,16 @@
 import { mat2d } from 'gl-matrix';
 import { Image } from './bitmap.js';
 
-// All image storage is straight RGBA8, including RGB underneath zero alpha.
-// Only presentation converts to premultiplied colour for the browser.
+// Public images use straight RGBA8, including RGB underneath zero alpha.
+// Offscreen composition privately accumulates premultiplied RGBA16F.
 let device = null;
 export const getGPU = () => device;
-export function initializeGPU(document) {
+const PREPARE_UPLOAD_BYTES = 4 * 1024 * 1024;
+const PREPARE_UPLOAD_MS = 4;
+export function initializeGPU(document, textBlendShader) {
   if (device) throw new Error('GPU renderer is already initialized');
   try {
-    device = new GPUDevice(document);
+    device = new GPUDevice(document, textBlendShader);
   } catch (error) {
     document.defaultView.alert(`WebGL 2 初始化失败，无法启动游戏。\n${error.message}`);
     throw error;
@@ -16,71 +18,50 @@ export function initializeGPU(document) {
   return device;
 }
 
-const VERTEX = `#version 300 es
+// The quad used by every program the device owns or that a feature module
+// compiles through GPUDevice.compile. Modules draw six vertices with it.
+export const QUAD_VERTEX = `#version 300 es
 precision highp float;
 uniform vec2 targetSize;
 uniform vec4 sourceRect;
 uniform mat3 transform;
-uniform int glyphBatch;
-layout(location = 0) in vec2 glyphPosition;
-layout(location = 1) in vec2 glyphSourcePoint;
 out vec2 sourcePoint;
 void main() {
-  if (glyphBatch != 0) {
-    sourcePoint = glyphSourcePoint;
-    gl_Position = vec4(glyphPosition / targetSize * 2.0 - 1.0, 0, 1);
-    return;
-  }
   vec2 corners[6] = vec2[6](vec2(0,0),vec2(1,0),vec2(0,1),vec2(0,1),vec2(1,0),vec2(1,1));
   sourcePoint = mix(sourceRect.xy, sourceRect.zw, corners[gl_VertexID]);
   vec2 point = (transform * vec3(sourcePoint,1)).xy;
   gl_Position = vec4(point / targetSize * 2.0 - 1.0, 0, 1);
 }`;
 
+// Shared blend program for layer, motion, window composition and text draws.
+// Feature-only programs (transitions, presentation, whole-image pixel passes)
+// are compiled by the modules that own them.
 // Blending is a word-for-word port of the reference C implementation
 // (third_party/kirikiroid2 .../visual/gl/blend_functor_c.h and the native
 // blend slots installed by TVPInitTVPGL). Packed pixels are 0xAARRGGBB in a
 // uint so that every masking, borrow and 32 bit truncation reproduces the
 // original byte results, including the engine's own oddities.
-const FRAGMENT = `#version 300 es
+const fragmentSource = textBlendShader => `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D sourceTexture;
 uniform sampler2D destinationTexture;
-uniform sampler2D secondTexture;
-uniform sampler2D ruleTexture;
 uniform sampler2D tableTexture;
 uniform vec2 sourceSize;
-uniform vec2 targetSize;
-uniform vec4 sourceRect;
-uniform mat3 transform;
 uniform mat3 inverseTransform;
 uniform vec4 sampleRect;
+#ifdef LAYER_COMPOSITE
+const int operation = 1;
+const int mode = 0;
+#else
 uniform int operation;
 uniform int mode;
+#endif
 uniform int policy;
-uniform int phase;
-uniform int vague;
-uniform int layerType;
 uniform int opacity;
 uniform int smoothSampling;
 uniform bool opaque;
 uniform bool explicitCoverage;
-uniform int colourOp;
-uniform int colourValue;
-uniform int colourOpa;
-uniform int lutOp;
-uniform sampler2D lutTexture;
-uniform int transformOp;
-uniform sampler2D kernelTexture;
-uniform int blurRadius;
-uniform float blurSigma;
-uniform ivec2 blurStep;
-uniform int blurLeft;
-uniform int blurTop;
-uniform int blurRight;
-uniform int blurBottom;
-uniform bool blurAlpha;
 in vec2 sourcePoint;
 out vec4 colour;
 
@@ -115,12 +96,6 @@ uint fadeAll(uint s, uint a) {
 // Colour fade toward zero; alpha is left untouched (add/sub/mul/dodge paths).
 uint fadeColour(uint s, uint a) {
   return (((s & 0x00ff00u) * a >> 8u) & 0x00ff00u) + (((s & 0xff00ffu) * a >> 8u) & 0xff00ffu);
-}
-uint blendARGB(uint b, uint a, uint ratio) {
-  uint b2 = b & 0x00ff00ffu;
-  uint t = (b2 + (((a & 0x00ff00ffu) - b2) * ratio >> 8u)) & 0x00ff00ffu;
-  b2 = (b & 0xff00ff00u) >> 8u;
-  return t + (((b2 + ((((a & 0xff00ff00u) >> 8u) - b2) * ratio >> 8u)) << 8u) & 0xff00ff00u);
 }
 uint alphaToPremul(uint x) { return mulColor(x, x >> 24u) + (x & 0xff000000u); }
 
@@ -175,13 +150,11 @@ uint alphaBlend55(uint d, uint s) {
   return (d & 0xff000000u) | (r << 16u) | (g << 8u) | b;
 }
 uint alphaBlendD55(uint d, uint s) {
-  uint addr = ((s >> 16u) & 0xff00u) + (d >> 24u);
   uint alpha = opacityOnOpacity((s >> 24u), d >> 24u);
   return alphaBlendLanes(d, s, alpha) + (negativeMul((s >> 24u), d >> 24u) << 24u);
 }
 uint alphaBlendDO(uint d, uint s, uint opa) {
   uint srcAlpha = ((s >> 24u) * opa) >> 8u;
-  uint addr = (srcAlpha << 8u) + (d >> 24u);
   uint alpha = opacityOnOpacity(srcAlpha, d >> 24u);
   return alphaBlendLanes(d, s, alpha) + (negativeMul(srcAlpha, d >> 24u) << 24u);
 }
@@ -422,56 +395,7 @@ uint psVariant(uint d, uint s, uint opa, bool hold) {
   return hold ? ((r & 0x00ffffffu) | (d & 0xff000000u)) : r;
 }
 
-// Layer.drawText blends each glyph's coverage with the destination through the
-// draw face's function. The three faces are the reference's text blit selection
-// (bmAlphaOnAlpha / bmAlpha / bmAlphaOnAddAlpha) and are ported verbatim; the
-// draw mode encodes them as 100 + face.
-uint packText(int r, int g, int b, int a) {
-  return (uint(clamp(a, 0, 255)) << 24u) | (uint(clamp(r, 0, 255)) << 16u)
-    | (uint(clamp(g, 0, 255)) << 8u) | uint(clamp(b, 0, 255));
-}
-uint textBlend(uint d, uint s, int opacity, uint face) {
-  uint coverage = s >> 24u;
-  if (opacity < 0) {
-    uint strength = min(uint(-opacity), 255u);
-    uint remain = 65025u - coverage * strength;
-    uint alpha = (d >> 24u) * remain / 65025u;
-    return (d & 0x00ffffffu) | (alpha << 24u);
-  }
-  if (opacity == 0 || coverage == 0u) return d;
-  int alpha = (int(coverage) * opacity) >> 8;
-  int dr = int((d >> 16u) & 255u), dg = int((d >> 8u) & 255u), db = int(d & 255u);
-  int sr = int((s >> 16u) & 255u), sg = int((s >> 8u) & 255u), sb = int(s & 255u);
-  int destAlpha = int(d >> 24u);
-  if (face == 4u) {
-    // bmAlphaOnAddAlpha: additive alpha on both planes.
-    int inverse = 255 - alpha;
-    int unionAlpha = alpha + destAlpha - ((destAlpha * alpha) >> 8);
-    return packText(
-      min(255, ((dr * inverse) >> 8) + ((sr * alpha) >> 8)),
-      min(255, ((dg * inverse) >> 8) + ((sg * alpha) >> 8)),
-      min(255, ((db * inverse) >> 8) + ((sb * alpha) >> 8)),
-      unionAlpha - (unionAlpha >> 8));
-  }
-  if (face == 1u) {
-    // bmAlpha: colour is interpolated, the destination alpha is retained.
-    return packText((dr * 256 + (sr - dr) * int(alpha)) / 256,
-      (dg * 256 + (sg - dg) * int(alpha)) / 256,
-      (db * 256 + (sb - db) * int(alpha)) / 256, destAlpha);
-  }
-  // bmAlphaOnAlpha: source-over in straight RGB with the destination alpha in
-  // the colour ratio.
-  int alphaInt = int(alpha);
-  int outAlpha = 255 - ((255 - alphaInt) * (255 - destAlpha)) / 255;
-  int ratio = 255;
-  if (destAlpha != 0) {
-    uint denominator = uint((255 - alphaInt) * destAlpha + 255 * alphaInt);
-    ratio = int((65025u * uint(alphaInt)) / denominator);
-  }
-  return packText((dr * 256 + (sr - dr) * ratio) / 256,
-    (dg * 256 + (sg - dg) * ratio) / 256,
-    (db * 256 + (sb - db) * ratio) / 256, outAlpha);
-}
+${textBlendShader}
 
 // LayerBitmapIntf::PartialBlt dispatch for the source layer's operation mode.
 uint blendPixel(uint d, uint s) {
@@ -525,180 +449,6 @@ uint blendPixel(uint d, uint s) {
   return d;
 }
 
-// TVPConstAlphaBlend_SD* used by layer cross fading.
-uint crossfadePlain(uint a, uint b, uint p) {
-  return ((((a & 0x00ff00ffu) + (((b & 0x00ff00ffu) - (a & 0x00ff00ffu)) * p >> 8u)) & 0x00ff00ffu))
-    | ((((a & 0x0000ff00u) + (((b & 0x0000ff00u) - (a & 0x0000ff00u)) * p >> 8u)) & 0x0000ff00u));
-}
-uint crossfadeAdditive(uint a, uint b, uint p) { return blendARGB(a, b, p); }
-uint crossfadeDestAlpha(uint a, uint b, uint p) {
-  uint o = p > 127u ? p + 1u : p;
-  uint iopa = 256u - o;
-  uint a1 = a >> 24u;
-  uint a2 = b >> 24u;
-  uint alpha = opacityOnOpacity((a2 * o & 0xff00u) >> 8u, (a1 * iopa >> 8u) & 255u);
-  uint r = ((((a & 0x00ff00ffu) + (((b & 0x00ff00ffu) - (a & 0x00ff00ffu)) * alpha >> 8u)) & 0x00ff00ffu))
-    | ((((a & 0x0000ff00u) + (((b & 0x0000ff00u) - (a & 0x0000ff00u)) * alpha >> 8u)) & 0x0000ff00u));
-  r |= (a1 + ((a2 - a1) * o >> 8u)) << 24u;
-  return r;
-}
-
-// TVPUnivTransBlend_d / TVPUnivTransBlend_switch_d: the universal transition
-// keeps destination alpha through TVPNegativeMulTable and does not adjust the
-// transition table value before deriving the inverse weight.
-uint universalDestAlpha(uint a, uint b, uint p, bool switching) {
-  uint a1 = a >> 24u;
-  uint a2 = b >> 24u;
-  uint srcAlpha = (a2 * p & 0xff00u) >> 8u;
-  uint destAlpha = (a1 * (256u - p) >> 8u) & 255u;
-  uint alpha = opacityOnOpacity(srcAlpha, destAlpha);
-  uint r = (((a & 0x00ff00ffu) + (((b & 0x00ff00ffu) - (a & 0x00ff00ffu)) * alpha >> 8u)) & 0x00ff00ffu)
-    | (((a & 0x0000ff00u) + (((b & 0x0000ff00u) - (a & 0x0000ff00u)) * alpha >> 8u)) & 0x0000ff00u);
-  // The switched and unswitched reference entry points compose alpha differently.
-  return switching ? r + (negativeMul(srcAlpha, destAlpha) << 24u) : r | ((a1 + ((a2 - a1) * p >> 8u)) << 24u);
-}
-
-// premulalpha_blend_a_ca_func: additive-alpha fill with an explicit source alpha.
-uint premulAC(uint d, uint sopa, uint sopaInv, uint src) {
-  uint dopa = d >> 24u;
-  dopa = dopa + sopa - (dopa * sopa >> 8u);
-  dopa -= dopa >> 8u;
-  return (dopa << 24u) + satAdd((((d & 0xff00ffu) * sopaInv >> 8u) & 0xff00ffu) + (((d & 0xff00u) * sopaInv >> 8u) & 0xff00u), src);
-}
-
-// LayerBitmapIntf FillColor / BlendColor family (tvpgl const_alpha_fill_blend).
-uint constColourPixel(uint d) {
-  uint c = uint(colourValue) & 0x00ffffffu;
-  uint opa = uint(colourOpa);
-  if (colourOp == 0) return (d & 0xff000000u) | c;                                   // TVPFillColor
-  if (colourOp == 1) {                                                               // TVPConstColorAlphaBlend
-    uint inv = 255u - opa;
-    return (d & 0xff000000u)
-      + ((((d & 0xff00ffu) * inv + (c & 0xff00ffu) * opa) >> 8u) & 0xff00ffu)
-      + ((((d & 0xff00u) * inv + (c & 0xff00u) * opa) >> 8u) & 0xff00u);
-  }
-  if (colourOp == 2) {                                                               // TVPConstColorAlphaBlend_d
-    uint dopa = d >> 24u;
-    uint alpha = opacityOnOpacity(opa, dopa);
-    uint d1 = d & 0xff00ffu;
-    d1 = (d1 + (((c & 0xff00ffu) - d1) * alpha >> 8u)) & 0xff00ffu;
-    d1 |= (255u - ((255u - dopa) * (255u - opa) >> 8u)) << 24u;
-    uint dd = d & 0xff00u;
-    return d1 | ((dd + (((c & 0xff00u) - dd) * alpha >> 8u)) & 0xff00u);
-  }
-  if (colourOp == 3) {                                                               // TVPConstColorAlphaBlend_a
-    uint premul = (((((c & 0x00ff00u) * opa) & 0x00ff0000u) + (((c & 0xff00ffu) * opa) & 0xff00ff00u)) >> 8u);
-    return premulAC(d, opa, opa ^ 0xffu, premul);
-  }
-  if (colourOp == 4) return uint(colourValue);                                       // TVPFillARGB
-  return (d & 0x00ffffffu) + ((((d >> 24u) * (255u - opa)) << 16u) & 0xff000000u);   // TVPRemoveConstOpacity
-}
-
-// TVPAdjustGamma / Layer.light: per channel 256 entry lookup table.
-// TVPAdjustGamma_c indexes the table with recip*t>>8, which reaches 256 when
-// t equals alpha and alpha is a power of two; that index is one past the array,
-// so the reference reads out of bounds. Return zero there instead of a rounded
-// value, matching the fetch semantics and the reference's observed output.
-uint lutEntry(uint channel, uint index) {
-  if (index > 255u) return 0u;
-  return uint(round(texelFetch(lutTexture, ivec2(int(index), int(channel)), 0).r * 255.0));
-}
-uint lutPixel(uint d) {
-  uint alpha = d >> 24u;
-  if (lutOp == 0) {
-    if (alpha == 0u) return d;
-    return (d & 0xff000000u) | (lutEntry(0u, d & 255u)) | (lutEntry(1u, (d >> 8u) & 255u) << 8u) | (lutEntry(2u, (d >> 16u) & 255u) << 16u);
-  }
-  if (lutOp == 2 || alpha == 255u) {
-    return (d & 0xff000000u) | (lutEntry(0u, d & 255u)) | (lutEntry(1u, (d >> 8u) & 255u) << 8u) | (lutEntry(2u, (d >> 16u) & 255u) << 16u);
-  }
-  if (alpha == 0u) return d;
-  // Additive-alpha face: weight by the adjusted alpha and the recip table.
-  uint adjusted = alpha + (alpha >> 7u);
-  uint recip = min(0x7fffu, 65536u / alpha);
-  uint result = d & 0xff000000u;
-  for (int c = 0; c < 3; c++) {
-    uint t = (d >> uint(8 * c)) & 255u;
-    uint value;
-    // The reference ORs the unclamped value, so a value of 256 carries into the
-    // neighbouring channel; reproduce that bit spill exactly.
-    if (t > alpha) value = (lutEntry(uint(c), 255u) * adjusted >> 8u) + t - alpha;
-    else value = lutEntry(uint(c), recip * t >> 8u) * adjusted >> 8u;
-    result |= value << uint(8 * c);
-  }
-  return result;
-}
-
-// TVPDoGrayScale / TVPConvert(Additive)Alpha: whole image value transforms.
-uint transformedPixel(uint s) {
-  if (transformOp == 0) {
-    uint v = ((s & 255u) * 19u + ((s >> 8u) & 255u) * 183u + ((s >> 16u) & 255u) * 54u) >> 8u;
-    return (v * 0x010101u) | (s & 0xff000000u);
-  }
-  if (transformOp == 1) return mulColor(s, s >> 24u) | (s & 0xff000000u);
-  uint alpha = s >> 24u;
-  uint result = s & 0xff000000u;
-  for (int c = 0; c < 3; c++) {
-    uint v = (s >> uint(8 * c)) & 255u;
-    result |= (alpha == 0u ? 0u : min(255u, v * 255u / alpha)) << uint(8 * c);
-  }
-  return result;
-}
-
-// iTVPBaseBitmap::DoBoxBlur / DoBoxBlurForAlpha over the clamped area.
-uint boxBlurPixel() {
-  ivec2 size = ivec2(sourceSize);
-  ivec2 centre = ivec2(gl_FragCoord.xy);
-  int x0 = max(0, centre.x + blurLeft), x1 = min(size.x - 1, centre.x + blurRight);
-  int y0 = max(0, centre.y + blurTop), y1 = min(size.y - 1, centre.y + blurBottom);
-  if (x1 < x0 || y1 < y0) return 0u;
-  uint n = uint((x1 - x0 + 1) * (y1 - y0 + 1));
-  uint rounding = n >> 1u;
-  uint sumB = 0u, sumG = 0u, sumR = 0u, sumA = 0u;
-  for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
-    uint v = packARGB(texelFetch(sourceTexture, ivec2(x, y), 0));
-    if (blurAlpha) {
-      uint a = v >> 24u;
-      uint aadj = a + (a >> 7u);
-      sumA += a;
-      sumB += (v & 255u) * aadj >> 8u;
-      sumG += ((v >> 8u) & 255u) * aadj >> 8u;
-      sumR += ((v >> 16u) & 255u) * aadj >> 8u;
-    } else {
-      sumA += v >> 24u;
-      sumB += v & 255u;
-      sumG += (v >> 8u) & 255u;
-      sumR += (v >> 16u) & 255u;
-    }
-  }
-  if (!blurAlpha) {
-    return (((sumR + rounding) / n) << 16u) | (((sumG + rounding) / n) << 8u) | ((sumB + rounding) / n) | (((sumA + rounding) / n) << 24u);
-  }
-  uint alpha = (sumA + rounding) / n;
-  uint result = alpha << 24u;
-  for (int c = 0; c < 3; c++) {
-    uint value = (c == 0 ? sumB : c == 1 ? sumG : sumR);
-    uint mean = (value + rounding) / n;
-    result |= (alpha == 0u ? 0u : min(255u, mean * 255u / alpha)) << uint(8 * c);
-  }
-  return result;
-}
-
-// tTJSNI_BaseLayer::ApplyGaussianBlur: separable convolution with the
-// generate_1d_gaussian_kernel weights, clamp-to-edge sampling, float
-// accumulation and per pass truncation at the 8 bit target.
-void gaussianPass() {
-  ivec2 size = ivec2(sourceSize);
-  ivec2 base = ivec2(gl_FragCoord.xy);
-  vec4 sum = vec4(0.0);
-  for (int k = -blurRadius; k <= blurRadius; k++) {
-    ivec2 p = clamp(base + k * blurStep, ivec2(0), size - 1);
-    float weight = texelFetch(kernelTexture, ivec2(k + blurRadius, 0), 0).r;
-    sum += texelFetch(sourceTexture, p, 0) * 255.0 * weight;
-  }
-  colour = clamp(floor(sum), 0.0, 255.0) / 255.0;
-}
-
 uint sampleTexel(int x, int y) {
   ivec2 size = ivec2(sourceSize);
   return packARGB(texelFetch(sourceTexture, clamp(ivec2(x, y), ivec2(0), size - 1), 0));
@@ -726,40 +476,13 @@ void main() {
     s = sampleTexel(int(floor(sourcePoint.x)), int(floor(sourcePoint.y)));
   }
   if (opaque) s |= 0xff000000u;
-  if (operation == 4) {
-    // Default framebuffer origin is bottom-left: TVPAlphaColorMat on black.
-    uint flipped = sampleTexel(int(floor(sourcePoint.x)), int(sourceSize.y) - 1 - int(floor(sourcePoint.y)));
-    float sa = float(flipped >> 24u);
-    vec3 premultiplied = vec3(
-      float((flipped >> 16u) & 255u) * sa / 256.0,
-      float((flipped >> 8u) & 255u) * sa / 256.0,
-      float(flipped & 255u) * sa / 256.0);
-    colour = vec4(floor(premultiplied) / 255.0, 1.0);
-    return;
-  }
-  if (operation == 13) { gaussianPass(); return; }
+#ifdef WINDOW_COMPOSITE
+  // Fixed-function source-over writes either the opaque window or a private
+  // premultiplied accumulation target, without sampling destination pixels.
+  colour = vec4(unpackARGB(s).rgb, float(s >> 24u) * float(opacity) / 65025.0);
+  return;
+#endif
   uint d = packARGB(texelFetch(destinationTexture, ivec2(gl_FragCoord.xy), 0));
-  if (operation == 3 || operation == 8) {
-    uint bridge = packARGB(texelFetch(secondTexture, ivec2(gl_FragCoord.xy), 0));
-    uint p = uint(phase);
-    if (operation == 8) {
-      int value = int(round(texelFetch(ruleTexture, ivec2(gl_FragCoord.xy), 0).r * 255.0));
-      int low = phase - vague;
-      if (vague < 512 && (value >= phase || value < low)) {
-        colour = unpackARGB(value >= phase ? s : bridge);
-        return;
-      }
-      p = uint(value < low ? 255 : (value >= phase ? 0 : 255 - (value - low) * 255 / vague));
-    }
-    if (layerType == 12) colour = unpackARGB(crossfadeAdditive(s, bridge, p));
-    else if (layerType == 2 || layerType >= 13) colour = unpackARGB(operation == 8 ? universalDestAlpha(s, bridge, p, vague < 512) : crossfadeDestAlpha(s, bridge, p));
-    else colour = unpackARGB(crossfadePlain(s, bridge, p));
-    return;
-  }
-  if (operation == 9) { colour = unpackARGB(constColourPixel(d)); return; }
-  if (operation == 10) { colour = unpackARGB(lutPixel(d)); return; }
-  if (operation == 11) { colour = unpackARGB(transformedPixel(s)); return; }
-  if (operation == 12) { colour = unpackARGB(boxBlurPixel()); return; }
   if (operation == 6) { colour = unpackARGB((d & 0x00ffffffu) | (s & 0xff000000u)); return; }
   if (operation == 1) {
     // Motion's own blend branch: not covered by the Layer reference baseline.
@@ -817,6 +540,22 @@ function createTables(gl) {
 // Glyphs are rasterised once (the reference keeps a 1-byte coverage bitmap per
 // character) and packed into a shared RGBA atlas, so text drawing is textured
 // quads on the GPU instead of read-modify-write on the CPU bitmap.
+const PREMULTIPLIED_FRAGMENT = `#version 300 es
+precision highp float;
+uniform sampler2D sourceTexture;
+uniform bool resolveComposite;
+in vec2 sourcePoint;
+out vec4 colour;
+void main() {
+  vec4 pixel = texelFetch(sourceTexture, ivec2(floor(sourcePoint)), 0);
+  if (resolveComposite) {
+    // Leave the original hidden RGB intact wherever the entire run has zero
+    // alpha. The original straight target is not sampled while being written.
+    if (pixel.a == 0.0) discard;
+    colour = vec4(pixel.rgb / pixel.a, pixel.a);
+  } else colour = vec4(pixel.rgb * pixel.a, pixel.a);
+}`;
+
 class GlyphAtlas {
   constructor(device, size = 2048) {
     this.device = device;
@@ -851,12 +590,14 @@ class GlyphAtlas {
     const gl = this.device.gl;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, left, top, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    if (pixels) gl.texSubImage2D(gl.TEXTURE_2D, 0, left, top, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     this.device.commit(this.image, entry);
-    this.device.stats.uploads++;
-    this.device.stats.uploadedBytes += pixels.byteLength;
-    this.device.stats.glyphUploads++;
-    this.device.stats.glyphUploadedBytes += pixels.byteLength;
+    if (pixels) {
+      this.device.stats.uploads++;
+      this.device.stats.uploadedBytes += pixels.byteLength;
+      this.device.stats.glyphUploads++;
+      this.device.stats.glyphUploadedBytes += pixels.byteLength;
+    }
     this.x += width + 1;
     this.row = Math.max(this.row, height);
     return { left, top, right: left + width, bottom: top + height };
@@ -864,23 +605,28 @@ class GlyphAtlas {
 }
 
 class GPUDevice {
-  constructor(document) {
+  constructor(document, textBlendShader) {
     this.canvas = new OffscreenCanvas(1, 1);
     const gl = this.gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false });
     if (!gl) throw new Error('WebGL 2 is required');
     this.lost = false;
     this.onLost = event => { event.preventDefault(); this.lost = true; };
     this.canvas.addEventListener('webglcontextlost', this.onLost);
-    this.program = this.compile(VERTEX, FRAGMENT);
+    const fragment = fragmentSource(textBlendShader);
+    this.program = this.compile(QUAD_VERTEX, fragment);
+    this.compositeProgram = this.compile(QUAD_VERTEX, fragment.replace('#version 300 es', '#version 300 es\n#define LAYER_COMPOSITE'));
+    this.windowProgram = this.compile(QUAD_VERTEX, fragment.replace('#version 300 es', '#version 300 es\n#define LAYER_COMPOSITE\n#define WINDOW_COMPOSITE'));
+    this.floatCompositing = !!gl.getExtension('EXT_color_buffer_float');
+    this.premultipliedProgram = this.floatCompositing ? this.compile(QUAD_VERTEX, PREMULTIPLIED_FRAGMENT) : null;
     gl.useProgram(this.program);
-    this.glyphBuffer = gl.createBuffer();
     gl.disable(gl.BLEND);
     gl.disable(gl.DITHER);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    this.locations = new Map();
+    this.programUniforms = new Map();
+    this.uniforms = null;
     this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     this.stats = { uploads: 0, uploadedBytes: 0, glyphUploads: 0, glyphUploadedBytes: 0,
-      readbacks: 0, readbackBytes: 0, snapshots: 0, textGlyphs: 0, textDraws: 0, draws: 0 };
+      readbacks: 0, readbackBytes: 0, snapshots: 0, draws: 0 };
     this.tables = createTables(gl);
     // Like tTVPOGLTexture2D, a bitmap owns its resident texture. Active render
     // targets cannot be evicted: preserving them would require a GPU readback.
@@ -891,11 +637,14 @@ class GPUDevice {
     this.glyphAtlasCount = 0;
     this.glyphAtlasBytes = 0;
     this.glyphImages = new WeakMap();
-    this.textBatches = new Map();
-    this.pendingTextReadbacks = new Set();
     this.textureFinalizer = new FinalizationRegistry(entry => this.releaseTexture(entry));
     this.scratch = null;
-    this.presenters = new WeakMap();
+    // Feature modules own their own programs and textures; release them here so
+    // device shutdown stays the single teardown point.
+    this.disposers = new Set();
+  }
+  onDispose(dispose) {
+    this.disposers.add(dispose);
   }
   compile(vertex, fragment) {
     const gl = this.gl;
@@ -913,10 +662,24 @@ class GPUDevice {
     return program;
   }
   uniform(name, type, ...values) {
-    if (!this.locations.has(name)) this.locations.set(name, this.gl.getUniformLocation(this.program, name));
-    this.gl[type](this.locations.get(name), ...values);
+    let uniform = this.uniforms.get(name);
+    if (!uniform) {
+      uniform = { location: this.gl.getUniformLocation(this.activeProgram, name), values: null };
+      this.uniforms.set(name, uniform);
+    }
+    if (uniform.location === null) return;
+    const previous = uniform.values;
+    const matrix = type === 'uniformMatrix3fv';
+    if (previous) {
+      const current = matrix ? values[1] : values;
+      let same = current.length === previous.length;
+      for (let i = 0; same && i < current.length; i++) same = current[i] === previous[i];
+      if (same) return;
+    }
+    this.gl[type](uniform.location, ...values);
+    uniform.values = matrix ? Array.from(values[1]) : values;
   }
-  create(width, height) {
+  create(width, height, gray = false, halfFloat = false) {
     const gl = this.gl;
     if (width <= 0 || height <= 0 || width > this.maxTextureSize || height > this.maxTextureSize) throw new Error(`GPU image has invalid dimensions: ${width}x${height}`);
     const texture = gl.createTexture();
@@ -926,45 +689,41 @@ class GPUDevice {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, halfFloat ? gl.RGBA16F : gray ? gl.R8 : gl.RGBA8, width, height);
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-    // Every target uses one immutable, sized RGBA8 colour attachment. Validate
-    // this layout once; querying every allocation synchronously drains the GPU
-    // command queue during rapid layer creation (notably Ctrl skip).
-    if (!this.framebufferValidated) {
+    // Validate the normalized and floating-point attachment layouts once;
+    // querying every allocation synchronously drains the GPU command queue.
+    if (!this.framebufferValidated || halfFloat && !this.floatFramebufferValidated) {
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('GPU framebuffer is incomplete');
       this.framebufferValidated = true;
+      if (halfFloat) this.floatFramebufferValidated = true;
     }
-    return { device: this, texture, framebuffer, width, height, filter: gl.NEAREST };
+    return { device: this, texture, framebuffer, width, height, gray, bytesPerPixel: halfFloat ? 8 : gray ? 1 : 4, filter: gl.NEAREST };
   }
   texture(image, discard = false) {
     if (this.lost) throw new Error('WebGL context was lost; reload the game');
-    if (image.gray) throw new Error('GPU operations require an RGBA image');
-    let entry = this.textures.get(image);
-    if (entry && (entry.width !== image.width || entry.height !== image.height)) {
-      this.releaseTexture(entry);
-      entry = null;
-    }
-    if (!entry) {
-      entry = this.create(image.width, image.height);
-      entry.image = new WeakRef(image);
-      this.textures.set(image, entry);
-      this.imageTextures.add(entry);
-      this.textureBytes += entry.width * entry.height * 4;
-      this.textureFinalizer.register(image, entry, entry);
-    }
-    const externalWritePending = image.externallyWritable && !this.textBatches.has(image);
     // An exported writable view can change without an Image method call.
     // At the next GPU use, explicitly enter the CPU-write contract.
-    if (externalWritePending) image.markCPUWritten();
+    if (image.externallyWritable) image.markCPUWritten();
+    // Storage geometry is immutable; resizing replaces the storage and key.
+    const storage = image._storage;
+    let entry = this.textures.get(storage);
+    if (!entry) {
+      entry = this.create(image.width, image.height, image.gray, image.halfFloat);
+      entry.storage = new WeakRef(storage);
+      this.textures.set(storage, entry);
+      this.imageTextures.add(entry);
+      this.textureBytes += entry.width * entry.height * entry.bytesPerPixel;
+      this.textureFinalizer.register(storage, entry, entry);
+    }
     if (!discard && !image.gpuValid) {
       if (!image.cpuValid) throw new Error('Image has no authoritative source');
       const pixels = image._pixels;
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, entry.texture);
       if (pixels) {
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, image.width, image.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, image.width, image.height, image.gray ? gl.RED : gl.RGBA, gl.UNSIGNED_BYTE, pixels);
         this.stats.uploads++;
         this.stats.uploadedBytes += pixels.byteLength;
       } else {
@@ -978,33 +737,77 @@ class GPUDevice {
     image.gpu = entry;
     return entry;
   }
-  moveImageStorage(targetImage, sourceImage) {
-    const previous = this.textures.get(targetImage);
-    if (previous) this.releaseTexture(previous);
-    this.textures.delete(targetImage);
-    const entry = this.textures.get(sourceImage);
-    if (entry) {
-      this.textures.delete(sourceImage);
-      this.textureFinalizer.unregister(entry);
-      entry.image = new WeakRef(targetImage);
-      this.textures.set(targetImage, entry);
-      this.textureFinalizer.register(targetImage, entry, entry);
+  // Immutable source images can be prepared before drawing. Keep each upload
+  // bounded and yield between batches so large resources do not monopolize a
+  // frame. GPU authority is published only after all rows have been uploaded.
+  async prepareTextures(images) {
+    const gl = this.gl;
+    let batchBytes = 0, batchStart = performance.now();
+    const nextBatch = async () => {
+      gl.flush();
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      batchBytes = 0;
+      batchStart = performance.now();
+    };
+    for (const image of images) {
+      if (!image.width || !image.height || image.gpuValid) continue;
+      // Uploading synchronizes shared content; it does not modify the image.
+      const pixels = image._pixels;
+      if (!pixels) {
+        this.texture(image);
+        continue;
+      }
+      const entry = this.texture(image, true);
+      const rowBytes = image.width * (image.gray ? 1 : 4);
+      for (let y = 0; y < image.height;) {
+        if (PREPARE_UPLOAD_BYTES - batchBytes < rowBytes) await nextBatch();
+        const height = Math.min(image.height - y, Math.floor((PREPARE_UPLOAD_BYTES - batchBytes) / rowBytes));
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y, image.width, height,
+          image.gray ? gl.RED : gl.RGBA, gl.UNSIGNED_BYTE,
+          pixels.subarray(y * rowBytes, (y + height) * rowBytes));
+        const bytes = height * rowBytes;
+        this.stats.uploads++;
+        this.stats.uploadedBytes += bytes;
+        batchBytes += bytes;
+        y += height;
+        if (batchBytes >= PREPARE_UPLOAD_BYTES || performance.now() - batchStart >= PREPARE_UPLOAD_MS) {
+          await nextBatch();
+        }
+      }
+      this.commit(image, entry);
     }
-    targetImage.gpu = sourceImage.gpu;
-    targetImage.gpuValid = sourceImage.gpuValid;
-    sourceImage.gpu = null;
-    sourceImage.gpuValid = false;
+  }
+  // Canvas-backed rasterizers upload directly, without a JS pixel readback.
+  uploadCanvas(image, canvas) {
+    image.detach(false);
+    const entry = this.texture(image, true), gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+    this.commit(image, entry);
+    this.stats.uploads++;
+    this.stats.uploadedBytes += image.width * image.height * 4;
   }
   releaseTexture(entry) {
-    const image = entry.image.deref();
-    if (image?.gpu === entry) {
-      image.gpu = null;
-      image.gpuValid = false;
+    const storage = entry.storage?.deref();
+    if (storage?.gpu === entry) {
+      // A shared storage may still be in use by another Image. Preserve its
+      // content before the only resident copy disappears.
+      if (storage.refs > 1 && !storage.cpuValid && !this.lost) {
+        storage.pixels = this.read(entry);
+        storage.cpuValid = true;
+      }
+      storage.gpu = null;
+      storage.gpuValid = false;
     }
-    if (image && this.textures.get(image) === entry) this.textures.delete(image);
+    if (storage && this.textures.get(storage) === entry) this.textures.delete(storage);
     this.textureFinalizer.unregister(entry);
     this.imageTextures.delete(entry);
-    this.textureBytes -= entry.width * entry.height * 4;
+    this.textureBytes -= entry.width * entry.height * entry.bytesPerPixel;
     if (entry.glyphAtlas) {
       this.glyphAtlasCount--;
       this.glyphAtlasBytes -= entry.width * entry.height * 4;
@@ -1020,6 +823,7 @@ class GPUDevice {
     gl.bindFramebuffer(gl.FRAMEBUFFER, entry.framebuffer);
     gl.readPixels(rect.left, rect.top, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     this.stats.readbacks++; this.stats.readbackBytes += pixels.byteLength;
+    if (entry.gray) return Uint8ClampedArray.from({ length: width * height }, (_, i) => pixels[i * 4]);
     return pixels;
   }
   snapshot(target, rect) {
@@ -1045,9 +849,12 @@ class GPUDevice {
     gl.bindTexture(gl.TEXTURE_2D, entry.texture);
     this.uniform(uniform, 'uniform1i', unit);
   }
-  setup(target, source, rect, matrix, clip, destination) {
+  setup(target, source, rect, matrix, clip, destination, program = this.program) {
     const gl = this.gl;
-    gl.useProgram(this.program);
+    gl.useProgram(program);
+    this.activeProgram = program;
+    this.uniforms = this.programUniforms.get(program);
+    if (!this.uniforms) this.programUniforms.set(program, this.uniforms = new Map());
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
     gl.viewport(0, 0, target.width, target.height);
     gl.enable(gl.SCISSOR_TEST);
@@ -1059,30 +866,10 @@ class GPUDevice {
     gl.activeTexture(gl.TEXTURE4);
     gl.bindTexture(gl.TEXTURE_2D, this.tables);
     this.uniform('tableTexture', 'uniform1i', 4);
-    gl.activeTexture(gl.TEXTURE5);
-    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture ?? null);
-    this.uniform('lutTexture', 'uniform1i', 5);
-    gl.activeTexture(gl.TEXTURE6);
-    gl.bindTexture(gl.TEXTURE_2D, this.kernelTexture ?? null);
-    this.uniform('kernelTexture', 'uniform1i', 6);
-    this.uniform('blurRadius', 'uniform1i', 0);
-    this.uniform('blurSigma', 'uniform1f', 1);
-    this.uniform('blurStep', 'uniform2i', 1, 0);
     this.uniform('sourceSize', 'uniform2f', source.width, source.height);
     this.uniform('smoothSampling', 'uniform1i', 0);
     this.uniform('explicitCoverage', 'uniform1i', 0);
-    this.uniform('colourOp', 'uniform1i', 0);
-    this.uniform('colourValue', 'uniform1i', 0);
-    this.uniform('colourOpa', 'uniform1i', 255);
-    this.uniform('lutOp', 'uniform1i', 0);
-    this.uniform('transformOp', 'uniform1i', 0);
-    this.uniform('blurLeft', 'uniform1i', 0);
-    this.uniform('blurTop', 'uniform1i', 0);
-    this.uniform('blurRight', 'uniform1i', 0);
-    this.uniform('blurBottom', 'uniform1i', 0);
-    this.uniform('blurAlpha', 'uniform1i', 0);
     this.uniform('targetSize', 'uniform2f', target.width, target.height);
-    this.uniform('glyphBatch', 'uniform1i', 0);
     this.uniform('sourceRect', 'uniform4f', rect.left, rect.top, rect.right, rect.bottom);
     this.uniform('transform', 'uniformMatrix3fv', false, [matrix[0], matrix[1], 0, matrix[2], matrix[3], 0, matrix[4], matrix[5], 1]);
   }
@@ -1100,6 +887,7 @@ class GPUDevice {
       opaque = false,
       motion = false,
       maskOnly = false,
+      windowComposite = false,
       smooth = false
     } = options;
     const clip = this.clip(targetImage, options.clip);
@@ -1121,7 +909,18 @@ class GPUDevice {
     clip.top = Math.max(clip.top, Math.floor(Math.min(...ys)));
     clip.bottom = Math.min(clip.bottom, Math.ceil(Math.max(...ys)));
     if (clip.right <= clip.left || clip.bottom <= clip.top) return;
-    const source = this.texture(sourceImage), target = this.texture(targetImage);
+    const overwrite = !maskOnly && !holdAlpha && opacity === 255 && (
+      !motion && mode === 1 && copySourceAlpha || motion && opaque && mode === 0);
+    // Bounding-box coverage is insufficient for rotated/sheared quads: their
+    // uncovered corners must retain the old destination pixels.
+    const fullTarget = clip.left === 0 && clip.top === 0 && clip.right === targetImage.width && clip.bottom === targetImage.height
+      && matrix[0] === 1 && matrix[1] === 0 && matrix[2] === 0 && matrix[3] === 1
+      && Number.isInteger(matrix[4]) && Number.isInteger(matrix[5]);
+    // A full overwrite can replace shared storage without preserving it; every
+    // other write (including self draws) separates first and keeps old pixels.
+    const overwriteFull = sourceImage !== targetImage && overwrite && fullTarget;
+    targetImage.detach(sourceImage === targetImage || !overwriteFull);
+    const source = this.texture(sourceImage), target = this.texture(targetImage, overwriteFull);
     // CopyRect's full-channel integer translation does not read destination
     // pixels. Blit it directly instead of snapshotting and running the blend
     // shader; self-copies still use the existing snapshot path.
@@ -1153,13 +952,12 @@ class GPUDevice {
     // Full-opacity copies and opaque normal compositing overwrite the target.
     // They do not need its previous contents. Keep snapshots for self-draws
     // and all blends that actually depend on destination colour or alpha.
-    const overwrite = !maskOnly && !holdAlpha && opacity === 255 && (
-      !motion && mode === 1 && copySourceAlpha || motion && opaque && mode === 0);
-    const destination = sourceImage !== targetImage && overwrite
+    const destination = windowComposite || sourceImage !== targetImage && overwrite
       ? source : this.snapshot(target, sourceImage === targetImage ? this.clip(targetImage) : clip);
     const inverse = mat2d.invert(new Float64Array(6), matrix);
     if (!inverse) return;
-    this.setup(target, sourceImage === targetImage ? destination : source, clip, [1,0,0,1,0,0], clip, destination);
+    this.setup(target, sourceImage === targetImage ? destination : source, clip, [1,0,0,1,0,0], clip, destination,
+      windowComposite ? this.windowProgram : motion && mode === 0 && !maskOnly ? this.compositeProgram : this.program);
     this.uniform('explicitCoverage', 'uniform1i', 1);
     this.uniform('smoothSampling', 'uniform1i', smooth ? 1 : 0);
     this.uniform('inverseTransform', 'uniformMatrix3fv', false, [
@@ -1173,40 +971,63 @@ class GPUDevice {
     this.uniform('opacity', 'uniform1i', opacity);
     this.uniform('opaque', 'uniform1i', opaque ? 1 : 0);
     this.uniform('policy', 'uniform1i', Number(holdAlpha) | Number(destinationAlpha)<<1 | Number(additiveDestination)<<2 | Number(copySourceAlpha)<<3 | Number(ignoreSourceAlpha)<<4);
-    this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
+    const gl = this.gl;
+    if (windowComposite) {
+      gl.enable(gl.BLEND);
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    if (windowComposite) gl.disable(gl.BLEND);
     this.stats.draws++;
     this.commit(targetImage, target);
+  }
+  // Batch normal source-over runs in premultiplied RGBA16F. Public images
+  // remain straight RGBA8; special modes keep their existing ordered path.
+  compositeOffscreen(image, commands) {
+    const normal = command => command.source !== image &&
+      (command.options.mode === 0 || command.options.mode > 5);
+    // The current destination is converted into the accumulation target first,
+    // so a shared image must be separated with its pixels preserved.
+    image.detach(true);
+    for (let i = 0; i < commands.length;) {
+      let end = i;
+      while (end < commands.length && normal(commands[end])) end++;
+      if (!this.floatCompositing || end - i < 3) {
+        const { source, options } = commands[i++];
+        this.draw(image, source, options);
+        continue;
+      }
+      let intermediate = this.offscreenComposite;
+      if (!intermediate || intermediate.width !== image.width || intermediate.height !== image.height) {
+        if (intermediate) {
+          this.releaseTexture(this.textures.get(intermediate._storage));
+        }
+        intermediate = this.offscreenComposite = new Image(image.width, image.height, { defer: true });
+        intermediate.halfFloat = true;
+      }
+      const target = this.texture(image), accumulation = this.texture(intermediate, true);
+      const rect = this.clip(image), identity = [1, 0, 0, 1, 0, 0];
+      const convert = (output, input, resolve) => {
+        this.setup(output, input, rect, identity, rect, input, this.premultipliedProgram);
+        this.uniform('resolveComposite', 'uniform1i', Number(resolve));
+        this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
+        this.stats.draws++;
+      };
+      convert(accumulation, target, false);
+      intermediate.markGPUWritten();
+      for (; i < end; i++) {
+        const { source, options } = commands[i];
+        this.draw(intermediate, source, { ...options, windowComposite: true });
+      }
+      convert(target, accumulation, true);
+      this.commit(image, target);
+    }
   }
   commit(image, entry) {
     image.gpu = entry;
     image.markGPUWritten();
-    if (image.externallyWritable) {
-      if (this.textBatches.has(image)) this.pendingTextReadbacks.add(image);
-      else this.syncExternalImage(image);
-    }
-  }
-  beginTextBatch(image) {
-    if (!this.textBatches.has(image) && image.externallyWritable) this.texture(image);
-    const batch = this.textBatches.get(image);
-    if (batch) batch.depth++;
-    else this.textBatches.set(image, { depth: 1, commands: [] });
-  }
-  endTextBatch(image) {
-    const batch = this.textBatches.get(image);
-    if (!batch) throw new Error('GPU text batch is not active');
-    if (batch.depth > 1) {
-      batch.depth--;
-      return;
-    }
-    this.drawGlyphBatch(image, batch.commands);
-    this.textBatches.delete(image);
-    if (this.pendingTextReadbacks.delete(image) && !image.cpuValid) {
-      this.syncExternalImage(image);
-    }
-  }
-  syncExternalImage(image) {
-    // The CPU view is now current too; the GPU copy remains authoritative.
-    image.materialize();
+    if (image.externallyWritable) image.materialize();
   }
   clip(image, rect = null) {
     rect ??= { left: 0, top: 0, right: image.width, bottom: image.height };
@@ -1235,28 +1056,23 @@ class GPUDevice {
   glyph(image) {
     let glyph = this.glyphImages.get(image);
     if (glyph) return glyph;
-    const pixels = image.pixels;
-    let left = image.width, top = image.height, right = 0, bottom = 0;
-    for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
-      if (!pixels[(y * image.width + x) * 4 + 3]) continue;
-      left = Math.min(left, x); top = Math.min(top, y);
-      right = Math.max(right, x + 1); bottom = Math.max(bottom, y + 1);
+    if (image.gpuValid) {
+      const { atlas, rect } = this.addGlyph(image.width, image.height, null);
+      this.draw(atlas.image, image, { matrix: [1, 0, 0, 1, rect.left, rect.top], mode: 1, copySourceAlpha: true });
+      glyph = { atlas, rect };
+      this.glyphImages.set(image, glyph);
+      return glyph;
     }
-    glyph = right <= left || bottom <= top
-      ? { atlas: null, rect: null, bounds: null }
-      : { ...this.addGlyph(image.width, image.height, pixels), bounds: { left, top, right, bottom } };
+    const pixels = image.pixels;
+    let visible = false;
+    for (let i = 3; i < pixels.length; i += 4) {
+      if (pixels[i]) { visible = true; break; }
+    }
+    glyph = visible ? this.addGlyph(image.width, image.height, pixels) : { atlas: null, rect: null };
     this.glyphImages.set(image, glyph);
     return glyph;
   }
-  // Collect rasterized glyphs until the text call ends. Nonoverlapping glyph
-  // quads can share one destination snapshot and draw submission; intersecting
-  // quads are flushed in order so the reference blend result is preserved.
   drawGlyph(targetImage, glyph, left, top, options = {}) {
-    const batch = this.textBatches.get(targetImage);
-    if (batch) {
-      batch.commands.push({ source: glyph?.rect ? null : glyph, glyph: glyph?.rect ? glyph : null, left, top, options });
-      return true;
-    }
     if (!glyph?.rect) glyph = this.glyph(glyph);
     if (!glyph.rect) return false;
     const { rect } = glyph;
@@ -1266,86 +1082,11 @@ class GPUDevice {
       matrix: [1, 0, 0, 1, left - rect.left, top - rect.top],
     });
   }
-  drawGlyphBatch(targetImage, commands) {
-    this.stats.textGlyphs += commands.length;
-    let group = null;
-    const overlaps = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-    const flush = () => {
-      if (!group) return;
-      const { atlas, mode, opacity, quads, bounds } = group;
-      const clip = {
-        left: Math.max(0, Math.floor(bounds.left)), top: Math.max(0, Math.floor(bounds.top)),
-        right: Math.min(targetImage.width, Math.ceil(bounds.right)), bottom: Math.min(targetImage.height, Math.ceil(bounds.bottom)),
-      };
-      if (clip.right <= clip.left || clip.bottom <= clip.top) { group = null; return; }
-      const source = this.texture(atlas.image), target = this.texture(targetImage);
-      const destination = this.snapshot(target, clip), gl = this.gl;
-      this.setup(target, source, { left: 0, top: 0, right: atlas.size, bottom: atlas.size }, [1, 0, 0, 1, 0, 0], clip, destination);
-      this.uniform('glyphBatch', 'uniform1i', 1);
-      this.uniform('operation', 'uniform1i', 0);
-      this.uniform('mode', 'uniform1i', mode);
-      this.uniform('opacity', 'uniform1i', opacity);
-      this.uniform('opaque', 'uniform1i', 0);
-      this.uniform('policy', 'uniform1i', 0);
-      this.uniform('explicitCoverage', 'uniform1i', 0);
-      this.uniform('smoothSampling', 'uniform1i', 0);
-      const vertices = new Float32Array(quads.length * 6 * 4);
-      let offset = 0;
-      for (const quad of quads) {
-        const { bounds: b, source: s } = quad;
-        const u0 = quad.entry.rect.left + s.left, v0 = quad.entry.rect.top + s.top;
-        const u1 = quad.entry.rect.left + s.right, v1 = quad.entry.rect.top + s.bottom;
-        for (const [x, y, u, v] of [
-          [b.left, b.top, u0, v0], [b.right, b.top, u1, v0], [b.left, b.bottom, u0, v1],
-          [b.left, b.bottom, u0, v1], [b.right, b.top, u1, v0], [b.right, b.bottom, u1, v1],
-        ]) {
-          vertices[offset++] = x; vertices[offset++] = y; vertices[offset++] = u; vertices[offset++] = v;
-        }
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.glyphBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STREAM_DRAW);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
-      gl.enableVertexAttribArray(1);
-      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
-      gl.drawArrays(gl.TRIANGLES, 0, vertices.length / 4);
-      this.stats.draws++;
-      this.stats.textDraws++;
-      this.commit(targetImage, target);
-      group = null;
-    };
-    for (const command of commands) {
-      const entry = command.glyph ?? this.glyph(command.source);
-      if (!entry.bounds) continue;
-      const clip = this.clip(targetImage, command.options.clip);
-      const source = entry.bounds;
-      const bounds = {
-        left: Math.max(command.left + source.left, clip.left),
-        top: Math.max(command.top + source.top, clip.top),
-        right: Math.min(command.left + source.right, clip.right),
-        bottom: Math.min(command.top + source.bottom, clip.bottom),
-      };
-      if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) continue;
-      const mode = command.options.mode ?? 2, opacity = command.options.opacity ?? 255;
-      const canJoin = group && group.atlas === entry.atlas && group.mode === mode && group.opacity === opacity
-        && group.quads.every(quad => !overlaps(quad.bounds, bounds));
-      if (!canJoin) flush();
-      if (!group) group = { atlas: entry.atlas, mode, opacity, quads: [], bounds: { ...bounds } };
-      group.quads.push({ entry, bounds, source: {
-        left: bounds.left - command.left, top: bounds.top - command.top,
-        right: bounds.right - command.left, bottom: bounds.bottom - command.top,
-      } });
-      group.bounds.left = Math.min(group.bounds.left, bounds.left);
-      group.bounds.top = Math.min(group.bounds.top, bounds.top);
-      group.bounds.right = Math.max(group.bounds.right, bounds.right);
-      group.bounds.bottom = Math.max(group.bounds.bottom, bounds.bottom);
-    }
-    flush();
-  }
   fill(image, rect, rgba, maskOnly = false) {
     const clip = this.clip(image, rect);
     if (clip.right <= clip.left || clip.bottom <= clip.top) return;
     const full = !maskOnly && clip.left === 0 && clip.top === 0 && clip.right === image.width && clip.bottom === image.height;
+    image.detach(!full);
     const target = this.texture(image, full), gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
     gl.enable(gl.SCISSOR_TEST);
@@ -1358,133 +1099,9 @@ class GPUDevice {
     gl.colorMask(true, true, true, true);
     this.commit(image, target);
   }
-  // LayerBitmapIntf FillColor / FillColorOnAlpha / FillColorOnAddAlpha /
-  // RemoveConstOpacity: the colour ops only touch the destination buffer.
-  colour(image, rect, argb, opa, op) {
-    this.pixelOperation(image, rect, 9, () => {
-      this.uniform('colourOp', 'uniform1i', op);
-      this.uniform('colourValue', 'uniform1i', argb | 0);
-      this.uniform('colourOpa', 'uniform1i', opa);
-    });
-  }
-  // TVPAdjustGamma / Layer.light: the tables are computed on the host with the
-  // reference arithmetic and applied as a lookup texture.
-  applyLookup(image, rect, tables, additive = false) {
-    const data = new Uint8Array(256 * 3);
-    for (let channel = 0; channel < 3; channel++) data.set(tables[channel], channel * 256);
-    const gl = this.gl;
-    if (!this.lutTexture) {
-      this.lutTexture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 256, 3, 0, gl.RED, gl.UNSIGNED_BYTE, data);
-    } else {
-      gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 3, gl.RED, gl.UNSIGNED_BYTE, data);
-    }
-    this.pixelOperation(image, rect, 10, () => this.uniform('lutOp', 'uniform1i', additive ? 1 : 0));
-  }
-  // TVPDoGrayScale (0) / TVPConvertAlphaToAdditiveAlpha (1) / TVPConvertAdditiveAlphaToAlpha (2).
-  transform(image, rect, kind) {
-    this.pixelOperation(image, rect, 11, () => this.uniform('transformOp', 'uniform1i', kind));
-  }
-  // tTJSNI_BaseLayer::ApplyGaussianBlur: two separable convolution passes.
-  // Pass one writes the horizontally blurred copy into a scratch target, pass
-  // two writes the image texture in place, so no readback is needed.
-  gaussianBlur(image, radius, sigma) {
-    if (this.lost) throw new Error('WebGL context was lost; reload the game');
-    if (image.gray) throw new Error('GPU operations require an RGBA image');
-    if (!image.width || !image.height || !(radius > 0) || !(sigma > 0)) return;
-    const gl = this.gl;
-    this.uploadKernel(radius, sigma);
-    const source = this.texture(image);
-    const clip = this.clip(image);
-    const full = { left: 0, top: 0, right: image.width, bottom: image.height };
-    // The scratch target must match the image exactly: the pass clamps sample
-    // coordinates to the texture size, which has to be the image size.
-    if (!this.blurTarget || this.blurTarget.width !== image.width || this.blurTarget.height !== image.height) {
-      if (this.blurTarget) {
-        gl.deleteTexture(this.blurTarget.texture);
-        gl.deleteFramebuffer(this.blurTarget.framebuffer);
-      }
-      this.blurTarget = this.create(image.width, image.height);
-    }
-    const identity = [1, 0, 0, 1, 0, 0];
-    const pass = (target, input, stepX, stepY) => {
-      this.setup(target, input, full, identity, clip, input);
-      this.uniform('operation', 'uniform1i', 13);
-      this.uniform('opaque', 'uniform1i', 0);
-      this.uniform('blurRadius', 'uniform1i', radius);
-      this.uniform('blurStep', 'uniform2i', stepX, stepY);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    };
-    pass(this.blurTarget, source, 1, 0);
-    pass(source, this.blurTarget, 0, 1);
-    this.stats.draws += 2;
-    this.commit(image, source);
-  }
-  uploadKernel(radius, sigma) {
-    const gl = this.gl;
-    const size = radius * 2 + 1;
-    const data = new Float32Array(size);
-    // generate_1d_gaussian_kernel, including its float32 rounding at every step.
-    const s32 = Math.fround(sigma);
-    const rSquared = Math.fround(Math.fround(2 * s32) * s32);
-    let sum = 0;
-    for (let i = 0; i < size; i++) {
-      const x = i - radius;
-      data[i] = Math.fround(Math.exp(Math.fround(-Math.fround(x * x) / rSquared)));
-      sum = Math.fround(sum + data[i]);
-    }
-    for (let i = 0; i < size; i++) data[i] = Math.fround(data[i] / sum);
-    if (!this.kernelTexture) {
-      this.kernelTexture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, this.kernelTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    }
-    gl.bindTexture(gl.TEXTURE_2D, this.kernelTexture);
-    if (this.kernelSize !== size) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, size, 1, 0, gl.RED, gl.FLOAT, data);
-      this.kernelSize = size;
-    } else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size, 1, gl.RED, gl.FLOAT, data);
-  }
-  // iTVPBaseBitmap::DoBoxBlur / DoBoxBlurForAlpha with area offsets.
-  boxBlur(image, rect, area, alphaMode) {
-    this.pixelOperation(image, rect, 12, () => {
-      this.uniform('blurLeft', 'uniform1i', area.left);
-      this.uniform('blurTop', 'uniform1i', area.top);
-      this.uniform('blurRight', 'uniform1i', area.right);
-      this.uniform('blurBottom', 'uniform1i', area.bottom);
-      this.uniform('blurAlpha', 'uniform1i', alphaMode ? 1 : 0);
-    });
-  }
-  // Runs a whole-buffer pass reading the previous content and writing it back.
-  pixelOperation(image, rect, operation, setUniforms) {
-    if (this.lost) throw new Error('WebGL context was lost; reload the game');
-    if (image.gray) throw new Error('GPU operations require an RGBA image');
-    const clip = this.clip(image, rect);
-    if (clip.right <= clip.left || clip.bottom <= clip.top) return;
-    const target = this.texture(image);
-    const previous = this.snapshot(target, this.clip(image));
-    const full = { left: 0, top: 0, right: image.width, bottom: image.height };
-    this.setup(target, previous, full, [1, 0, 0, 1, 0, 0], clip, previous);
-    // Scratch capacity may exceed this image; neighbourhood filters must clamp
-    // to the logical image bounds, not to unused texels in the scratch buffer.
-    this.uniform('sourceSize', 'uniform2f', image.width, image.height);
-    this.uniform('operation', 'uniform1i', operation);
-    this.uniform('opaque', 'uniform1i', 0);
-    setUniforms();
-    this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
-    this.stats.draws++;
-    this.commit(image, target);
-  }
   copy(targetImage, sourceImage) {
+    // Copy replaces every target texel, so shared old content need not survive.
+    targetImage.detach(false);
     const source = this.texture(sourceImage), target = this.texture(targetImage, true), gl = this.gl;
     gl.disable(gl.SCISSOR_TEST);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, source.framebuffer);
@@ -1492,48 +1109,10 @@ class GPUDevice {
     gl.blitFramebuffer(0, 0, source.width, source.height, 0, 0, target.width, target.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     this.commit(targetImage, target);
   }
-  crossfade(image, a, b, phase, type, rule = null, vague = 0) {
-    const ruleSource = rule ? this.texture(rule) : null;
-    const source = this.texture(a);
-    const second = this.texture(b);
-    const target = this.texture(image, true);
-    this.setup(target, source, { left: 0, top: 0, right: image.width, bottom: image.height }, [1, 0, 0, 1, 0, 0], this.clip(image), second);
-    this.bind(second, 2, 'secondTexture');
-    if (ruleSource) this.bind(ruleSource, 3, 'ruleTexture');
-    this.uniform('operation', 'uniform1i', rule ? 8 : 3);
-    this.uniform('phase', 'uniform1i', phase);
-    this.uniform('layerType', 'uniform1i', type);
-    this.uniform('vague', 'uniform1i', vague);
-    this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
-    this.stats.draws++;
-    this.commit(image, target);
-  }
-  universal(image, a, b, rule, phase, vague, type) {
-    this.crossfade(image, a, b, phase, type, rule, vague);
-  }
-  present(image, canvas) {
-    const source = this.texture(image);
-    const gl = this.gl;
-    if (this.canvas.width !== image.width) this.canvas.width = image.width;
-    if (this.canvas.height !== image.height) this.canvas.height = image.height;
-    this.setup({ framebuffer: null, width: image.width, height: image.height }, source, { left: 0, top: 0, right: image.width, bottom: image.height }, [1, 0, 0, 1, 0, 0], this.clip(image), source);
-    this.uniform('operation', 'uniform1i', 4);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    let context = this.presenters.get(canvas);
-    if (!context) {
-      context = canvas.getContext('2d', { alpha: false });
-      if (!context) throw new Error('GPU presentation requires CanvasRenderingContext2D');
-      this.presenters.set(canvas, context);
-    }
-    // Copy the rendered canvas directly. Safari's transferToImageBitmap path
-    // can block for an entire frame while exporting the WebGL drawing buffer.
-    context.drawImage(this.canvas, 0, 0);
-  }
   diagnostics() {
     return { ...this.stats, textureBytes: this.textureBytes, textureCount: this.imageTextures.size,
       glyphAtlasCount: this.glyphAtlasCount, glyphAtlasBytes: this.glyphAtlasBytes };
   }
-  stop() {}
   finalize() {
     for (const entry of this.imageTextures) this.releaseTexture(entry);
     this.textures = new WeakMap();
@@ -1543,13 +1122,12 @@ class GPUDevice {
       gl.deleteFramebuffer(this.scratch.framebuffer);
     }
     gl.deleteTexture(this.tables);
-    if (this.lutTexture) gl.deleteTexture(this.lutTexture);
-    if (this.kernelTexture) gl.deleteTexture(this.kernelTexture);
-    if (this.blurTarget) {
-      gl.deleteTexture(this.blurTarget.texture);
-      gl.deleteFramebuffer(this.blurTarget.framebuffer);
-    }
     gl.deleteProgram(this.program);
+    gl.deleteProgram(this.compositeProgram);
+    gl.deleteProgram(this.windowProgram);
+    if (this.premultipliedProgram) gl.deleteProgram(this.premultipliedProgram);
+    for (const dispose of this.disposers) dispose();
+    this.disposers.clear();
     this.canvas.removeEventListener('webglcontextlost', this.onLost);
     gl.getExtension('WEBGL_lose_context')?.loseContext();
     if (device === this) device = null;

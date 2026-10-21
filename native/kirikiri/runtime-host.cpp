@@ -256,15 +256,17 @@ public:
 class HostInstance : public tTJSNativeInstance
 {
     Runtime *r;
-    int owner = 0, initialize, stateHandle = 0;
+    int owner = 0, initialize, stateHandle = 0, classId, reference = 0;
 
 public:
-    HostInstance(Runtime *r, int initialize) : r(r), initialize(initialize ? host_retain(r, initialize) : 0) { r->alive++; }
+    HostInstance(Runtime *r, int initialize, int classId) : r(r), initialize(initialize ? host_retain(r, initialize) : 0), classId(classId) { r->alive++; }
     void attach(iTJSDispatch2 *value, int state = 0)
     {
         owner = (int)(uintptr_t)value;
         stateHandle = state;
         r->attachOwner(value);
+        reference = r->owners.at(value).reference;
+        r->nativeInstances[classId][reference] = this;
     }
     int state() const { return stateHandle; }
     void setState(int handle)
@@ -278,6 +280,12 @@ public:
     ~HostInstance() override
     {
         r->alive--;
+        if (reference)
+        {
+            auto &instances = r->nativeInstances.at(classId);
+            instances.erase(reference);
+            if (instances.empty()) r->nativeInstances.erase(classId);
+        }
         r->forgetOwner(reinterpret_cast<iTJSDispatch2 *>((uintptr_t)owner));
         if (stateHandle)
             r->releaseHost(stateHandle);
@@ -329,7 +337,7 @@ class HostClass : public tTJSNativeClass
     int initialize;
 
 protected:
-    iTJSNativeInstance *CreateNativeInstance() override { return new HostInstance(r, initialize); }
+    iTJSNativeInstance *CreateNativeInstance() override { return new HostInstance(r, initialize, _ClassID); }
 
 public:
     ~HostClass() override
@@ -400,16 +408,10 @@ extern "C"
                        {
         auto *array=TJSCreateArrayObject();tTJSVariant result(array,array);array->Release();int index=0;
         const auto classId=TJSRegisterNativeClass(name);
-        std::vector<std::pair<int,int>> states;
-        for(const auto &[owner,identity]:r->owners){
-            iTJSNativeInstance *instance=nullptr;
-            if(TJS_SUCCEEDED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE,classId,&instance))){
-                auto *host=dynamic_cast<HostInstance *>(instance);
-                if(host&&host->state())states.emplace_back(identity.reference,host->state());
-            }
+        const auto found=r->nativeInstances.find(classId);
+        if(found!=r->nativeInstances.end())for(const auto &[identity,host]:found->second){
+            if(host->state()){tTJSVariant value(host->state());success(array->PropSetByNum(TJS_MEMBERENSURE,index++,&value,array));}
         }
-        std::sort(states.begin(),states.end());
-        for(const auto &[identity,handle]:states){tTJSVariant value(handle);success(array->PropSetByNum(TJS_MEMBERENSURE,index++,&value,array));}
         return r->keep(result); });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_object_create_host(Runtime *r, int kind, int hostHandle)

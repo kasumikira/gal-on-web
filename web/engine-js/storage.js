@@ -169,6 +169,8 @@ export class Storages {
   }
   async isExistentStorage(name) { return Number((await this.getPlacedPath(name))!==''); }
   async read(name) {
+    // Return independently owned writable bytes. Consumers may transfer a
+    // complete result buffer; backends/media must not expose cached buffers.
     const path = await this.getPlacedPath(name);
     if (!path) throw new Error(`Storage not found: ${name}`);
     const found = this.findMedia(path);

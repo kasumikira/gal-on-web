@@ -2,8 +2,8 @@
 // boundary (LayerIntf.cpp and BitmapIntf.cpp).  Kept separate from layer.js
 // so the layer state machine can install these operations after its Node type
 // and bitmap class are available.
-import { Image, colorBytes } from './bitmap.js';
-import { getFontAscentOffsets, clipBlit, blurGlyphImage } from './font.js';
+import { Image } from './bitmap.js';
+import { getFontAscentOffsets, clipBlit, blurGlyphImage, fontCoverageImage } from './font.js';
 import { encodeTLG, makeBMP, canvasBytes } from './image-codecs/encode.js';
 import { number, truth } from '#krkr/values';
 import { nativeOwner } from '#krkr/native';
@@ -33,16 +33,7 @@ function makeGlyphImage(glyph, color, aa) {
   const colors = Math.trunc(number(glyphValue(glyph, 8) ?? 256));
   const stride = colors > 256 ? 4 : 1;
   if (bytes.length < width * height * stride) throw new Error('TJS failed glyph for drawGlyph: truncated bitmap');
-  const [r, g, b] = colorBytes(color);
-  const image = new Image(width, height);
-  const pixels = image.writablePixels;
-  for (let i = 0; i < width * height; i++) {
-    let alpha = bytes[i * stride];
-    if (!aa) alpha = alpha >= 128 ? 255 : 0;
-    const p = i * 4;
-    pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b; pixels[p + 3] = alpha;
-  }
-  return image;
+  return fontCoverageImage(bytes.subarray(0, width * height * stride), width, height, color, { stride, aa });
 }
 
 function normalizeGlyphOpacity(node, opa) {

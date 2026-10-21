@@ -1005,6 +1005,9 @@ namespace TJS {
             tjs_uint32 hash = *hint;
             tjs_int cnt = 0;
             tTJSSymbolData *lv1 = Symbols + (hash & HashMask);
+            if(lv1->Hash == hash && (lv1->SymFlags & TJS_SYMBOL_USING) &&
+               lv1->NameMatch(name))
+                return lv1;
             tTJSSymbolData *prevd = lv1;
             tTJSSymbolData *d = lv1->Next;
             for(; d; prevd = d, d = d->Next, cnt++) {
@@ -1021,11 +1024,6 @@ namespace TJS {
                 }
             }
 
-            if(lv1->Hash == hash && (lv1->SymFlags & TJS_SYMBOL_USING)) {
-                if(lv1->NameMatch(name)) {
-                    return lv1;
-                }
-            }
         }
 
         tjs_uint32 hash = tTJSHashFunc<tjs_char *>::Make(name);
@@ -1044,6 +1042,9 @@ namespace TJS {
         if(!(lv1->SymFlags & TJS_SYMBOL_USING) && lv1->Next == nullptr)
             return nullptr; // lv1 is unused and does not have any
                             // chains
+        if(lv1->Hash == hash && (lv1->SymFlags & TJS_SYMBOL_USING) &&
+           lv1->NameMatch(name))
+            return lv1;
 
         // search over the chain
         tjs_int cnt = 0;
@@ -1063,11 +1064,6 @@ namespace TJS {
             }
         }
 
-        if(lv1->Hash == hash && (lv1->SymFlags & TJS_SYMBOL_USING)) {
-            if(lv1->NameMatch(name)) {
-                return lv1;
-            }
-        }
 
         return nullptr;
     }

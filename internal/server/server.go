@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gal-on-web/internal/library"
@@ -20,7 +22,7 @@ import (
 // maxSaveSize bounds one uploaded save file; the engine writes small data files.
 const maxSaveSize = 256 << 20
 
-func New(root, web string, game library.Game, saves *save.Store) http.Handler {
+func New(root string, webFS fs.FS, game library.Game, saves *save.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/game", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -96,16 +98,7 @@ func New(root, web string, game library.Game, saves *save.Store) http.Handler {
 		log.Printf("save delete %s", name)
 		w.WriteHeader(http.StatusNoContent)
 	})
-	static := http.FileServer(http.Dir(web))
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Frontend files are revalidated so changed code is never served from a
-		// stale cache; the validator distinguishes every revision of a file.
-		if info, err := staticFile(web, r.URL.Path); err == nil {
-			w.Header().Set("Etag", fmt.Sprintf("\"%x-%x\"", info.ModTime().UnixNano(), info.Size()))
-		}
-		w.Header().Set("Cache-Control", "no-cache")
-		static.ServeHTTP(w, r)
-	}))
+	mux.Handle("/", staticHandler(webFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Required by the WASM engine's shared memory and worker protocol.
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
@@ -183,15 +176,81 @@ func (reader *saveReader) Seek(offset int64, whence int) (int64, error) {
 	return reader.at, nil
 }
 
-// staticFile resolves a request path to the file the static handler serves.
-func staticFile(root, name string) (os.FileInfo, error) {
-	target := filepath.Join(root, filepath.FromSlash(path.Clean("/"+name)))
-	info, err := os.Stat(target)
+// staticHandler serves the frontend and supplies a validator for each file.
+// Embedded files carry a zero modification time, so hashing their contents
+// distinguishes revisions of the same URL across binary builds.
+func staticHandler(webFS fs.FS) http.Handler {
+	cache := &etagCache{files: webFS, entries: make(map[string]etagEntry)}
+	files := http.FileServerFS(webFS)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Frontend files are revalidated so changed code is never served from a
+		// stale cache; the validator distinguishes every revision of a file.
+		if etag, ok := cache.get(r.URL.Path); ok {
+			w.Header().Set("Etag", etag)
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	})
+}
+
+type etagCache struct {
+	files   fs.FS
+	mu      sync.Mutex
+	entries map[string]etagEntry
+}
+
+type etagEntry struct {
+	size    int64
+	modTime time.Time
+	tag     string
+}
+
+func (cache *etagCache) get(urlPath string) (string, bool) {
+	name, info, err := resolveStatic(cache.files, urlPath)
 	if err != nil {
-		return nil, err
+		return "", false
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if entry, ok := cache.entries[name]; ok && entry.size == info.Size() && entry.modTime.Equal(info.ModTime()) {
+		return entry.tag, true
+	}
+	file, err := cache.files.Open(name)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	hash := fnv.New64a()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", false
+	}
+	entry := etagEntry{
+		size:    info.Size(),
+		modTime: info.ModTime(),
+		tag:     fmt.Sprintf("\"%x-%x\"", info.Size(), hash.Sum64()),
+	}
+	cache.entries[name] = entry
+	return entry.tag, true
+}
+
+// resolveStatic finds the file the static handler serves for a URL path,
+// following a directory request to its index.html.
+func resolveStatic(files fs.FS, urlPath string) (string, fs.FileInfo, error) {
+	name := strings.TrimPrefix(path.Clean("/"+urlPath), "/")
+	if name == "" {
+		name = "."
+	}
+	info, err := fs.Stat(files, name)
+	if err != nil {
+		return "", nil, err
 	}
 	if !info.IsDir() {
-		return info, nil
+		return name, info, nil
 	}
-	return os.Stat(filepath.Join(target, "index.html"))
+	index := path.Join(name, "index.html")
+	info, err = fs.Stat(files, index)
+	if err != nil {
+		return "", nil, err
+	}
+	return index, info, nil
 }

@@ -1,8 +1,118 @@
 import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner } from '#krkr/native';
 import { number, truth, Closure } from '#krkr/values';
-import { Image, colorBytes, clamp255 } from './bitmap.js';
-import { getGPU } from './gpu.js';
+import { Image, colorBytes } from './bitmap.js';
+import { getGPU, QUAD_VERTEX } from './gpu.js';
+import { blurGlyphGPU } from './gpu-glyph-blur.js';
 import { LRUCache } from 'lru-cache';
+
+export const TEXT_BLEND = `// Layer.drawText blends each glyph's coverage with the destination through the
+// draw face's function. The three faces are the reference's text blit selection
+// (bmAlphaOnAlpha / bmAlpha / bmAlphaOnAddAlpha) and are ported verbatim; the
+// draw mode encodes them as 100 + face.
+uint packText(int r, int g, int b, int a) {
+  return (uint(clamp(a, 0, 255)) << 24u) | (uint(clamp(r, 0, 255)) << 16u)
+    | (uint(clamp(g, 0, 255)) << 8u) | uint(clamp(b, 0, 255));
+}
+uint textBlend(uint d, uint s, int opacity, uint face) {
+  uint coverage = s >> 24u;
+  if (opacity < 0) {
+    uint strength = min(uint(-opacity), 255u);
+    uint remain = 65025u - coverage * strength;
+    uint alpha = (d >> 24u) * remain / 65025u;
+    return (d & 0x00ffffffu) | (alpha << 24u);
+  }
+  if (opacity == 0 || coverage == 0u) return d;
+  int alpha = (int(coverage) * opacity) >> 8;
+  int dr = int((d >> 16u) & 255u), dg = int((d >> 8u) & 255u), db = int(d & 255u);
+  int sr = int((s >> 16u) & 255u), sg = int((s >> 8u) & 255u), sb = int(s & 255u);
+  int destAlpha = int(d >> 24u);
+  if (face == 4u) {
+    // bmAlphaOnAddAlpha: additive alpha on both planes.
+    int inverse = 255 - alpha;
+    int unionAlpha = alpha + destAlpha - ((destAlpha * alpha) >> 8);
+    return packText(
+      min(255, ((dr * inverse) >> 8) + ((sr * alpha) >> 8)),
+      min(255, ((dg * inverse) >> 8) + ((sg * alpha) >> 8)),
+      min(255, ((db * inverse) >> 8) + ((sb * alpha) >> 8)),
+      unionAlpha - (unionAlpha >> 8));
+  }
+  if (face == 1u) {
+    // bmAlpha: colour is interpolated, the destination alpha is retained.
+    return packText((dr * 256 + (sr - dr) * int(alpha)) / 256,
+      (dg * 256 + (sg - dg) * int(alpha)) / 256,
+      (db * 256 + (sb - db) * int(alpha)) / 256, destAlpha);
+  }
+  // bmAlphaOnAlpha: source-over in straight RGB with the destination alpha in
+  // the colour ratio.
+  int alphaInt = int(alpha);
+  int outAlpha = 255 - ((255 - alphaInt) * (255 - destAlpha)) / 255;
+  int ratio = 255;
+  if (destAlpha != 0) {
+    uint denominator = uint((255 - alphaInt) * destAlpha + 255 * alphaInt);
+    ratio = int((65025u * uint(alphaInt)) / denominator);
+  }
+  return packText((dr * 256 + (sr - dr) * ratio) / 256,
+    (dg * 256 + (sg - dg) * ratio) / 256,
+    (db * 256 + (sb - db) * ratio) / 256, outAlpha);
+}
+
+`;
+
+const fontPrograms = new WeakMap();
+const FONT_FRAGMENT = `#version 300 es
+precision highp float;
+uniform sampler2D sourceTexture;
+uniform vec2 sourceSize;
+uniform vec3 glyphColor;
+uniform int coverageChannel;
+uniform int thresholdCoverage;
+in vec2 sourcePoint;
+out vec4 colour;
+void main() {
+  vec2 uv = sourcePoint / sourceSize;
+  vec4 value = texture(sourceTexture, uv);
+  float coverage = coverageChannel == 0 ? value.r : value.a;
+  if (thresholdCoverage != 0) coverage = coverage >= (128.0 / 255.0) ? 1.0 : 0.0;
+  colour = vec4(coverageChannel == 3 && value.a == 0.0 ? vec3(0.0) : glyphColor, coverage);
+}`;
+
+function colorizeGlyph(source, color, channel, aa) {
+  const image = new Image(source.width, source.height, { defer: true });
+  if (!source.width || !source.height) return image;
+  const gpu = getGPU();
+  if (!gpu) throw new Error('GPU font rendering requires an initialized GPU renderer');
+  let program = fontPrograms.get(gpu);
+  if (!program) {
+    program = gpu.compile(QUAD_VERTEX, FONT_FRAGMENT);
+    fontPrograms.set(gpu, program);
+    gpu.onDispose(() => { gpu.gl.deleteProgram(program); fontPrograms.delete(gpu); });
+  }
+  const input = gpu.texture(source), target = gpu.texture(image, true);
+  const clip = { left: 0, top: 0, right: image.width, bottom: image.height };
+  gpu.setup(target, input, clip, [1, 0, 0, 1, 0, 0], clip, input, program);
+  gpu.uniform('sourceSize', 'uniform2f', source.width, source.height);
+  gpu.uniform('glyphColor', 'uniform3f', ((color >>> 16) & 255) / 255, ((color >>> 8) & 255) / 255, (color & 255) / 255);
+  gpu.uniform('coverageChannel', 'uniform1i', channel);
+  gpu.uniform('thresholdCoverage', 'uniform1i', Number(!aa));
+  gpu.gl.drawArrays(gpu.gl.TRIANGLES, 0, 6);
+  gpu.stats.draws++;
+  gpu.commit(image, target);
+  gpu.releaseTexture(input);
+  return image;
+}
+
+export function fontCoverageImage(coverage, width, height, color, { stride = 1, aa = true } = {}) {
+  if (width <= 0 || height <= 0) return new Image(width, height, { defer: true });
+  const source = new Image(width, height, { gray: stride === 1, pixels: coverage });
+  return colorizeGlyph(source, color, 0, aa);
+}
+
+function fontCanvasImage(canvas, color, aa = true) {
+  if (!canvas.width || !canvas.height) return new Image(canvas.width, canvas.height, { defer: true });
+  const source = new Image(canvas.width, canvas.height, { defer: true });
+  getGPU().uploadCanvas(source, canvas);
+  return colorizeGlyph(source, color, 3, aa);
+}
 
 export class FontState {
   constructor() {
@@ -107,76 +217,6 @@ function textClipRect(node, source, left, top) {
   return rect.right <= rect.left || rect.bottom <= rect.top ? null : rect;
 }
 
-function clipErase(node, source, left, top, strength) {
-  const rect = textClipRect(node, source, left, top);
-  if (!rect) return false;
-  strength = Math.max(0, Math.min(255, Math.trunc(Math.abs(strength))));
-  const destination = node.image.writablePixels;
-  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
-    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
-    const coverage = source.pixels[si + 3];
-    destination[di + 3] = Math.max(0, Math.trunc(destination[di + 3] * (255 - coverage * strength / 255) / 255));
-  }
-  node.markImageModified(rect);
-  return true;
-}
-
-function blendTextPixel(p, di, source, si, opa, face) {
-  const coverage = Math.max(0, Math.min(255, Math.trunc(source[si + 3])));
-  const opacity = Math.max(0, Math.min(255, Math.trunc(opa)));
-  if (coverage === 0 || opa === 0) return;
-  if (opa < 0) {
-    // bmAlphaOnAlpha + negative opacity selects RemoveOpacity in the native
-    // renderer.  The source coverage is the removal mask; RGB is untouched.
-    p[di + 3] = Math.max(0, Math.trunc(p[di + 3] * (255 - coverage * opacity / 255) / 255));
-    return;
-  }
-  const alpha = Math.min(255, (coverage * opacity) >> 8);
-  if (face === 1) {
-    // bmAlpha (opaque destination): colour is interpolated, destination
-    // alpha is retained by ApplyColorMap.
-    for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * alpha / 256);
-    return;
-  }
-  if (face === 4) {
-    // bmAlphaOnAddAlpha: the destination and source RGB values are additive
-    // alpha (premultiplied) channels, as in TVPAddAlphaBlend_a_a.
-    const inverse = 255 - alpha, destAlpha = p[di + 3];
-    for (let c = 0; c < 3; c++) p[di + c] = Math.min(255, ((p[di + c] * inverse) >> 8) + ((source[si + c] * alpha) >> 8));
-    const union = alpha + destAlpha - ((destAlpha * alpha) >> 8);
-    p[di + 3] = union - (union >> 8);
-    return;
-  }
-  if (face !== 0) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
-  // bmAlphaOnAlpha: source-over in straight RGB, with destination alpha
-  // participating in the source colour ratio.
-  const destAlpha = p[di + 3];
-  const outAlpha = 255 - Math.trunc((255 - alpha) * (255 - destAlpha) / 255);
-  let ratio = 255;
-  if (destAlpha) {
-    const sourceOverDest = alpha / destAlpha;
-    ratio = Math.trunc((sourceOverDest / (1 - alpha / 255 + sourceOverDest)) * 255);
-  }
-  for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * ratio / 256);
-  p[di + 3] = outAlpha;
-}
-
-export function clipBlitCPU(node, source, left, top, { opa = 255 } = {}) {
-  const face = node.drawFace ?? 0;
-  if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
-  if (opa === 0) return false;
-  if (opa < 0) return clipErase(node, source, left, top, opa);
-  const rect = textClipRect(node, source, left, top);
-  if (!rect) return false;
-  const destination = node.image.writablePixels;
-  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
-    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
-    blendTextPixel(destination, di, source.pixels, si, opa, face);
-  }
-  node.markImageModified(rect);
-  return true;
-}
-
 export function clipBlit(node, source, left, top, { opa = 255 } = {}) {
   const face = node.drawFace ?? 0;
   if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
@@ -196,20 +236,10 @@ export function clipBlit(node, source, left, top, { opa = 255 } = {}) {
 
 function prerenderedGlyphImage(font, glyph, color, aa) {
   const coverage = retrievePrerenderedGlyph(font, glyph);
-  const image = new Image(glyph.width, glyph.height);
-  const [r, g, b] = colorBytes(color);
   // TVPToActualColor strips system-color markers and leaves RGB.  Text
   // opacity comes from the `opa` argument, so an ordinary 0xRRGGBB color is
   // fully opaque even though its high byte is zero.
-  const pixels = image.writablePixels;
-  for (let i = 0; i < coverage.length; i++) {
-    let alpha = coverage[i];
-    if (!aa) alpha = alpha >= 128 ? 255 : 0;
-    const p = i * 4;
-    pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b;
-    pixels[p + 3] = alpha;
-  }
-  return image;
+  return fontCoverageImage(coverage, glyph.width, glyph.height, color, { aa });
 }
 
 // The message layer repaints the whole visible line on every reveal step, so the
@@ -230,7 +260,7 @@ function cachedGlyph(cache, key, create) {
   const entry = cache.get(key);
   if (entry !== undefined) return entry;
   const created = create();
-  const bytes = created?.image?.pixels.byteLength;
+  const bytes = created?.image ? created.image.width * created.image.height * 4 : 0;
   if (bytes > 0 && bytes <= GLYPH_CACHE_BYTES) cache.set(key, created);
   return created;
 }
@@ -277,10 +307,7 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
   blurLevel = Math.max(0, Math.min(255, Math.trunc(blurLevel)));
   if (!radius) {
     if (blurLevel === 255) return { image: source, offsetX: 0, offsetY: 0 };
-    const image = source.clone();
-    const pixels = image.writablePixels;
-    for (let i = 3; i < pixels.length; i += 4) pixels[i] = Math.min(255, (pixels[i] * blurLevel) >> 8);
-    return { image, offsetX: 0, offsetY: 0 };
+    return blurGlyphGPU(source, blurWidth, blurLevel, []);
   }
   const hypot = (x, y) => {
     x = Math.abs(x); y = Math.abs(y);
@@ -295,49 +322,7 @@ export function blurGlyphImage(source, blurWidth, blurLevel = 255) {
   }
   const levelScale = Math.trunc((1 << 18) / total);
   const weightedKernel = kernel.map(([x, y, weight]) => [x, y, Math.trunc(weight * levelScale * blurLevel / 256)]);
-  const image = new Image(source.width + radius * 2, source.height + radius * 2);
-  const pixels = image.writablePixels;
-  let hasActive = false;
-  let minX = source.width, minY = source.height, maxX = -1, maxY = -1;
-  for (let i = 3; i < source.pixels.length; i += 4) {
-    if (!source.pixels[i]) continue;
-    const index = (i - 3) >> 2, x = index % source.width, y = Math.floor(index / source.width);
-    hasActive = true;
-    minX = Math.min(minX, x); minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
-  }
-  // Alpha is a sum of nonnegative, integer contributions with a 255 cap, so
-  // transparent source pixels can be omitted without changing the result.
-  // This avoids scanning blank parts of the glyph rectangle for every kernel
-  // position.
-  if (hasActive) {
-    for (let sy = minY; sy <= maxY; sy++) for (let sx = minX; sx <= maxX; sx++) {
-      const src = (sy * source.width + sx) * 4, sourceAlpha = source.pixels[src + 3];
-      if (!sourceAlpha) continue;
-      for (const [ox, oy, kernelLevel] of weightedKernel) {
-        const dst = ((sy + oy + radius) * image.width + sx + ox + radius) * 4 + 3;
-        const contribution = Math.trunc(sourceAlpha * kernelLevel / (1 << 18));
-        pixels[dst] = Math.min(255, pixels[dst] + contribution);
-      }
-    }
-  }
-  // RGB does not participate in the blur; the legacy loop leaves the RGB
-  // value from the last kernel sample touching each output pixel. Reproduce
-  // that value with a reverse kernel lookup, including transparent pixels.
-  for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
-    const dst = (y * image.width + x) * 4;
-    for (let i = weightedKernel.length - 1; i >= 0; i--) {
-      const [ox, oy] = weightedKernel[i];
-      const sx = x - ox - radius, sy = y - oy - radius;
-      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue;
-      const src = (sy * source.width + sx) * 4;
-      pixels[dst] = source.pixels[src];
-      pixels[dst + 1] = source.pixels[src + 1];
-      pixels[dst + 2] = source.pixels[src + 2];
-      break;
-    }
-  }
-  return { image, offsetX: -Math.trunc(blurWidth), offsetY: -Math.trunc(blurWidth) };
+  return blurGlyphGPU(source, blurWidth, blurLevel, weightedKernel);
 }
 
 function normalizeTextOpacity(node, opa) {
@@ -402,7 +387,7 @@ function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0
     return true;
   }
   const canvas = document.createElement('canvas');
-  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const context = canvas.getContext('2d');
   const size = Math.abs(node.font.height) | 0;
   const [r, g, b] = colorBytes(color);
   const flags = node.font.flags;
@@ -429,7 +414,7 @@ function drawFallback(cache, document, node, glyphs, color, opa, shadowWidth = 0
     if (flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
     context.restore();
   }
-  const source = Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height);
+  const source = fontCanvasImage(canvas, color, aa);
   const blurred = blurGlyphImage(source, shadowWidth, blurLevel);
   return clipBlit(node, blurred.image, region.left + blurred.offsetX, region.top + blurred.offsetY, { opa, holdAlpha: !!node.holdAlpha });
 }
@@ -440,7 +425,7 @@ function renderFallbackGlyph(document, node, character, color, shadowWidth, blur
   const size = Math.abs(node.font.height) | 0;
   const flags = node.font.flags;
   const canvas = document.createElement('canvas');
-  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const context = canvas.getContext('2d');
   const font = `${flags & 0x0200 ? 'bold ' : ''}${flags & 0x0100 ? 'italic ' : ''}${size}px "${String(node.font.face).replace(/"/g, '')}", sans-serif`;
   context.font = font;
   const measured = measuredTextBounds(context, character, size, flags);
@@ -469,11 +454,7 @@ function renderFallbackGlyph(document, node, character, color, shadowWidth, blur
   const metrics = context.measureText(character), line = Math.max(1, Math.ceil(size / 14));
   if (flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
   if (flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
-  const source = Image.from(context.getImageData(0, 0, width, height).data, width, height);
-  if (!aa) {
-    const pixels = source.writablePixels;
-    for (let i = 3; i < pixels.length; i += 4) pixels[i] = pixels[i] >= 128 ? 255 : 0;
-  }
+  const source = fontCanvasImage(canvas, color, aa);
   const blurred = blurGlyphImage(source, shadowWidth, blurLevel);
   return { image: blurred.image, left: originX + blurred.offsetX, top: originY + blurred.offsetY };
 }
@@ -712,17 +693,14 @@ export function createTextRenderer(document) {
   const glyphCache = new LRUCache({
     max: GLYPH_CACHE_ENTRIES,
     maxSize: GLYPH_CACHE_BYTES,
-    sizeCalculation: entry => entry.image.pixels.byteLength,
+    sizeCalculation: entry => entry.image.width * entry.image.height * 4,
   });
   const drawText = function drawText(node, x, y, text, color, opa, aa = true, shadowLevel = 0, shadowColor = 0, shadowWidth = 0, shadowOfsx = 0, shadowOfsy = 0) {
     opa = normalizeTextOpacity(node, opa);
     if (opa === 0) return;
-    const gpu = getGPU();
-    gpu?.beginTextBatch(node.image);
-    try {
     if (drawPrerenderedText(glyphCache, document, node, x, y, text, color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowOfsx, shadowOfsy)) return;
     const canvas = textCanvas ??= document.createElement('canvas');
-    const context = canvas.getContext('2d', { willReadFrequently: true });
+    const context = canvas.getContext('2d');
     const font = node.font, size = Math.abs(font.height) | 0;
     const fontSpec = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
     context.font = fontSpec;
@@ -752,11 +730,7 @@ export function createTextRenderer(document) {
         if (font.flags & 0x0800) context.fillRect(0, size * 0.52, metrics.width, line);
         if (font.flags & 0x0400) context.fillRect(0, size * 0.86, metrics.width, line);
         context.restore();
-        const image = Image.from(context.getImageData(0, 0, region.width, region.height).data, region.width, region.height);
-        if (threshold) {
-          const pixels = image.writablePixels;
-          for (let i = 3; i < pixels.length; i += 4) pixels[i] = pixels[i] >= 128 ? 255 : 0;
-        }
+        const image = fontCanvasImage(canvas, drawColor, threshold ? false : aa);
         const blurred = blurGlyphImage(image, blurWidth, blurLevel);
         return { image: blurred.image, left: region.left + blurred.offsetX - x - dx, top: region.top + blurred.offsetY - y - dy };
       });
@@ -772,9 +746,6 @@ export function createTextRenderer(document) {
     if (angle === 0 && !(font.flags & (0x0400 | 0x0800))) {
       drawFallback(glyphCache, document, node, glyphs, color, opa, 0, 0, 0, angle, 255, !!aa);
     } else drawRun(0, 0, color, 0, 255, !aa);
-    } finally {
-      gpu?.endTextBatch(node.image);
-    }
   };
   drawText.finalize = () => glyphCache.clear();
   return drawText;

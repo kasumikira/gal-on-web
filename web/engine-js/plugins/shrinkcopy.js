@@ -1,5 +1,6 @@
 import { callScript, nativeOwner } from '#krkr/native';
 import { number, integer } from '#krkr/values';
+import { captureImageTexture, releaseImageTexture, shrinkArea } from './gpu-resample.js';
 
 // shrinkCopy.cpp: Layer.shrinkCopy(dx, dy, dw, dh, src, sx, sy, sw, sh) and
 // Layer.shrinkCopyFast(src, stepx, stepy). Both run on the destination layer
@@ -20,17 +21,6 @@ const sourceInfo = (Layer, value) => {
   try { state = Layer.state(value); } catch { return null; }
   const node = state.node, image = node?.image;
   return image ? { node, image } : null;
-};
-
-// Coverage of source pixel i by the interval [r1, r2) inside [0, size).
-const axisWeights = (r1, r2, size) => {
-  const result = [];
-  const first = Math.max(0, Math.floor(r1)), last = Math.min(size - 1, Math.ceil(r2) - 1);
-  for (let i = first; i <= last; i++) {
-    const weight = Math.min(r2, i + 1) - Math.max(r1, i);
-    if (weight > 0) result.push([i, weight]);
-  }
-  return result;
 };
 
 export function registerShrinkCopy({ get }) {
@@ -66,42 +56,12 @@ export function registerShrinkCopy({ get }) {
     const dey = dty + dth > dih ? dih - dty : dth;
     const ratioX = ssw / ddw, ratioY = ssh / ddh;
     const diffX = ddx - dtx, diffY = ddy - dty;
-    // makeAvgTable (shrinkCopy.cpp 221): source interval per destination column
-    // and row. Coordinates stay relative to the clipped source origin.
-    const columns = [];
-    for (let x = dsx; x < dex; x++) {
-      const r1 = (x - diffX) * ratioX;
-      columns.push(axisWeights(r1, r1 + ratioX, ssw));
-    }
-    const rows = [];
-    for (let y = dsy; y < dey; y++) {
-      const r1 = (y - diffY) * ratioY;
-      rows.push(axisWeights(r1, r1 + ratioY, ssh));
-    }
-    const pixels = srcImage.pixels, target = dstImage.writablePixels;
-    const srcPitch = siw * 4, dstPitch = diw * 4, area = ratioX * ratioY;
-    for (let y = 0; y < rows.length; y++) {
-      const row = rows[y], dy = (dty + dsy + y) * dstPitch;
-      for (let x = 0; x < columns.length; x++) {
-        const column = columns[x];
-        let alpha = 0, red = 0, green = 0, blue = 0;
-        for (const [sy, wy] of row) {
-          const line = (ssy + sy) * srcPitch;
-          for (const [sx, wx] of column) {
-            const weight = wx * wy, index = line + (ssx + sx) * 4;
-            red += weight * pixels[index];
-            green += weight * pixels[index + 1];
-            blue += weight * pixels[index + 2];
-            alpha += weight * pixels[index + 3];
-          }
-        }
-        const index = dy + (dtx + dsx + x) * 4;
-        target[index] = Math.min(255, Math.trunc(red / area));
-        target[index + 1] = Math.min(255, Math.trunc(green / area));
-        target[index + 2] = Math.min(255, Math.trunc(blue / area));
-        target[index + 3] = Math.min(255, Math.trunc(alpha / area));
-      }
-    }
+    shrinkArea(srcImage, dstImage, {
+      clip: { left: dtx + dsx, top: dty + dsy, right: dtx + dex, bottom: dty + dey },
+      sourceOrigin: [ssx, ssy], sourceExtent: [ssw, ssh],
+      destinationOrigin: [dtx, dty], outputOrigin: [dtx + dsx, dty + dsy],
+      outputSize: [dex - dsx, dey - dsy], ratio: [ratioX, ratioY], destinationOffset: [diffX, diffY],
+    });
     destination.node.imageModified = true;
   });
 
@@ -115,42 +75,20 @@ export function registerShrinkCopy({ get }) {
     const srcImage = source.image, siw = srcImage.width, sih = srcImage.height;
     // Read the source before resizing: the reference captures the source pointer
     // in check() and only then calls setImageSize on the destination.
-    const pixels = srcImage.pixels;
     // LimitedShrink::resize: ceil(size / step) through the layer's own method.
     const width = Math.ceil(siw / stepX), height = Math.ceil(sih / stepY);
-    await callScript(nativeOwner(this), 'setImageSize', [width, height]);
-    const dstImage = this.node.image;
-    const target = dstImage.writablePixels;
-    const srcPitch = siw * 4, dstPitch = dstImage.width * 4;
-    const xGroups = Math.trunc(siw / stepX), xRemainder = siw - xGroups * stepX;
-    const yGroups = Math.trunc(sih / stepY), yRemainder = sih - yGroups * stepY;
-    // ShrinkLine (shrinkCopy.cpp 419): RGB is averaged, alpha is forced opaque.
-    const block = (srcX, srcY, columns, rows, outX, outY) => {
-      let red = 0, green = 0, blue = 0;
-      for (let y = 0; y < rows; y++) {
-        const line = (srcY + y) * srcPitch;
-        for (let x = 0; x < columns; x++) {
-          const index = line + (srcX + x) * 4;
-          red += pixels[index];
-          green += pixels[index + 1];
-          blue += pixels[index + 2];
-        }
-      }
-      const count = columns * rows, index = outY * dstPitch + outX * 4;
-      target[index] = count > 0 ? Math.min(255, Math.trunc(red / count)) : 0;
-      target[index + 1] = count > 0 ? Math.min(255, Math.trunc(green / count)) : 0;
-      target[index + 2] = count > 0 ? Math.min(255, Math.trunc(blue / count)) : 0;
-      target[index + 3] = 255;
-    };
-    for (let group = 0; group < yGroups; group++) {
-      const srcY = group * stepY;
-      for (let column = 0; column < xGroups; column++) block(column * stepX, srcY, stepX, stepY, column, group);
-      if (xRemainder) block(xGroups * stepX, srcY, xRemainder, stepY, xGroups, group);
-    }
-    if (yRemainder) {
-      const srcY = yGroups * stepY;
-      for (let column = 0; column < xGroups; column++) block(column * stepX, srcY, stepX, yRemainder, column, yGroups);
-      if (xRemainder) block(xGroups * stepX, srcY, xRemainder, yRemainder, xGroups, yGroups);
+    const sourceEntry = srcImage === destination.image ? captureImageTexture(srcImage) : null;
+    try {
+      await callScript(nativeOwner(this), 'setImageSize', [width, height]);
+      const dstImage = this.node.image;
+      shrinkArea(srcImage, dstImage, {
+        sourceEntry,
+        clip: { left: 0, top: 0, right: width, bottom: height },
+        sourceOrigin: [0, 0], sourceExtent: [siw, sih], destinationOrigin: [0, 0],
+        outputOrigin: [0, 0], outputSize: [width, height], ratio: [stepX, stepY], fast: true,
+      });
+    } finally {
+      if (sourceEntry) releaseImageTexture(sourceEntry);
     }
     this.node.imageModified = true;
   });

@@ -34,6 +34,7 @@ export function createLayerTransitions(document, {
     } else {
       gpu.fill(result, { left: 0, top: 0, right: width, bottom: height }, [0, 0, 0, 0]);
     }
+    const commands = [];
     const paint = (current, offsetX, offsetY, parentOpacity, parentClip) => {
       const left = Math.max(parentClip.left, offsetX + current.left);
       const top = Math.max(parentClip.top, offsetY + current.top);
@@ -43,14 +44,14 @@ export function createLayerTransitions(document, {
       const opacity = current === node ? 255 : parentOpacity * current.opacity / 255;
       const img = current.image;
       if (img && img.width && img.height) {
-        gpu.draw(result, img, {
+        commands.push({ source: img, options: {
           matrix: [1, 0, 0, 1, offsetX + current.left + current.imageLeft, offsetY + current.top + current.imageTop],
           clip: { left, top, right, bottom },
           mode: 0,
           motion: true,
           opacity,
           opaque: current.type === ltOpaque,
-        });
+        } });
       }
       for (const child of current.children) {
         if (!child.visible) continue;
@@ -58,6 +59,7 @@ export function createLayerTransitions(document, {
       }
     };
     paint(node, -node.left, -node.top, 255, { left: 0, top: 0, right: width, bottom: height });
+    gpu.compositeOffscreen(result, commands);
     return result;
   }
 
@@ -153,7 +155,7 @@ export function createLayerTransitions(document, {
     node.transition = {
       name: handlerName, handler, withchildren: children, effect, callback, selfupdate,
       src: srcNode, srcOwner, start: callback === undefined ? performance.now() : 0, time,
-      src1, src2, src1Revision, src2Revision, phase: 0, frame: src1.clone(), revision: 0,
+      src1, src2, src1Revision, src2Revision, phase: 0, frame: src1.copyReference(), revision: 0,
     };
     const reportTransition = error => { if (onTransitionError) onTransitionError(error); else console.error(error); };
     const step = () => {

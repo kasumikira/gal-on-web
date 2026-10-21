@@ -9,7 +9,16 @@ import { config } from './global.js';
 import { nativeClass, nativeMembers, nativeProperty, unimplemented, reportUnimplemented, nativeOwner, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { number, truth } from '#krkr/values';
 import { Image } from './bitmap.js';
+import { getGPU } from './gpu.js';
 import { Input, ALL_FORMATS, BufferSource, VideoSampleSink, AudioSampleSink } from './media-core.js';
+
+// Upload a canvas-backed decoded frame directly into an Image's resident
+// texture. DOM-source uploads preserve the canvas's straight-alpha RGBA data.
+export function uploadVideoCanvas(image, canvas) {
+  const gpu = getGPU();
+  if (!gpu) throw new Error('Video frame upload requires the GPU renderer');
+  gpu.uploadCanvas(image, canvas);
+}
 
 // tTVPPeriodEventReason (VideoOvlIntf.h).
 export const perLoop = 0, perPeriod = 1, perPrepare = 2, perSegLoop = 3;
@@ -248,21 +257,20 @@ class Player {
   }
 }
 
-// VideoSample -> engine Image (RGBA). Rotation metadata is applied by
-// sample.draw; the scratch canvas matches the current video size.
+// VideoSample -> scratch canvas. Rotation metadata is applied by sample.draw;
+// the canvas matches the current video size and uploads directly to the GPU.
 let scratchCanvas = null, scratchContext = null, scratchKey = '';
-function sampleToImage(sample) {
+function sampleToCanvas(sample) {
   const width = sample.displayWidth, height = sample.displayHeight;
   const key = width + 'x' + height;
   if (scratchKey !== key) {
     scratchCanvas = new OffscreenCanvas(width, height);
-    scratchContext = scratchCanvas.getContext('2d', { willReadFrequently: true });
+    scratchContext = scratchCanvas.getContext('2d');
     scratchKey = key;
   }
   scratchContext.clearRect(0, 0, width, height);
   sample.draw(scratchContext, 0, 0, width, height);
-  const data = scratchContext.getImageData(0, 0, width, height);
-  return Image.from(data.data, width, height);
+  return scratchCanvas;
 }
 
 // tTJSNI_VideoOverlay state machine, geometry and TJS surface.
@@ -287,19 +295,20 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
   // EC_UPDATE branch: size both layers to the video, replace the main
   // image, then fire onFrameUpdate / period events.
   const pushFrame = (s, sample, frame) => {
-    const image = sampleToImage(sample);
+    const canvas = sampleToCanvas(sample);
+    let frameImage;
     for (const slot of [1, 2]) {
       const owner = s['layer' + slot];
       if (!owner) continue;
       const node = Layer.peekNode(owner);
       if (!node) continue;
-      if (node.image.width !== image.width || node.image.height !== image.height) {
-        node.image = image.clone();
-        node.width = image.width;
-        node.height = image.height;
-      } else {
-        node.image.writablePixels.set(image.pixels);
+      if (node.image.width !== canvas.width || node.image.height !== canvas.height) {
+        node.image = new Image(canvas.width, canvas.height, { defer: true });
+        node.width = canvas.width;
+        node.height = canvas.height;
       }
+      if (!frameImage) { uploadVideoCanvas(node.image, canvas); frameImage = node.image; }
+      else if (node.image !== frameImage) getGPU().copy(node.image, frameImage);
       node.imageModified = true;
       if (s.onLayerChange) s.onLayerChange();
     }

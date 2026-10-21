@@ -4,18 +4,19 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"gal-on-web/internal/library"
 	"gal-on-web/internal/save"
 	"gal-on-web/internal/server"
+	webui "gal-on-web/web"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	root := flag.String("game", "", "game directory containing data.xp3")
-	web := flag.String("web", "web/build", "frontend build directory")
-	engine := flag.String("engine", "krkr-js", "browser engine adapter")
+	webDir := flag.String("web", "", "serve the frontend from this directory instead of the embedded build")
 	entry := flag.String("entry", "data.xp3", "game entry relative to game directory")
 	savePath := flag.String("save", "tests/savedata.sqlite", "SQLite file holding emulated save data")
 	flag.Parse()
@@ -30,9 +31,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	game, err := library.Scan(abs, *engine, *entry)
+	game, err := library.Scan(abs, *entry)
 	if err != nil {
 		log.Fatal(err)
+	}
+	webFS := webui.Build()
+	webSource := "embedded web/build"
+	if *webDir != "" {
+		webFS = os.DirFS(*webDir)
+		webSource = *webDir
 	}
 	saves, err := save.Open(*savePath)
 	if err != nil {
@@ -46,6 +53,6 @@ func main() {
 	if err := saves.SetMeta("game.entry", game.Entry); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("%s: %d files; saves in %s; open http://%s", game.Title, len(game.Files), saves.Path(), *addr)
-	log.Fatal(http.ListenAndServe(*addr, server.New(abs, *web, game, saves)))
+	log.Printf("%s: %d files; frontend %s; saves in %s; open http://%s", game.Title, len(game.Files), webSource, saves.Path(), *addr)
+	log.Fatal(http.ListenAndServe(*addr, server.New(abs, webFS, game, saves)))
 }

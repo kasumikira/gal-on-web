@@ -7,11 +7,13 @@
   },
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:go\" \"pnpm dev:vite\"",
-    "dev:go": "go run ./cmd/galweb -engine krkr-js",
+    "dev:go": "go run ./cmd/galweb",
+    "build:go": "pnpm build:js && go build -ldflags=\"-s -w\" -o galweb.exe ./cmd/galweb",
     "dev:vite": "vite --host 127.0.0.1 --port 5173",
     "build:js": "vite build",
     "engine:inventory": "node tools/engine-inventory.mjs",
-    "build:vm": "node native/kirikiri/build.mjs"
+    "build:vm": "node native/kirikiri/build.mjs",
+    "build:image-codecs": "node native/image-codecs/build.mjs"
   },
   "dependencies": {
     "chardet": "2.1.0",

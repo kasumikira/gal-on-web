@@ -1,6 +1,6 @@
 # Gal on Web
 
-浏览器中的 Kirikiri 运行时。原版 TJS2、KAGParser 和 Scripts 在同一个 WASM 模块中执行，渲染、音频及其余业务 Native 接口由 JavaScript 实现。Go 提供游戏清单和文件区间读取。
+浏览器中的 Kirikiri 运行时。原版 TJS2、KAGParser 和 Scripts 在同一个 WASM 模块中执行，渲染、音频及其余业务 Native 接口由 JavaScript 实现。Go 提供游戏清单、文件区间读取和内嵌前端页面。
 
 ## 启动
 
@@ -17,7 +17,7 @@ pnpm dev
 go run ./cmd/galweb -game "D:/games/游戏目录" -addr 127.0.0.1:8080
 ~~~
 
-浏览器需支持 WebAssembly JSPI。开发服务器通过 /api 代理访问 Go 服务。运行时资源按 HTTP Range 读取，不预先解包整个 XP3。
+Go 服务在编译时内嵌前端，直接运行 `go run` 或 `galweb.exe` 前需先执行一次 `pnpm build:js`；`pnpm dev` 会自动先构建前端。浏览器需支持 WebAssembly JSPI。开发服务器通过 /api 代理访问 Go 服务。运行时资源按 HTTP Range 读取，不预先解包整个 XP3。
 
 存档默认写入 `tests/savedata.sqlite`（可用 `-save` 指定）：每个存档文件一行，内容存为 BLOB，便于把整个存档目录当单个文件复制复现问题。`?save=memory` 可切回刷新即丢弃的内存存档。
 
@@ -28,9 +28,10 @@ native/kirikiri 是唯一 C++ 项目，按原版 core 与 plugins 布局组织�
 ~~~powershell
 pnpm build:vm
 pnpm build:js
+go build -o galweb.exe ./cmd/galweb
 ~~~
 
-WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web/build`。Go 服务默认托管该目录，打开 8080 根页面即可进入游戏。可通过 `-web` 指定其它前端构建目录。
+WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web/build`。Go 构建通过 `//go:embed` 把 `web/build` 编进二进制，因此必须先完成前端构建；生成的 `galweb.exe` 不再依赖外部前端文件。打开 8080 根页面即可进入游戏。开发时仍可通过 `-web` 指定其它前端构建目录覆盖内嵌内容。
 
 ## 页面配置
 

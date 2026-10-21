@@ -283,28 +283,43 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
   }
   // PlayerUpdateLayerEval.cpp findSourceForNode_guess via ResourceManager.
   function resolveSource(node) {
-    const slot = node.active;
+    const descriptor = sourceDescriptor(node, node.active);
+    if (!descriptor) { node.source = null; return; }
+    node.source = descriptor.blank
+      ? { blank: true, width: descriptor.width, height: descriptor.height, originX: descriptor.originX, originY: descriptor.originY, pixels: null }
+      : decodeSource(descriptor.node);
+  }
+  function sourceDescriptor(node, slot) {
     const src = slot.srcValue;
-    if (!src || src === 'blank') { node.source = null; return; }
+    if (!src || src === 'blank') return null;
     const manager = node.manager;
-    if (!manager) { node.source = null; return; }
+    if (!manager) return null;
     const path = src.startsWith('src/') ? src : `src/${src}`;
     const descriptor = manager.findSource(node.motionContext, path);
-    if (!descriptor) { node.source = null; return; }
-    if (descriptor.blank) { node.source = { blank: true, width: descriptor.width, height: descriptor.height, originX: descriptor.originX, originY: descriptor.originY, pixels: null }; return; }
-    const decoded = decodeSource(descriptor.node);
-    if (!decoded) { node.source = null; return; }
+    if (!descriptor || descriptor.blank) return descriptor;
     // The `icon` member, when present, selects a different icon within the group.
-    let image = decoded;
     if (slot.iconValue) {
       const group = path.split('/')[1];
       const iconDescriptor = manager.findSource(node.motionContext, `src/${group}/${slot.iconValue}`);
       if (iconDescriptor && !iconDescriptor.blank) {
-        const iconImage = decodeSource(iconDescriptor.node);
-        if (iconImage) image = iconImage;
+        return iconDescriptor;
       }
     }
-    node.source = image;
+    return descriptor;
+  }
+  function* motionSources(nodes) {
+    const seen = new Set();
+    for (const node of nodes) {
+      for (let index = 0; index < node.frameList.length; index++) {
+        const slot = emptySlot();
+        parseFrame(slot, node.frameList, index);
+        mergeContent(slot, node.nodeType, node.frameList);
+        const descriptor = sourceDescriptor(node, slot);
+        if (!descriptor || descriptor.blank || seen.has(descriptor.node.offset)) continue;
+        seen.add(descriptor.node.offset);
+        yield decodeSource(descriptor.node);
+      }
+    }
   }
 
   @nativeClass('Player')
@@ -375,7 +390,8 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     // PlayerDrawDispatch.cpp draw: route into the target Layer.
     draw(target) {
       const state = this;
-      renderToTarget(state, target);
+      if (!state.sourcePreparation) return renderToTarget(state, target);
+      return drawAfterPreparation(state, target);
     },
     setDrawAffineTranslateMatrix(m11, m21, m12, m22, m14, m24) {
       const state = this;
@@ -410,7 +426,7 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
         transformOrder: [...defaultTransformOrderGlobal], coordinate: 0,
         drawAffine: { m11: 1, m12: 0, m21: 0, m22: 1, m14: 0, m24: 0, nonIdentity: false },
         rootDelta: { x: 0, y: 0, flipX: false, flipY: false, angle: 0, zoomX: 1, zoomY: 1, slantX: 0, slantY: 0, opacity: 255, visible: true },
-        pendingActions: [], syncRequested: false, report,
+        pendingActions: [], syncRequested: false, report, sourcePreparation: null,
       };
     }
   }
@@ -435,6 +451,20 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     state.motionName = motionName;
     state.motionContext = moduleKey;
     buildTree(state, motionNode, key);
+    const gpu = getGPU();
+    if (!gpu) throw new Error('Motion requires an initialized GPU renderer');
+    // Capture this motion's nodes: another load may replace state.nodes while
+    // preparation yields. Start on the next task so loadMotion can return first.
+    const nodes = state.nodes;
+    const preparation = new Promise(resolve => setTimeout(resolve, 0))
+      .then(() => gpu.prepareTextures(motionSources(nodes)));
+    state.sourcePreparation = preparation;
+    preparation.then(() => {
+      if (state.sourcePreparation === preparation) state.sourcePreparation = null;
+    }, () => {
+      // Observe background rejection until draw awaits the original promise;
+      // keep that rejected promise so the resource consumer receives the error.
+    });
     state.frameTickCount = 0;
     state.allplaying = true;
     state.playing = true;
@@ -602,11 +632,20 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
 
   // prepareRenderItems/executeLayerRenderCommands: walk the tree back-to-front
   // and blend each node's quad into the target layer image. The composite stays
-  // in a straight-RGBA GPU texture. Ordinary and special blend modes share the
-  // same shader path; intermediate frames are never read back to JavaScript.
+  // in a straight-RGBA GPU texture. Normal runs use a private premultiplied
+  // buffer; special modes preserve their ordered destination-reading path.
   // prepareLayerForRender (PlayerRenderInternal.cpp 716) sizes the target from
   // the layer's own width/height and clips to the whole area before the items
   // are blended on top.
+  async function drawAfterPreparation(state, target) {
+    const held = retainScriptValue(target);
+    try {
+      await state.sourcePreparation;
+      renderToTarget(state, held);
+    } finally {
+      await disposeScriptValue(held);
+    }
+  }
   function renderToTarget(state, targetValue) {
     const targetOwner = targetValue instanceof Closure ? targetValue.object : targetValue;
     const node = getLayerNode ? getLayerNode(targetOwner) : null;
@@ -621,23 +660,25 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     const gpu = getGPU();
     if (!gpu) throw new Error('Motion requires an initialized GPU renderer');
     // Preserve the back-to-front child walk and its invisible-subtree pruning.
+    const commands = [];
     const drawChildren = parent => {
       for (const item of parent.children) {
         if (!item.accumulated.visible) continue;
         const source = item.source;
         if (source && source.width && !source.blank) {
           const { matrix, posX, posY } = itemTransform(item, state.drawAffine);
-          gpu.draw(node.image, source, {
+          commands.push({ source, options: {
             matrix: [matrix[0], matrix[1], matrix[2], matrix[3], posX, posY],
             mode: item.active.blendMode & 0x0f,
             opacity: item.accumulated.opacity,
             motion: true,
-          });
+          } });
         }
         drawChildren(item);
       }
     };
     drawChildren(state.nodes[0]);
+    gpu.compositeOffscreen(node.image, commands);
     node.imageModified = true;
   }
   function itemTransform(item, transform) {

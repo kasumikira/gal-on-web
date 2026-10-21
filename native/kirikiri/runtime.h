@@ -8,6 +8,7 @@
 #include <string>
 #include <exception>
 using namespace TJS;
+class HostInstance;
 struct Runtime : iTJSConsoleOutput
 {
     tTJS *engine = new tTJS();
@@ -29,6 +30,7 @@ struct Runtime : iTJSConsoleOutput
     };
     std::map<iTJSDispatch2 *, Owner> owners;
     std::map<int, iTJSDispatch2 *> ownerReferences;
+    std::map<int, std::map<int, HostInstance *>> nativeInstances;
     struct Export
     {
         iTJSDispatch2 *object, *context;

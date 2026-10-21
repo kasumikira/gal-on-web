@@ -39,10 +39,11 @@ export async function loadGraphicAsync(storage, key = 0x1fffffff, options = {}) 
   const decoder = decoderWorker(), id = nextId++;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    // Storage may return a view into an archive/cache. Copy only this file's
-    // range, then transfer it; cloning the view could copy its entire archive.
+    // Only an explicitly owned, complete buffer can be detached. Borrowed
+    // data and archive views keep their backing storage intact.
     try {
-      const input = bytes.slice();
+      const input = storage.transferOwnership && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes : bytes.slice();
       decoder.postMessage({ id, bytes: input, name: storage.name, key, options }, [input.buffer]);
     }
     catch (error) { pending.delete(id); reject(error); }

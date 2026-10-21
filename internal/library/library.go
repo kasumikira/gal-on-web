@@ -14,15 +14,14 @@ type File struct {
 }
 
 type Game struct {
-	ID     string `json:"id"`
-	Title  string `json:"title"`
-	Engine string `json:"engine"`
-	Entry  string `json:"entry"`
-	Files  []File `json:"files"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Entry string `json:"entry"`
+	Files []File `json:"files"`
 }
 
-func Scan(root, engine, entry string) (Game, error) {
-	game := Game{ID: "default", Title: filepath.Base(root), Engine: engine, Entry: "/" + filepath.ToSlash(entry)}
+func Scan(root, entry string) (Game, error) {
+	game := Game{ID: "default", Title: filepath.Base(root), Entry: "/" + filepath.ToSlash(entry)}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err

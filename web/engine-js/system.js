@@ -8,7 +8,7 @@ import { queryKeyState } from './key-state.js';
 const FRAME_INTERVAL_60_MS = 1000 / 60;
 const FRAME_TIME_EPSILON_MS = 1e-6;
 
-export function createSystem({ vm, enqueueEvent, storage }) {
+export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
   let title = 'kirikiriz';
   const { document, inform, arguments: args, continuousFrameRate, onTitleChange } = config;
   const view = document.defaultView;
@@ -18,7 +18,7 @@ export function createSystem({ vm, enqueueEvent, storage }) {
     return { get: () => current, set: value => { current = convert(value); } };
   };
   const eventDisabled = mutable(0, Number);
-  const graphicCacheLimit = mutable(0, Number);
+  const graphicCacheLimit = mutable(graphicCache ? graphicCache.limit : 0, Number);
   const exitOnWindowClose = mutable(1, Number);
   const drawThreadNum = mutable(1, Number);
   const exitOnNoWindowStartup = mutable(1, Number);
@@ -164,7 +164,11 @@ export function createSystem({ vm, enqueueEvent, storage }) {
     get eventDisabled() { return eventDisabled.get(); },
     set eventDisabled(value) { eventDisabled.set(value); },
     get graphicCacheLimit() { return graphicCacheLimit.get(); },
-    set graphicCacheLimit(value) { graphicCacheLimit.set(value); },
+    set graphicCacheLimit(value) {
+      // SystemIntf.cpp 358-368: bytes, 0 disables the cache and -1 restores
+      // the platform maximum.
+      graphicCacheLimit.set(graphicCache ? graphicCache.setLimit(value) : Number(value));
+    },
     get exitOnWindowClose() { return exitOnWindowClose.get(); },
     set exitOnWindowClose(value) { exitOnWindowClose.set(value); },
     get drawThreadNum() { return drawThreadNum.get(); },
@@ -227,7 +231,7 @@ export function createSystem({ vm, enqueueEvent, storage }) {
       return queryKeyState(Math.trunc(Number(values[0])), values.length < 2 ? true : !!values[1]);
     },
     toActualColor(value) { return Math.trunc(Number(value)); },
-    clearGraphicCache() {},
+    clearGraphicCache() { graphicCache?.clear(); },
     touchImages() { return {}; },
     doCompact() {},
     dumpHeap() {},

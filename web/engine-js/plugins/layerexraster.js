@@ -1,5 +1,6 @@
 import { callScript, nativeOwner } from '#krkr/native';
 import { number, integer } from '#krkr/values';
+import { rasterCopy } from './gpu-resample.js';
 
 // layerExRaster.cpp: Layer.copyRaster(src, maxh, lines, cycle, time) copies the
 // source layer row by row into this layer, shifting each row horizontally by
@@ -35,16 +36,14 @@ export function registerLayerExRaster({ get }) {
     const omega = 2 * Math.PI / lineCount;
     // The wave is centred on the source height and starts at the clip top.
     let rad = -omega * now / period * Math.trunc(srcImage.height / 2) + omega * clipTop;
-    const pixels = srcImage.pixels, target = dstImage.writablePixels;
-    const srcPitch = srcImage.width * 4, dstPitch = dstImage.width * 4;
+    const shifts = [];
     for (let row = 0; row < clipHeight; row++, rad += omega) {
-      const shift = Math.trunc(Math.sin(rad) * amplitude);
-      const width = shift >= 0 ? clipWidth - shift : clipWidth + shift;
-      if (width <= 0) continue;
-      const from = (clipTop + row) * srcPitch + (clipLeft + (shift >= 0 ? 0 : -shift)) * 4;
-      const to = (clipTop + row) * dstPitch + (clipLeft + (shift >= 0 ? shift : 0)) * 4;
-      target.set(pixels.subarray(from, from + width * 4), to);
+      shifts.push(Math.trunc(Math.sin(rad) * amplitude));
     }
+    if (clipWidth <= 0 || clipHeight <= 0) return;
+    rasterCopy(srcImage, dstImage, shifts, {
+      left: clipLeft, top: clipTop, right: clipLeft + clipWidth, bottom: clipTop + clipHeight,
+    });
     node.imageModified = true;
     // layerExBase::redraw(): update(clipLeft, clipTop, clipWidth, clipHeight).
     await callScript(nativeOwner(this), 'update', [clipLeft, clipTop, clipWidth, clipHeight]);

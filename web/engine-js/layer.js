@@ -182,13 +182,16 @@ export function createLayerClass(document, {
     if (height + node.imageTop < node.height) node.imageTop = node.height - height;
   };
   // LayerIntf.cpp AssignImages assigns each source plane into the destination
-  // plane (tTVPBaseTexture::Assign); a plane that has no destination yet is
-  // copied. Main and province planes never cross formats.
+  // plane. tTVPNativeBaseBitmap::Assign only references the source texture
+  // (unconditionally, including a different size); a plane that has no
+  // destination yet is constructed as a new wrapper around the same texture
+  // (tTVPNativeBaseBitmap copy constructor).
   const assignPlane = (target, source) => {
     if (!source) return null;
-    if (target && target.gray === source.gray) return target.assign(source);
-    return source.clone();
+    return target ? target.assign(source) : source.copyReference();
   };
+  const samePlane = (target, source) => !!target && !!source &&
+    (target === source || target._storage === source._storage);
   const drawingRect = (node, x, y, w, h) => {
     const clip = node.clip ?? {
       left: 0,
@@ -224,26 +227,37 @@ export function createLayerClass(document, {
     if (!node.province) return;
     if (!value && rect.left === 0 && rect.top === 0 && rect.right === node.province.width && rect.bottom === node.province.height) node.province = null;else node.province.fill(rect, value);
   };
-  // LayerIntf.cpp InternalSetImageSize/ChangeImageSize: retain existing pixels,
-  // fill newly exposed pixels, and shrink the display rectangle only as needed.
+  // LayerIntf.cpp ChangeImageSize: resize both existing planes with
+  // SetSizeWithFill, reset the clip rectangle, and mark the layer modified.
+  // The caller schedules the layer update after adjusting its geometry.
+  const changeImageSize = (node, width, height) => {
+    if (width <= 0 || height <= 0) throw new Error('TJS cannot create empty layer image');
+    if (node.image) node.image.resize(width, height, node.neutralColor);
+    if (node.province) node.province.resize(width, height, 0);
+    if (node.image) node.clip = null;
+    node.imageModified = true;
+  };
+  // LayerIntf.cpp InternalSetImageSize: shrink the display rectangle first,
+  // adjust the image offset, then resize the image planes to the new size.
+  const internalSetImageSize = (node, width, height) => {
+    if (width < node.width) {
+      node.imageLeft = 0;
+      resizeLayer(node, width, node.height);
+    }
+    if (width + node.imageLeft < node.width) node.imageLeft = node.width - width;
+    if (height < node.height) {
+      node.imageTop = 0;
+      resizeLayer(node, node.width, height);
+    }
+    if (height + node.imageTop < node.height) node.imageTop = node.height - height;
+    changeImageSize(node, width, height);
+  };
+  // LayerIntf.cpp SetImageSize: identical dimensions are a no-op before
+  // InternalSetImageSize runs.
   const resizeImage = (node, width, height) => {
     if (!node.image) throw new Error('TJS layer has no image');
     if (width === node.image.width && height === node.image.height) return;
-    if (width <= 0 || height <= 0) throw new Error('TJS cannot create empty layer image');
-    if (width < node.width) {
-      node.width = width;
-      node.imageLeft = 0;
-    }
-    if (height < node.height) {
-      node.height = height;
-      node.imageTop = 0;
-    }
-    if (width + node.imageLeft < node.width) node.imageLeft = node.width - width;
-    if (height + node.imageTop < node.height) node.imageTop = node.height - height;
-    node.image = node.image.resize(width, height, node.neutralColor);
-    if (node.province) node.province = node.province.resized(width, height);
-    node.clip = null;
-    node.imageModified = true;
+    internalSetImageSize(node, width, height);
     updateTree(node);
   };
   const dispatchAction = async (owner, type, fields = {}) => {
@@ -366,13 +380,14 @@ export function createLayerClass(document, {
       resizeImage(node, Math.trunc(number(w)), Math.trunc(number(h)));
     }
     @nativeMethod
-    independMainImage() {}
-    @nativeMethod
-    independProvinceImage() {
+    independMainImage(copy = true) {
       const node = this.node;
-      node.province ??= new Image(node.image.width, node.image.height, {
-        gray: true
-      });
+      if (node.image) node.image.detach(arguments.length ? truth(copy) : true);
+    }
+    @nativeMethod
+    independProvinceImage(copy = true) {
+      const node = this.node;
+      if (node.province) node.province.detach(arguments.length ? truth(copy) : true);
     }
     @nativeMethod
     setClip(x, y, w, h) {
@@ -708,8 +723,9 @@ export function createLayerClass(document, {
     setMaskPixel(x, y, value) {
       if (arguments.length < 3) throw new Error('TJS Layer.setMaskPixel requires 3 arguments');
       const node = this.node;
-      const base = node.image.index(Math.trunc(number(x)), Math.trunc(number(y))) * 4;
-      node.image.writablePixels[base + 3] = clamp255(Math.trunc(number(value)));
+      const px = Math.trunc(number(x)), py = Math.trunc(number(y));
+      node.image.fill({ left: px, top: py, right: px + 1, bottom: py + 1 },
+        clamp255(Math.trunc(number(value))) << 24, true);
       node.imageModified = true;
       updateTree(node);
     }
@@ -726,7 +742,7 @@ export function createLayerClass(document, {
       node.province ??= new Image(node.image.width, node.image.height, {
         gray: true
       });
-      node.province.writablePixels[node.province.index(Math.trunc(number(x)), Math.trunc(number(y)))] = Math.trunc(number(value)) & 0xff;
+      node.province.setPoint(Math.trunc(number(x)), Math.trunc(number(y)), Math.trunc(number(value)) & 0xff);
       node.imageModified = true;
       updateTree(node);
     }
@@ -736,15 +752,29 @@ export function createLayerClass(document, {
         srcOwner = nativeOwner(src);
       const srcNode = Layer.state(srcOwner) ? instanceOf(srcOwner) : null;
       if (!srcNode) throw new Error('TJS specify layer');
-      // LayerIntf.cpp AssignImages assigns *into* the destination planes
-      // (tTVPBaseTexture::Assign), so the destination image and its surface
-      // survive. A per-frame assign therefore copies instead of allocating.
-      node.image = assignPlane(node.image, srcNode.image);
-      node.province = assignPlane(node.province, srcNode.province);
-      if (node.image) adjustImageRect(node);
-      node.clip = null;
+      // LayerIntf.cpp AssignImages: assign the main plane first, then the
+      // province plane. InternalSetImageSize and Update run only when the main
+      // plane actually changed.
+      let mainChanged = true;
+      if (srcNode.image) {
+        mainChanged = !samePlane(node.image, srcNode.image);
+        node.image = assignPlane(node.image, srcNode.image);
+      } else {
+        // DeallocateImage also discards the province plane.
+        node.image = null;
+        node.province = null;
+      }
+      if (srcNode.province) {
+        node.province = assignPlane(node.province, srcNode.province);
+      } else {
+        node.province = null;
+      }
+      if (mainChanged && node.image) {
+        internalSetImageSize(node, node.image.width, node.image.height);
+      }
       node.imageModified = true;
-      updateTree(node);
+      if (node.image) node.clip = null;
+      if (mainChanged) updateTree(node);
     }
     @nativeProperty
     get parent() {
@@ -1125,7 +1155,8 @@ export function createLayerClass(document, {
     @nativeProperty
     get mainImageBuffer() {
       const node = this.node;
-      return new Uint8Array(node.image.pixels.buffer, node.image.pixels.byteOffset, node.image.pixels.byteLength);
+      const pixels = node.image.pixels;
+      return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     }
     @nativeProperty
     get mainImageBufferForWrite() {
@@ -1156,6 +1187,7 @@ export function createLayerClass(document, {
       });
       node.imageModified = true;
       const pixels = node.province.writablePixels;
+      node.province.externallyWritable = true;
       return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     }
     @nativeProperty
