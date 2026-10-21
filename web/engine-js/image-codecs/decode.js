@@ -61,72 +61,15 @@ function toImage(decoded, { gray = false } = {}) {
 }
 
 // LoadPNG.cpp glmPalettized needs palette indices, which browser decoders
-// discard. PNG's packed scanlines use the same unfiltering for both palette
-// indices and grayscale samples; DecompressionStream handles the zlib data.
+// discard. The Rust png decoder preserves packed samples; this layer keeps the
+// engine-specific province and image-buffer conventions.
 async function decodeIndexedPNG(bytes, key, province) {
   const width = be32(bytes, 16) >>> 0, height = be32(bytes, 20) >>> 0;
-  const depth = bytes[24], type = bytes[25], interlaced = bytes[28];
+  const depth = bytes[24], type = bytes[25];
   if ((type !== 3 && type !== 0) || depth > 8) return null;
-  let palette, transparency;
-  const chunks = [];
-  for (let offset = 8; offset < bytes.length;) {
-    const size = be32(bytes, offset) >>> 0, name = utf8.decode(bytes.subarray(offset + 4, offset + 8));
-    const data = bytes.subarray(offset + 8, offset + 8 + size);
-    if (name === 'PLTE') palette = data;
-    else if (name === 'tRNS') transparency = data;
-    else if (name === 'IDAT') chunks.push(data);
-    offset += size + 12;
-  }
-  const raw = new Uint8Array(await new Response(new Blob(chunks).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer());
-  const image = new Image(width, height, { gray: province });
-  const pixels = image.writablePixels;
-  const passes = interlaced ? [[0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4], [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2]] : [[0, 0, 1, 1]];
-  let input = 0;
-  const mask = (1 << depth) - 1;
-  for (const [x0, y0, xStep, yStep] of passes) {
-    const w = Math.max(0, Math.ceil((width - x0) / xStep)), h = Math.max(0, Math.ceil((height - y0) / yStep));
-    if (!w || !h) continue;
-    const length = Math.ceil(w * depth / 8);
-    let previous = new Uint8Array(length);
-    for (let y = 0; y < h; y++) {
-      if (input + length + 1 > raw.length) throw new Error('TJS truncated PNG scanline');
-      const filter = raw[input++], row = raw.slice(input, input + length); input += length;
-      for (let i = 0; i < length; i++) {
-        const left = i ? row[i - 1] : 0, up = previous[i], upperLeft = i ? previous[i - 1] : 0;
-        switch (filter) {
-          case 0: break;
-          case 1: row[i] += left; break;
-          case 2: row[i] += up; break;
-          case 3: row[i] += (left + up) >> 1; break;
-          case 4: {
-            const p = left + up - upperLeft, a = Math.abs(p - left), b = Math.abs(p - up), c = Math.abs(p - upperLeft);
-            row[i] += a <= b && a <= c ? left : b <= c ? up : upperLeft;
-            break;
-          }
-          default: throw new Error('TJS invalid PNG row filter');
-        }
-      }
-      for (let x = 0; x < w; x++) {
-        const index = row[x * depth >> 3] >> (8 - depth - (x * depth & 7)) & mask;
-        const px = x0 + x * xStep, py = y0 + y * yStep;
-        if (province) { pixels[py * width + px] = type === 3 ? index : Math.trunc(index * 255 / mask); continue; }
-        const base = index * 3;
-        let r, g, b, a;
-        if (type === 3) {
-          if (!palette || base + 2 >= palette.length) throw new Error('TJS invalid PNG palette index');
-          r = palette[base]; g = palette[base + 1]; b = palette[base + 2];
-          a = (key >>> 24) === 3 && index === (key & 255) ? 0 : transparency?.[index] ?? 255;
-        } else {
-          r = g = b = Math.trunc(index * 255 / mask);
-          a = transparency && index === (transparency[0] << 8 | transparency[1]) ? 0 : 255;
-        }
-        const dest = (py * width + px) * 4;
-        pixels[dest] = r; pixels[dest + 1] = g; pixels[dest + 2] = b; pixels[dest + 3] = a;
-      }
-      previous = row;
-    }
-  }
-  return image;
+  await initializeImageCodec();
+  const pixels = imageCodec.decodeIndexedPng(bytes, width, height, province, key);
+  return pixels ? new Image(width, height, { gray: province, pixels }) : null;
 }
 
 // ---- BMP (GraphicsLoaderIntf.cpp TVPLoadBMP/TVPInternalLoadBMP) ----

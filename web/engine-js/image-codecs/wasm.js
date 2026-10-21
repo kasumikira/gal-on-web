@@ -43,7 +43,28 @@ function bgraToRgbaInto(sourceBytes, outputBytes, simd) {
 }
 
 export const imageCodec = Object.freeze({
-  decodeTlg(bytes, simd = true) {
+  decodeIndexedPng(bytes, width, height, province, key) {
+    const wasm = api();
+    const channels = province ? 1 : 4;
+    const outputLength = width * height * channels;
+    if (!Number.isSafeInteger(outputLength) || outputLength > 0xffff_ffff) {
+      throw new RangeError('Rust PNG decoder: image is too large');
+    }
+    const source = alloc(bytes.length), output = alloc(outputLength);
+    try {
+      put(source, bytes);
+      const status = wasm.image_codecs_decode_png_indexed(
+        source, bytes.length, output, outputLength, Number(province), key >>> 0,
+      );
+      if (status === 2) return null;
+      if (status) throw new Error(`Rust PNG decoder failed (${status})`);
+      return new Uint8ClampedArray(memory.buffer, output, outputLength).slice();
+    } finally {
+      free(output, outputLength);
+      free(source, bytes.length);
+    }
+  },
+  decodeTlg(bytes) {
     const wasm = api();
     const source = alloc(bytes.length);
     let output = 0, outputLength = 0;
@@ -54,7 +75,7 @@ export const imageCodec = Object.freeze({
       if (!width || !height) throw new Error('Rust TLG decoder: invalid header');
       outputLength = width * height * 4;
       output = alloc(outputLength);
-      const status = wasm.image_codecs_decode_tlg(source, bytes.length, output, outputLength, Number(simd));
+      const status = wasm.image_codecs_decode_tlg(source, bytes.length, output, outputLength);
       if (status) throw new Error(`Rust TLG decoder failed (${status})`);
       // Copy once into JS-owned pixels before freeing the temporary WASM allocation.
       const pixels = new Uint8ClampedArray(memory.buffer, output, outputLength).slice();

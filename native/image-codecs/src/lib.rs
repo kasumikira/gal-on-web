@@ -1,5 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 
+use std::io::Cursor;
+
 const GOLOMB_COMPRESSED: [[usize; 9]; 4] = [
     [3, 7, 15, 27, 63, 108, 223, 448, 130],
     [3, 5, 13, 24, 51, 95, 192, 384, 257],
@@ -104,53 +106,6 @@ fn lzss(
     Ok(r)
 }
 
-fn tlg5_compose(
-    upper: &[u8],
-    residual: &[&[u8]],
-    width: usize,
-    colors: usize,
-    out: &mut [u8],
-    simd: bool,
-) {
-    if simd {
-        unsafe {
-            tlg5_compose_simd(upper, residual, width, colors, out);
-            return;
-        }
-    }
-    let (mut b, mut g, mut r, mut a) = (0u8, 0u8, 0u8, 0u8);
-    for x in 0..width {
-        let (db, dg, dr, da) = if colors == 3 {
-            (
-                residual[2][x].wrapping_add(residual[1][x]),
-                residual[1][x],
-                residual[0][x].wrapping_add(residual[1][x]),
-                0,
-            )
-        } else {
-            (
-                residual[2][x].wrapping_add(residual[1][x]),
-                residual[1][x],
-                residual[0][x].wrapping_add(residual[1][x]),
-                residual[3][x],
-            )
-        };
-        let p = x * 4;
-        b = b.wrapping_add(db);
-        g = g.wrapping_add(dg);
-        r = r.wrapping_add(dr);
-        out[p] = b.wrapping_add(upper[p]);
-        out[p + 1] = g.wrapping_add(upper[p + 1]);
-        out[p + 2] = r.wrapping_add(upper[p + 2]);
-        if colors == 3 {
-            out[p + 3] = 255;
-        } else {
-            a = a.wrapping_add(da);
-            out[p + 3] = a.wrapping_add(upper[p + 3]);
-        }
-    }
-}
-
 #[target_feature(enable = "simd128")]
 unsafe fn tlg5_compose_simd(
     upper: &[u8],
@@ -224,7 +179,7 @@ unsafe fn tlg5_compose_simd(
     }
 }
 
-fn decode_tlg5(data: &[u8], pixels: &mut [u8], simd: bool) -> Result<(u32, u32), DecodeError> {
+fn decode_tlg5(data: &[u8], pixels: &mut [u8]) -> Result<(u32, u32), DecodeError> {
     let mut p = 11;
     let colors = *data.get(p).ok_or(DecodeError::Invalid)? as usize;
     p += 1;
@@ -293,7 +248,7 @@ fn decode_tlg5(data: &[u8], pixels: &mut [u8], simd: bool) -> Result<(u32, u32),
             };
             let line = y - yblk;
             let residual: [&[u8]; 4] = core::array::from_fn(|c| &bufs[c][line * w..line * w + w]);
-            tlg5_compose(upper, &residual, w, colors, row, simd);
+            unsafe { tlg5_compose_simd(upper, &residual, w, colors, row) };
         }
     }
     Ok((width, height))
@@ -518,7 +473,6 @@ fn decode_line(
     oddskip: usize,
     dir: usize,
     local_row: usize,
-    simd: bool,
 ) {
     let (mut p, mut up) = ([initial, 0, 0, 0], [initial, 0, 0, 0]);
     let blocks = (width + 7) / 8;
@@ -542,11 +496,7 @@ fn decode_line(
             let a = pixelbuf.get(off + 3).copied().unwrap_or(0);
             let v = residual(method, b, g, r, a);
             let u = [upper[px + 3], upper[px], upper[px + 1], upper[px + 2]];
-            let next = if simd {
-                simd_predict(p, u, up, v, post)
-            } else {
-                scalar_predict(p, u, up, v, post)
-            };
+            let next = simd_predict(p, u, up, v, post);
             p = next;
             up = u;
             row[px] = p[1];
@@ -558,34 +508,12 @@ fn decode_line(
     }
 }
 #[inline]
-fn scalar_predict(p: [u8; 4], u: [u8; 4], up: [u8; 4], v: [u8; 4], avg: bool) -> [u8; 4] {
-    core::array::from_fn(|i| {
-        let pred = if avg {
-            // TLG6_AVG_PACKED rounds up.
-            ((p[i] as u16 + u[i] as u16 + 1) >> 1) as u8
-        } else {
-            let min = p[i].min(u[i]);
-            let max = p[i].max(u[i]);
-            if up[i] < min {
-                max
-            } else if up[i] > max {
-                min
-            } else {
-                (p[i] as u16 + u[i] as u16 - up[i] as u16) as u8
-            }
-        };
-        // packed_bytes_add wraps each byte; the carry must not reach the next
-        // channel.
-        pred.wrapping_add(v[i])
-    })
-}
-#[inline]
 fn simd_predict(p: [u8; 4], u: [u8; 4], up: [u8; 4], v: [u8; 4], avg: bool) -> [u8; 4] {
     unsafe {
         predict_simd(p, u, up, v, avg)
     }
 }
-fn decode_tlg6(data: &[u8], pixels: &mut [u8], simd: bool) -> Result<(u32, u32), DecodeError> {
+fn decode_tlg6(data: &[u8], pixels: &mut [u8]) -> Result<(u32, u32), DecodeError> {
     let mut p = 11usize;
     let colors = *data.get(p).ok_or(DecodeError::Invalid)? as usize;
     if colors != 1 && colors != 3 && colors != 4 {
@@ -686,30 +614,122 @@ fn decode_tlg6(data: &[u8], pixels: &mut [u8], simd: bool) -> Result<(u32, u32),
                 odd,
                 dir,
                 yy - y,
-                simd,
             );
         }
     }
     Ok((width, height))
 }
-pub fn decode_tlg_into(
-    data: &[u8],
-    pixels: &mut [u8],
-    simd: bool,
-) -> Result<(u32, u32), DecodeError> {
+pub fn decode_tlg_into(data: &[u8], pixels: &mut [u8]) -> Result<(u32, u32), DecodeError> {
     if data.starts_with(b"TLG5.0") {
-        decode_tlg5(data, pixels, simd)
+        decode_tlg5(data, pixels)
     } else if data.starts_with(b"TLG6.0") {
-        decode_tlg6(data, pixels, simd)
+        decode_tlg6(data, pixels)
     } else {
         Err(DecodeError::Invalid)
     }
 }
-pub fn decode_tlg(data: &[u8], simd: bool) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+pub fn decode_tlg(data: &[u8]) -> Result<(u32, u32, Vec<u8>), DecodeError> {
     let (width, height) = dimensions(data)?;
     let mut pixels = vec![0u8; checked_len(width, height, 4)?];
-    decode_tlg_into(data, &mut pixels, simd)?;
+    decode_tlg_into(data, &mut pixels)?;
     Ok((width, height, pixels))
+}
+
+fn decode_png_indexed(data: &[u8], output: &mut [u8], province: bool, key: u32) -> Result<(), i32> {
+    let mut decoder = png::Decoder::new(Cursor::new(data));
+    decoder.set_transformations(png::Transformations::IDENTITY);
+    decoder.set_ignore_iccp_chunk(true);
+    decoder.set_ignore_text_chunk(true);
+    let mut reader = decoder.read_info().map_err(|_| 1)?;
+    let (width, height, color_type, bit_depth, is_animated, palette, transparency) = {
+        let info = reader.info();
+        (
+            info.width,
+            info.height,
+            info.color_type,
+            info.bit_depth,
+            info.animation_control.is_some(),
+            info.palette.as_deref().map(<[u8]>::to_vec),
+            info.trns.as_deref().map(<[u8]>::to_vec),
+        )
+    };
+    if is_animated {
+        return Err(2);
+    }
+    if !matches!(
+        color_type,
+        png::ColorType::Indexed | png::ColorType::Grayscale
+    ) || bit_depth as usize > 8
+    {
+        return Err(2);
+    }
+    let channels = if province { 1 } else { 4 };
+    let output_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|length| length.checked_mul(channels))
+        .ok_or(1)?;
+    if output.len() != output_len {
+        return Err(3);
+    }
+
+    let mut raw = vec![0; reader.output_buffer_size().ok_or(1)?];
+    let frame = reader.next_frame(&mut raw).map_err(|_| 1)?;
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let bits = bit_depth as usize;
+    let mask = (1usize << bits) - 1;
+    if color_type == png::ColorType::Indexed && palette.is_none() {
+        return Err(1);
+    }
+    for y in 0..height {
+        let row = y.checked_mul(frame.line_size).ok_or(1)?;
+        for x in 0..width {
+            let bit = x.checked_mul(bits).ok_or(1)?;
+            let byte = *raw.get(row + bit / 8).ok_or(1)? as usize;
+            let sample = (byte >> (8 - bits - bit % 8)) & mask;
+            if province {
+                output[y * width + x] = if color_type == png::ColorType::Indexed {
+                    sample as u8
+                } else {
+                    (sample * 255 / mask) as u8
+                };
+                continue;
+            }
+
+            let destination = (y * width + x) * 4;
+            if color_type == png::ColorType::Indexed {
+                let base = sample * 3;
+                let palette = palette.as_deref().ok_or(1)?;
+                let rgb = palette.get(base..base + 3).ok_or(1)?;
+                let alpha = if key >> 24 == 3 && sample == (key as usize & 0xff) {
+                    0
+                } else {
+                    transparency
+                        .as_deref()
+                        .and_then(|values| values.get(sample))
+                        .copied()
+                        .unwrap_or(255)
+                };
+                output[destination..destination + 4]
+                    .copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+            } else {
+                let gray = (sample * 255 / mask) as u8;
+                // png normalizes low-bit grayscale tRNS samples to one byte.
+                let transparent_sample = transparency
+                    .as_deref()
+                    .and_then(|values| values.first())
+                    .copied()
+                    .map(usize::from);
+                let alpha = if transparent_sample == Some(sample) {
+                    0
+                } else {
+                    255
+                };
+                output[destination..destination + 4].copy_from_slice(&[gray, gray, gray, alpha]);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_rl8(src: &[u8], out: &mut [u8], simd: bool) -> usize {
@@ -938,15 +958,29 @@ pub unsafe extern "C" fn image_codecs_dimensions(ptr: *const u8, len: usize) -> 
     }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn image_codecs_decode_png_indexed(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_len: usize,
+    province: u32,
+    key: u32,
+) -> i32 {
+    let data = core::slice::from_raw_parts(ptr, len);
+    let output = core::slice::from_raw_parts_mut(out, out_len);
+    decode_png_indexed(data, output, province != 0, key)
+        .err()
+        .unwrap_or(0)
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn image_codecs_decode_tlg(
     ptr: *const u8,
     len: usize,
     out: *mut u8,
     out_len: usize,
-    simd: u32,
 ) -> i32 {
     let data = core::slice::from_raw_parts(ptr, len);
-    match decode_tlg_into(data, core::slice::from_raw_parts_mut(out, out_len), simd != 0) {
+    match decode_tlg_into(data, core::slice::from_raw_parts_mut(out, out_len)) {
         Ok(_) => 0,
         Err(DecodeError::Output) => 2,
         Err(DecodeError::Invalid) => 1,
