@@ -16,7 +16,6 @@
     "build:image-codecs": "node native/image-codecs/build.mjs"
   },
   "dependencies": {
-    "chardet": "2.1.0",
     "fft.js": "4.0.4",
     "gl-matrix": "3.4.4",
     "libarchive.js": "2.0.2",

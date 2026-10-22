@@ -1,5 +1,3 @@
-import { detect } from 'chardet';
-
 // TextStream.cpp's BOM, cipher and narrow-text converter paths.
 const decode = (bytes, encoding) => new TextDecoder(encoding, { fatal: true }).decode(bytes);
 export const normalizeTextEncoding = encoding => new TextDecoder(encoding).encoding;
@@ -84,12 +82,19 @@ export class TextStreamDecoder {
     if (bytes[0] === 239 && bytes[1] === 187 && bytes[2] === 191) return decode(bytes.subarray(3), 'utf-8');
     const end = bytes.indexOf(0);
     const narrow = end < 0 ? bytes : bytes.subarray(0, end);
-    const detected = this.encoding ?? detect(narrow);
-    let encoding;
-    try { encoding = detected && normalizeTextEncoding(detected); }
-    catch (error) {
-      if (!(error instanceof RangeError)) throw error;
+    if (this.encoding) return decode(narrow, this.encoding);
+    // TextStream.cpp: try SJIS first; a successful UTF-8 or GBK conversion
+    // selects that converter for subsequent narrow-text reads.
+    for (const encoding of ['shift_jis', 'utf-8', 'gbk']) {
+      let text;
+      try { text = decode(narrow, encoding); }
+      catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        continue;
+      }
+      if (encoding !== 'shift_jis') this.encoding = encoding;
+      return text;
     }
-    return decode(narrow, encoding || 'shift_jis');
+    throw new Error('TJS narrow-text conversion failed');
   }
 }
