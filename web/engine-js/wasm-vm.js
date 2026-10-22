@@ -1,4 +1,11 @@
-import { TextStreamDecoder, streamOffset, encodeTextStream } from "./text-stream.js";
+import {
+  TextStreamDecoder,
+  streamOffset,
+  hasStreamOffset,
+  encodeTextStream,
+  encodeCipheredTextStream,
+  encodeCompressedTextStream,
+} from "./text-stream.js";
 import { TJSRuntime } from "./tjs-runtime/runtime.js";
 import { Closure, SHADOW, TJSValueType, unwrap, setPrimitiveRuntime, clearPrimitiveRuntime } from "#krkr/values";
 import {
@@ -611,9 +618,31 @@ export class TJSInterop {
         case 9: return storage.getPlacedPath(name);
         case 10: return storage.write(name, value);
         case 11: {
+          const compressionMarker = mode.indexOf('z');
+          const compressionDigit = compressionMarker < 0
+            ? undefined
+            : /^\d/.exec(mode.slice(compressionMarker + 1))?.[0];
+          const compressionLevel = compressionDigit === undefined ? undefined : Number(compressionDigit);
+          if (compressionMarker >= 0 && compressionLevel !== undefined)
+            console.log(`TJS text stream: using generic browser compression; control of level z${compressionLevel} is not implemented`);
+
+          let cipherMode = -1;
+          if (compressionMarker < 0) {
+            const cipherMarker = mode.indexOf('c');
+            cipherMode = cipherMarker < 0
+              ? -1
+              : Number(/^\d/.exec(mode.slice(cipherMarker + 1))?.[0] ?? 1);
+            if (cipherMode !== -1 && cipherMode !== 1 && cipherMode !== 2)
+              throw new Error(`Unsupported TJS text cipher mode ${cipherMode}`);
+          }
+          const compressed = compressionMarker >= 0 || cipherMode === 2;
           const offset = streamOffset(mode);
-          const content = encodeTextStream(value);
-          if (!offset) return storage.write(name, content);
+          const hasOffset = hasStreamOffset(mode);
+          // CompressionStream does not expose a compression-level option.
+          const content = compressed
+            ? await encodeCompressedTextStream(value)
+            : cipherMode === 1 ? encodeCipheredTextStream(value) : encodeTextStream(value);
+          if (!hasOffset) return storage.write(name, content);
           const previous = await storage.read(name);
           const bytes = new Uint8Array(Math.max(previous.length, offset + content.length));
           bytes.set(previous);

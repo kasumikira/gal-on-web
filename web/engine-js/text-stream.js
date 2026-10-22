@@ -5,16 +5,49 @@ const decode = (bytes, encoding) => new TextDecoder(encoding, { fatal: true }).d
 export const normalizeTextEncoding = encoding => new TextDecoder(encoding).encoding;
 
 export function streamOffset(mode = '') {
-  if (!mode) return 0;
-  if (!/^o\d+$/.test(mode)) throw new Error(`Unsupported TJS stream mode: ${mode}`);
-  return Number(mode.slice(1));
+  const offset = /o(\d+)/.exec(mode);
+  return offset ? Number(offset[1]) : 0;
+}
+
+export function hasStreamOffset(mode = '') {
+  return mode.includes('o');
 }
 
 export function encodeTextStream(text) {
+  text = text[0] === '\0' ? '' : text.replaceAll('\0', ' ');
   const bytes = new Uint8Array(2 + text.length * 2);
   const view = new DataView(bytes.buffer);
   view.setUint16(0, 0xfeff, true);
   for (let i = 0; i < text.length; i++) view.setUint16(2 + i * 2, text.charCodeAt(i), true);
+  return bytes;
+}
+
+export function encodeCipheredTextStream(text) {
+  const bytes = encodeTextStream(text);
+  const ciphered = new Uint8Array(3 + bytes.length);
+  ciphered.set([0xfe, 0xfe, 1]);
+  ciphered.set(bytes, 3);
+  const view = new DataView(ciphered.buffer);
+  for (let i = 5; i < ciphered.length; i += 2) {
+    const value = view.getUint16(i, true);
+    view.setUint16(i, ((value & 0xaaaa) >>> 1) | ((value & 0x5555) << 1), true);
+  }
+  return ciphered;
+}
+
+// TextStream.cpp z mode: signature, UTF-16LE BOM, compressed/raw byte lengths,
+// then zlib-compressed UTF-16LE code units (the BOM stays outside the payload).
+export async function encodeCompressedTextStream(text) {
+  const raw = encodeTextStream(text).subarray(2);
+  const compressed = new Uint8Array(await new Response(
+    new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate')),
+  ).arrayBuffer());
+  const bytes = new Uint8Array(21 + compressed.length);
+  bytes.set([0xfe, 0xfe, 2, 0xff, 0xfe]);
+  const header = new DataView(bytes.buffer);
+  header.setBigUint64(5, BigInt(compressed.length), true);
+  header.setBigUint64(13, BigInt(raw.length), true);
+  bytes.set(compressed, 21);
   return bytes;
 }
 

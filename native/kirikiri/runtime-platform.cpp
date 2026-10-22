@@ -3,6 +3,7 @@
 #include "MemoryOutput.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <emscripten/emscripten.h>
 
@@ -148,6 +149,107 @@ static tTJSBinaryStream *readBinary(const ttstr &name, const ttstr &mode)
     return new MemoryInput(std::vector<unsigned char>(bytes->GetData(), bytes->GetData() + bytes->GetLength()));
 }
 
+static bool binaryWriteOffset(const ttstr &mode, tjs_uint64 &offset)
+{
+    const tjs_char *position = TJS_strchr(mode.c_str(), TJS_W('o'));
+    if (!position)
+        return false;
+    position++;
+    tjs_char digits[256];
+    int count = 0;
+    while (count < 255 && position[count] >= TJS_W('0') && position[count] <= TJS_W('9'))
+    {
+        digits[count] = position[count];
+        count++;
+    }
+    digits[count] = 0;
+    offset = ttstr(digits).AsInteger();
+    return true;
+}
+
+class BinaryWriteStream final : public tTJSBinaryStream
+{
+    Runtime *runtime;
+    ttstr name;
+    MemoryOutput output;
+
+    void commit()
+    {
+        if (!runtime || !runtime->storage)
+            throw eTJSError(TJS_W("TJS binary storage is not attached"));
+        tTJSVariant filename(name), content(output.bytes.data(), output.bytes.size());
+        tTJSVariant *args[] = {&filename, &content};
+        invoke(runtime, runtime->storage, 10, nullptr, nullptr, 2, args);
+    }
+
+public:
+    BinaryWriteStream(Runtime *runtime, const ttstr &name, const ttstr &mode)
+        : runtime(runtime), name(name)
+    {
+        tjs_uint64 offset;
+        if (!binaryWriteOffset(mode, offset))
+            return;
+
+        std::unique_ptr<tTJSBinaryStream> input(readBinary(name, ttstr()));
+        const auto size = input->GetSize();
+        if (size > output.bytes.max_size())
+            throw eTJSError(TJS_W("TJS binary storage is too large"));
+        output.bytes.resize(static_cast<size_t>(size));
+        size_t read = 0;
+        while (read < output.bytes.size())
+        {
+            const auto length = static_cast<tjs_uint>(std::min<size_t>(
+                output.bytes.size() - read, std::numeric_limits<tjs_uint>::max()));
+            const auto count = input->Read(output.bytes.data() + read, length);
+            if (!count)
+                throw eTJSError(TJS_W("TJS binary storage read was truncated"));
+            read += count;
+        }
+        if (offset > output.bytes.max_size())
+            throw eTJSError(TJS_W("TJS binary storage seek outside output"));
+        output.Seek(static_cast<tjs_int64>(offset), TJS_BS_SEEK_SET);
+    }
+
+    ~BinaryWriteStream() override
+    {
+        try
+        {
+            commit();
+        }
+        catch (...)
+        {
+            // The base stream destructor is noexcept, so close-time storage
+            // errors cannot be propagated through the original saveStruct API.
+        }
+    }
+
+    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override
+    {
+        return output.Seek(offset, whence);
+    }
+
+    tjs_uint Read(void *buffer, tjs_uint length) override
+    {
+        return output.Read(buffer, length);
+    }
+
+    tjs_uint Write(const void *buffer, tjs_uint length) override
+    {
+        return output.Write(buffer, length);
+    }
+
+    void SetEndOfStorage() override
+    {
+        output.SetEndOfStorage();
+    }
+
+    tjs_uint64 GetSize() override
+    {
+        return output.GetSize();
+    }
+
+};
+
 tTJS *TVPGetScriptEngine()
 {
     return activeRuntime->engine;
@@ -237,8 +339,12 @@ void initializeStorageCallbacks()
         return new TextWriteStream(activeRuntime, name, mode);
     };
     TJSCreateBinaryStreamForRead = readBinary;
-    TJSCreateBinaryStreamForWrite = [](const ttstr &, const ttstr &) -> tTJSBinaryStream *
-    { throw eTJSError(TJS_W("TJS binary storage writing is not implemented")); };
+    TJSCreateBinaryStreamForWrite = [](const ttstr &name, const ttstr &mode) -> tTJSBinaryStream *
+    {
+        if (!activeRuntime || !activeRuntime->storage)
+            throw eTJSError(TJS_W("TJS binary storage is not attached"));
+        return new BinaryWriteStream(activeRuntime, name, mode);
+    };
 }
 void compactRuntime()
 {
