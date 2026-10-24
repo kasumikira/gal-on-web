@@ -44,6 +44,8 @@ extern "C"
         tTJSVariant scriptsValue(scripts, nullptr);
         scripts->Release();
         runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, TJS_W("Scripts"), nullptr, &scriptsValue, nullptr);
+        TVPRegisterCSVParser();
+        TVPRegisterSaveStruct();
         return runtime;
     }
     EMSCRIPTEN_KEEPALIVE int tjs_kag_parsers(Runtime *r)

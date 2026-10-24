@@ -1,7 +1,7 @@
 // ObjSource equivalent: decode one PSB icon entry into an engine Image, lazily.
 // SourceCache.cpp ensureTexture_guess (RL / palette / raw 32bpp paths).
 import { Image } from '../bitmap.js';
-import { imageCodec } from './wasm.js';
+import { codecs } from './wasm.js';
 const decodedSources = new WeakMap();
 export function decodeSource(iconNode) {
   if (!iconNode) return null;
@@ -27,7 +27,7 @@ export function decodeSource(iconNode) {
   // 1 byte/pixel when RL-compressed with a palette, else 4 bytes/pixel.
   let source8 = null, source32 = null;
   if (compressed) {
-    if (hasPalette) source8 = imageCodec.decodeRl8(pixelData, pixelCount);
+    if (hasPalette) source8 = codecs.decodeRl8(pixelData, pixelCount);
   } else if (hasPalette) source8 = pixelData;
   else source32 = pixelData;
   const rgba = new Uint8ClampedArray(pixelCount * 4);
@@ -41,9 +41,9 @@ export function decodeSource(iconNode) {
     // Decode directly into RGBA: no intermediate full-size BGRA allocation
     // or second pass over the decompressed image. The only output copy is
     // from temporary WASM memory into the JS-owned image buffer.
-    imageCodec.decodeRl32Into(pixelData, rgba);
+    codecs.decodeRl32Into(pixelData, rgba);
   } else {
-    imageCodec.bgraToRgbaInto(source32.subarray(0, pixelCount * 4), rgba);
+    codecs.bgraToRgbaInto(source32.subarray(0, pixelCount * 4), rgba);
   }
   // Cache the renderable image itself: timeline seeks must not wrap the same
   // decoded pixels in a new GPU texture owner on every source resolution.

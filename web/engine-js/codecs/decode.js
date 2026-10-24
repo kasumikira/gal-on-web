@@ -1,6 +1,6 @@
 // PNG/JPEG/WEBP/BMP and TLG5/TLG6 decoding; format routing by magic bytes.
 import { Image } from '../bitmap.js';
-import { imageCodec, initializeImageCodec } from './wasm.js';
+import { codecs, initializeCodecs } from './wasm.js';
 
 function grayscaleImage(image) {
   if (image.gray) return image;
@@ -67,8 +67,8 @@ async function decodeIndexedPNG(bytes, key, province) {
   const width = be32(bytes, 16) >>> 0, height = be32(bytes, 20) >>> 0;
   const depth = bytes[24], type = bytes[25];
   if ((type !== 3 && type !== 0) || depth > 8) return null;
-  await initializeImageCodec();
-  const pixels = imageCodec.decodeIndexedPng(bytes, width, height, province, key);
+  await initializeCodecs();
+  const pixels = codecs.decodeIndexedPng(bytes, width, height, province, key);
   return pixels ? new Image(width, height, { gray: province, pixels }) : null;
 }
 
@@ -153,8 +153,8 @@ export async function loadGraphic(storage, key = 0x1fffffff, { gray = false, pro
   else if (head[0] === 0x42 && head[1] === 0x4d) image = decodeBMP(bytes, key, province);
   else if (head[0] === 0x52 && head[1] === 0x49 && utf8.decode(head.subarray(8, 12)) === 'WEBP') image = toImage(await decodeWithBrowser(bytes), { gray });
   else if (utf8.decode(head.subarray(0, 6)) === 'TLG5.0' || utf8.decode(head.subarray(0, 6)) === 'TLG6.0') {
-    await initializeImageCodec();
-    const decoded = imageCodec.decodeTlg(bytes);
+    await initializeCodecs();
+    const decoded = codecs.decodeTlg(bytes);
     image = new Image(decoded.width, decoded.height, { pixels: decoded.pixels });
   }
   else if (utf8.decode(head.subarray(0, 6)) === 'TLG0.0') {

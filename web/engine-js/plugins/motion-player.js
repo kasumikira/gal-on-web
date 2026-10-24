@@ -1,7 +1,7 @@
 import { NativeProperty, nativeClass, nativeMethod, nativeMembers, retainScriptValue, disposeScriptValue, unimplemented, reportUnimplemented } from '#krkr/native';
 import { Closure, truth, number, integer } from '#krkr/values';
 import { MotionResourceManager } from './motion-resource.js';
-import { decodeSource } from '../image-codecs/psb.js';
+import { decodeSource } from '../codecs/psb.js';
 import { Image } from '../bitmap.js';
 import { getGPU } from '../gpu.js';
 import { mat2 } from 'gl-matrix';

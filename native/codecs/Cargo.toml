@@ -1,5 +1,5 @@
 [package]
-name = "gal-image-codecs"
+name = "gal-codecs"
 version = "0.1.0"
 edition = "2021"
 

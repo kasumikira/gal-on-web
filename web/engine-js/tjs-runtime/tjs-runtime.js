@@ -35,7 +35,7 @@ var ENVIRONMENT_IS_NODE = globalThis.process?.versions?.node && globalThis.proce
 if (ENVIRONMENT_IS_NODE) {
   // When building an ES module `require` is not normally available.
   // We need to use `createRequire()` to construct the require()` function.
-  const {createRequire} = await import("node:module");
+  const {createRequire} = await ((import("node:module")));
   /** @suppress{duplicate} */ var require = createRequire(import.meta.url);
 }
 
@@ -177,7 +177,7 @@ function updateMemoryViews() {
 function preRun() {
   var preRun = Module["preRun"];
   if (preRun) {
-    if (typeof preRun == "function") preRun = [ preRun ];
+    if (typeof preRun === "function") preRun = [ preRun ];
     onPreRuns.push(...preRun);
   }
   // Begin ATPRERUNS hooks
@@ -193,7 +193,7 @@ function initRuntime() {
 function postRun() {
   var postRun = Module["postRun"];
   if (postRun) {
-    if (typeof postRun == "function") postRun = [ postRun ];
+    if (typeof postRun === "function") postRun = [ postRun ];
     onPostRuns.push(...postRun);
   }
   // Begin ATPOSTRUNS hooks
@@ -218,10 +218,6 @@ function postRun() {
   // a trap or not based on a hidden field within the object. So at the moment
   // we don't have a way of throwing a wasm trap from JS. TODO Make a JS API that
   // allows this in the wasm spec.
-  // Suppress closure compiler warning here. Closure compiler's builtin extern
-  // definition for WebAssembly.RuntimeError claims it takes no arguments even
-  // though it can.
-  // TODO(https://github.com/google/closure-compiler/pull/3913): Remove if/when upstream closure gets fixed.
   // See above, in the meantime, we resort to wasm code for trapping.
   // In case abort() is called before the module is initialized, wasmExports
   // and its exported '__trap' function is not available, in which case we throw
@@ -233,11 +229,7 @@ function postRun() {
   if (runtimeInitialized) {
     ___trap();
   }
-  /** @suppress {checkTypes} */ var e = new WebAssembly.RuntimeError(what);
-  // Throw the error whether or not MODULARIZE is set because abort is used
-  // in code paths apart from instantiation where an exception is expected
-  // to be thrown when abort is called.
-  throw e;
+  throw new WebAssembly.RuntimeError(what);
 }
 
 var wasmBinaryFile;
@@ -448,7 +440,7 @@ function __localtime_js(time, tmPtr) {
 }
 
 var __mktime_js = function(tmPtr) {
-  var ret = (() => {
+  var ret = ((() => {
     var date = new Date(HEAP32[(((tmPtr) + (20)) >> 2)] + 1900, HEAP32[(((tmPtr) + (16)) >> 2)], HEAP32[(((tmPtr) + (12)) >> 2)], HEAP32[(((tmPtr) + (8)) >> 2)], HEAP32[(((tmPtr) + (4)) >> 2)], HEAP32[((tmPtr) >> 2)], 0);
     if (isNaN(date.getTime())) {
       return -1;
@@ -488,7 +480,7 @@ var __mktime_js = function(tmPtr) {
     HEAP32[(((tmPtr) + (20)) >> 2)] = date.getYear();
     // Return time in seconds
     return date.getTime() / 1e3;
-  })();
+  }))();
   return BigInt(ret);
 };
 
@@ -605,7 +597,7 @@ function _clock_time_get(clk_id, ignored_precision, ptime) {
     return 52;
   }
   // "now" is in ms, and wasi times are in ns.
-  var nsec = Math.round(now * 1e3 * 1e3);
+  var nsec = Math.round(now * 1e6);
   HEAP64[((ptime) >> 3)] = BigInt(nsec);
   return 0;
 }
@@ -883,7 +875,7 @@ var Asyncify = {
   instrumentWasmImports(imports) {
     var importPattern = /^(__asyncjs__host_call|invoke_.*|__asyncjs__.*)$/;
     for (let [x, original] of Object.entries(imports)) {
-      if (typeof original == "function") {
+      if (typeof original === "function") {
         let isAsyncifyImport = original.isAsync || importPattern.test(x);
         // Wrap async imports with a suspending WebAssembly function.
         if (isAsyncifyImport) {
@@ -897,7 +889,7 @@ var Asyncify = {
     Asyncify.asyncExports = new Set;
     var ret = {};
     for (let [x, original] of Object.entries(exports)) {
-      if (typeof original == "function") {
+      if (typeof original === "function") {
         // Wrap all exports with a promising WebAssembly function.
         let isAsyncifyExport = exportPattern.test(x);
         if (isAsyncifyExport) {
@@ -981,7 +973,7 @@ var UTF16ToString = (ptr, maxBytesToRead, ignoreNul) => {
   if (Module["thisProgram"]) thisProgram = Module["thisProgram"];
   var preInit = Module["preInit"];
   if (preInit) {
-    if (typeof preInit == "function") Module["preInit"] = preInit = [ preInit ];
+    if (typeof preInit === "function") Module["preInit"] = preInit = [ preInit ];
     // Written as a loop so that preInit functions that themselves add more
     // preInit functions.  Is this actually needed?
     while (preInit.length > 0) {

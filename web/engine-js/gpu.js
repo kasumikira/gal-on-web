@@ -50,6 +50,7 @@ uniform sampler2D tableTexture;
 uniform vec2 sourceSize;
 uniform mat3 inverseTransform;
 uniform vec4 sampleRect;
+uniform vec4 sampleBounds;
 #ifdef LAYER_COMPOSITE
 const int operation = 1;
 const int mode = 0;
@@ -461,7 +462,7 @@ uint sampleNearest(vec2 point) {
 // GL render backend never reads StretchType and creates every texture with
 // GL_LINEAR, so this is the sampling path the original actually shows.
 uint sampleLinear(vec2 point) {
-  vec2 inset = clamp(point, sampleRect.xy + 0.5, sampleRect.zw - 0.5);
+  vec2 inset = clamp(point, sampleBounds.xy + 0.5, sampleBounds.zw - 0.5);
   return packARGB(texture(sourceTexture, inset / sourceSize));
 }
 
@@ -877,6 +878,7 @@ class GPUDevice {
     const {
       matrix = [1, 0, 0, 1, 0, 0],
       sourceRect = { left: 0, top: 0, right: sourceImage.width, bottom: sourceImage.height },
+      sampleBounds = sourceRect,
       mode = 2,
       opacity = 255,
       holdAlpha = false,
@@ -909,6 +911,51 @@ class GPUDevice {
     clip.top = Math.max(clip.top, Math.floor(Math.min(...ys)));
     clip.bottom = Math.min(clip.bottom, Math.ceil(Math.max(...ys)));
     if (clip.right <= clip.left || clip.bottom <= clip.top) return;
+    // Thumbnail sheets can exceed MAX_TEXTURE_SIZE. Keep their CPU bitmap
+    // intact and upload only the source tiles needed by this draw, like the
+    // reference renderer's tTVPOGLTexture2D_split.
+    if (sourceImage.width > this.maxTextureSize || sourceImage.height > this.maxTextureSize) {
+      const inverse = mat2d.invert(new Float64Array(6), matrix);
+      if (!inverse) return;
+      const points = [[clip.left, clip.top], [clip.right, clip.top],
+        [clip.left, clip.bottom], [clip.right, clip.bottom]];
+      const sx = points.map(([x, y]) => inverse[0] * x + inverse[2] * y + inverse[4]);
+      const sy = points.map(([x, y]) => inverse[1] * x + inverse[3] * y + inverse[5]);
+      const left = Math.max(0, sourceRect.left, Math.floor(Math.min(...sx)));
+      const top = Math.max(0, sourceRect.top, Math.floor(Math.min(...sy)));
+      const right = Math.min(sourceImage.width, sourceRect.right, Math.ceil(Math.max(...sx)));
+      const bottom = Math.min(sourceImage.height, sourceRect.bottom, Math.ceil(Math.max(...sy)));
+      const channels = sourceImage.gray ? 1 : 4;
+      const pixels = sourceImage.pixels;
+      // Linear sampling needs a one-pixel border from adjacent tiles.
+      const border = smooth ? 1 : 0, step = this.maxTextureSize - border * 2;
+      for (let y = Math.floor(top); y < bottom; y += step) {
+        for (let x = Math.floor(left); x < right; x += step) {
+          const endX = Math.min(x + step, right), endY = Math.min(y + step, bottom);
+          const ox = Math.max(0, x - border), oy = Math.max(0, y - border);
+          const w = Math.min(sourceImage.width, Math.ceil(endX) + border) - ox;
+          const h = Math.min(sourceImage.height, Math.ceil(endY) + border) - oy;
+          const data = new Uint8ClampedArray(w * h * channels);
+          for (let row = 0; row < h; row++) {
+            const offset = ((oy + row) * sourceImage.width + ox) * channels;
+            data.set(pixels.subarray(offset, offset + w * channels), row * w * channels);
+          }
+          const tile = new Image(w, h, { gray: sourceImage.gray, pixels: data });
+          try {
+            this.draw(targetImage, tile, { ...options, clip,
+              sourceRect: { left: Math.max(x, left) - ox, top: Math.max(y, top) - oy,
+                right: endX - ox, bottom: endY - oy },
+              sampleBounds: { left: Math.max(0, sampleBounds.left - ox), top: Math.max(0, sampleBounds.top - oy),
+                right: Math.min(w, sampleBounds.right - ox), bottom: Math.min(h, sampleBounds.bottom - oy) },
+              matrix: [matrix[0], matrix[1], matrix[2], matrix[3],
+                matrix[4] + matrix[0] * ox + matrix[2] * oy,
+                matrix[5] + matrix[1] * ox + matrix[3] * oy],
+            });
+          } finally { tile.release(); }
+        }
+      }
+      return;
+    }
     const overwrite = !maskOnly && !holdAlpha && opacity === 255 && (
       !motion && mode === 1 && copySourceAlpha || motion && opaque && mode === 0);
     // Bounding-box coverage is insufficient for rotated/sheared quads: their
@@ -966,6 +1013,7 @@ class GPUDevice {
       inverse[4], inverse[5], 1
     ]);
     this.uniform('sampleRect', 'uniform4f', sourceRect.left, sourceRect.top, sourceRect.right, sourceRect.bottom);
+    this.uniform('sampleBounds', 'uniform4f', sampleBounds.left, sampleBounds.top, sampleBounds.right, sampleBounds.bottom);
     this.uniform('operation', 'uniform1i', maskOnly ? 6 : motion ? 1 : 0);
     this.uniform('mode', 'uniform1i', mode);
     this.uniform('opacity', 'uniform1i', opacity);

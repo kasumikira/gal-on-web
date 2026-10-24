@@ -1,324 +1,285 @@
+import { VideoAudio } from './video-audio.js';
 import { config } from './global.js';
-// VideoOverlay from VideoOvlIntf.cpp / VideoOvlImpl.cpp. Frames are decoded
-// by mediabunny (WebCodecs) and routed into layer1/layer2 exactly like
-// KRMovieLayer's double buffer (MoviePlayerLayer::OnPlayEvent EC_UPDATE).
-// Only vomLayer rendering is implemented; vomMixer/vomMFEVR playback falls
+// VideoOverlay from VideoOvlIntf.cpp / VideoOvlImpl.cpp. 消费端是“时钟驱动”：
+// libav/WebCodecs 后端把帧放进统一有界队列，本文件按媒体
+// 时钟取出到期帧，再经公共图层呈现入口写进 layer1/layer2，等价于 KRMovieLayer
+// 双缓冲的 MoviePlayerLayer::OnPlayEvent EC_UPDATE。
+// Overlay and layer rendering are implemented; vomMixer/vomMFEVR playback falls
 // back the same way the game's own Movie script falls back when mixer
 // playback fails. A format WebCodecs cannot decode fails open() with a thrown
-// error, matching "no video decoder available" in the original Open().
-import { nativeClass, nativeMembers, nativeProperty, unimplemented, reportUnimplemented, nativeOwner, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
+// error, matching "no video decoder available" in the original Open(); WMV3
+// video and WMA2 audio use the modular libav.js backend.
+import { nativeClass, nativeMembers, nativeProperty, nativeDictionary, unimplemented, reportUnimplemented, nativeOwner, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { number, truth } from '#krkr/values';
+import { VideoPipeline, presentVideoFrame, closeFrame } from './video-pipeline.js';
+import { probeLibavVideo } from './video-libav.js';
 import { Image } from './bitmap.js';
 import { getGPU } from './gpu.js';
-import { Input, ALL_FORMATS, BufferSource, VideoSampleSink, AudioSampleSink } from './media-core.js';
+import { present } from './layer-composite.js';
 
-// Upload a canvas-backed decoded frame directly into an Image's resident
-// texture. DOM-source uploads preserve the canvas's straight-alpha RGBA data.
-export function uploadVideoCanvas(image, canvas) {
-  const gpu = getGPU();
-  if (!gpu) throw new Error('Video frame upload requires the GPU renderer');
-  gpu.uploadCanvas(image, canvas);
-}
+export { uploadVideoCanvas } from './video-pipeline.js';
 
 // tTVPPeriodEventReason (VideoOvlIntf.h).
 export const perLoop = 0, perPeriod = 1, perPrepare = 2, perSegLoop = 3;
 
+// Keep at most two decoded frames ahead; the reference GLES backend uses four.
+const VIDEO_BUFFER_COUNT = 2;
+
 const unwrap = value => nativeOwner(value);
 
-// Probe metadata once at open: size, fps, duration, track handles. The input
-// must stay alive for the sinks; the original keeps the IStream similarly.
-async function probeVideo(bytes) {
-  const input = new Input({ formats: ALL_FORMATS, source: new BufferSource(bytes) });
-  const videoTrack = await input.getPrimaryVideoTrack();
-  if (!videoTrack) throw new Error('Video storage has no video track');
-  const audioTrack = (await input.getAudioTracks())[0] ?? null;
-  const stats = await videoTrack.computePacketStats();
-  const fps = stats.averagePacketRate;
-  const duration = await input.computeDuration();
-  return {
-    input, videoTrack, audioTrack, fps, duration,
-    numberOfFrame: Math.max(1, Math.round(duration * fps)),
-    width: videoTrack.displayWidth, height: videoTrack.displayHeight,
-    totalTime: Math.round(duration * 1000),
-  };
-}
-
-// Decode the whole audio track up front and play it through one
-// AudioBufferSourceNode. Event/OP clips are 1-3 minutes, so the decoded
-// buffer is ~10-30 MB — the same order WaveSoundBuffer already holds. One
-// node gives sample-accurate start offsets, native playbackRate and a clock
-// (context.currentTime) the video timeline follows.
-class Player {
+// Video and PCM have independent bounded consumers; Web Audio provides the clock.
+export class Player {
   constructor(info, getAudioContext, view) {
-    this.info = info;
-    this.getAudioContext = getAudioContext;
-    this.view = view;
-    this.videoSink = new VideoSampleSink(info.videoTrack);
-    this.audioSink = info.audioTrack ? new AudioSampleSink(info.audioTrack) : null; this.audioBuffer = null;
-    this.source = null;
-    this.gain = null;
-    this.videoIterator = null;
-    this.pending = [];       // decoded video samples ahead of the clock
-    this.pts = 0;            // current presentation time (seconds)
-    this.rate = 1;
-    this.volume = 1; this.balance = 0;
-    this.playing = false;
-    this.raf = 0;
-    this.startContextTime = 0;  // AudioContext time when pts == startPts
-    this.startWallTime = 0;     // performance.now() when pts == startPts
-    this.startPts = 0;
-    this.onUpdate = null;    // (sample, frame) => void
-    this.onEnded = null;     // (finishedAtPts) => void
-    this.onError = null;     // (error) => void
-    this.onSegmentLoop = null;
-    this.segmentLoop = null; // { start, end } frames
-    this.stopped = true;
-    this.audioError = null;
+    this.info = info; this.source = info.source; this.getAudioContext = getAudioContext; this.view = view;
+    this.pipeline = new VideoPipeline(this.source, { capacity: VIDEO_BUFFER_COUNT, onError: error => this.fail(error) });
+    this.audio = null; this.gain = null; this.pan = null;
+    this.pts = 0; this.startPts = 0; this.rate = 1; this.volume = 1; this.balance = 0;
+    this.playing = false; this.stopped = true; this.completed = false; this.needsRewind = false;
+    this.raf = 0; this.startWallTime = 0; this.segmentLoop = null;
+    this.operation = Promise.resolve(); this.version = 0;
+    this.presentation = null;
+    this.onUpdate = null; this.onEnded = null; this.onError = null; this.onSegmentLoop = null;
   }
-
-  // Decode the full audio track once at open. A failure leaves the video
-  // playing silently but is recorded and reported to the caller rather than
-  // silently discarded (EC_UPDATE keeps running on the wall clock).
-  async decodeAudio() {
-    if (!this.audioSink) return;
-    try {
-      const context = this.getAudioContext();
-      this.gain = context.createGain();
-      this.gain.gain.value = this.volume;
-      this.gain.connect(context.destination);
-      let merged = null;
-      for await (const sample of this.audioSink.samples()) {
-        const buffer = sample.toAudioBuffer();
-        sample.close?.();
-        if (!merged) {
-          merged = context.createBuffer(buffer.numberOfChannels, Math.ceil(buffer.sampleRate * this.info.duration), buffer.sampleRate);
-        }
-        // Append; samples arrive in presentation order and may have gaps,
-        // so write each at its own offset rather than sequential copy.
-        const offset = Math.min(merged.length, Math.max(0, Math.round(sample.timestamp * buffer.sampleRate)));
-        const frames = Math.min(buffer.length, merged.length - offset);
-        for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-          merged.copyToChannel(buffer.getChannelData(Math.min(ch, buffer.numberOfChannels - 1)).subarray(0, frames), ch, offset);
-        }
-      }
-      this.audioBuffer = merged;
-    } catch (error) {
-      this.audioBuffer = null;
-      this.audioError = error;
-      throw error;
-    }
+  run(operation) {
+    const task = this.operation.then(operation);
+    this.operation = task.catch(() => {});
+    return task;
   }
-
-  startAt(time) {
-    // Restart decode stream; keep playing state untouched (rewind semantics).
-    this.videoIterator = this.videoSink.samples(time)[Symbol.asyncIterator]();
-    this.pending = [];
-    this.startPts = time;
-    this.pts = time;
-    if (this.playing) this.startClock();
-  }
-
-  startClock() {
+  fail(error) { this.stopPlayback(); this.onError?.(error); }
+  async prepareAudio() {
+    if (!this.info.hasAudio || this.audio) return;
     const context = this.getAudioContext();
-    this.startContextTime = context.currentTime;
-    this.startWallTime = performance.now();
-    if (this.source) { this.source.onended = null; try { this.source.stop(); } catch {} this.source.disconnect(); this.source = null; }
-    if (this.audioBuffer) {
-      this.source = context.createBufferSource();
-      this.source.buffer = this.audioBuffer;
-      this.source.playbackRate.value = this.rate;
-      this.source.connect(this.gain);
-      const ended = this.onEnded;
-      this.source.onended = () => { if (this.playing) ended?.(this.info.duration); };
-      // Seeking before the clip start: currentTime runs while silent.
-      const silent = this.startPts < 0 ? -this.startPts : 0;
-      this.source.start(context.currentTime + silent, Math.max(0, this.startPts), undefined);
-      if (silent) this.source.disconnect(); // keep clock, drop early audio
-    }
+    this.audio = await VideoAudio.create(context, this.source, error => this.fail(error));
+    this.gain = context.createGain(); this.gain.gain.value = this.volume;
+    this.pan = context.createStereoPanner(); this.pan.pan.value = this.balance;
+    this.audio.node.connect(this.gain); this.gain.connect(this.pan); this.pan.connect(context.destination);
+    this.audio.setRate(this.rate);
   }
-
-  // Video-only clips follow the wall clock (the reference backend always
-  // advances a media clock, audio or not).
+  async resetPosition(time) {
+    this.playing = false; this.view.cancelAnimationFrame(this.raf);
+    this.presentation = null;
+    this.source.interrupt();
+    const audioTask = this.audio?.stop();
+    this.pipeline.clear();
+    await Promise.all([audioTask, this.pipeline.stop()]);
+    await this.pipeline.reseek(time);
+    this.audio?.reset(time);
+    this.pts = this.startPts = time; this.completed = false; this.needsRewind = false;
+  }
+  startAt(time, resume = false) {
+    const version = this.version;
+    return this.run(async () => {
+      const playing = resume || this.playing;
+      await this.resetPosition(time);
+      if (playing) await this.beginPlay(undefined, version);
+    });
+  }
   wallPts() {
     if (!this.playing) return this.pts;
-    if (this.audioBuffer) {
-      return this.startPts + (this.getAudioContext().currentTime - this.startContextTime) * this.rate;
-    }
-    return this.startPts + (performance.now() - this.startWallTime) / 1000 * this.rate;
+    return this.audio ? this.audio.time : this.startPts + (performance.now() - this.startWallTime) / 1000 * this.rate;
   }
-
-  async play(time) {
-    if (!this.videoIterator) {
-      // First play after open: start the decode stream at the current pts.
-      this.startAt(time ?? this.pts);
-    }
-    const context = this.getAudioContext();
-    await context.resume();
-    this.playing = true; this.stopped = false;
-    if (time !== undefined) { this.startPts = time; this.pts = time; }
-    else this.startPts = this.pts;
-    this.startClock();
+  play(time) {
+    const version = this.version;
+    return this.run(() => this.beginPlay(time, version));
+  }
+  async beginPlay(time, version) {
+    if (version !== this.version) return;
+    // Browser autoplay may leave this promise pending until a gesture. PCM can
+    // prebuffer meanwhile; AudioContext time stays frozen without audio output.
+    this.getAudioContext().resume().catch(error => this.fail(error));
+    await this.prepareAudio();
+    if (version !== this.version) return;
+    if (time !== undefined && time !== this.pts) await this.resetPosition(time);
+    else if (this.needsRewind) await this.resetPosition(0);
+    if (version !== this.version) return;
+    this.startPts = this.pts; this.startWallTime = performance.now();
+    this.playing = true; this.stopped = false; this.completed = false;
+    this.pipeline.start();
+    await this.audio?.play();
+    if (!this.playing) return;
     this.view.cancelAnimationFrame(this.raf);
     const tick = () => {
       if (!this.playing) return;
-      this.raf = this.view.requestAnimationFrame(tick);
-      this.present();
+      this.raf = this.view.requestAnimationFrame(tick); this.present();
     };
     tick();
   }
-
-  // Present frames whose pts <= clock (WndProc EC_UPDATE branch).
   present() {
+    if (this.presentation) return this.presentation;
+    const task = Promise.resolve().then(() => this.presentFrames(task));
+    this.presentation = task;
+    task.finally(() => {
+      if (this.presentation === task) this.presentation = null;
+    }).catch(error => this.fail(error));
+    return task;
+  }
+  async presentFrames(task) {
+    if (this.presentation !== task) return;
     const pts = this.pts = this.wallPts();
-    while (this.pending.length && this.pending[0].timestamp <= pts) {
-      const sample = this.pending.shift();
-      const frame = Math.floor(sample.timestamp * this.info.fps);
+    for (;;) {
+      const frame = this.pipeline.peek();
+      if (!frame || frame.timestamp > pts) break;
       const end = this.segmentLoop?.end ?? 0;
-      if (end > 0 && frame >= end) {
+      if (end > 0 && frame.frame >= end) {
         const start = this.segmentLoop.start > 0 ? this.segmentLoop.start : 0;
-        this.playing = false;
-        this.view.cancelAnimationFrame(this.raf);
-        this.onSegmentLoop?.(start);
-        return;
+        this.pause(); this.onSegmentLoop?.(start); return;
       }
-      this.onUpdate?.(sample, frame);
-      sample.close();
+      this.pipeline.shift();
+      const next = this.pipeline.peek();
+      // Another due frame supersedes these pixels, except across a loop edge.
+      const render = !next || next.timestamp === null || next.timestamp > pts || (end > 0 && next.frame >= end);
+      await this.push(frame, render);
+      if (this.presentation !== task) return;
     }
-    // Refill the two-slot buffer like MAX_BUFFER_COUNT.
-    if (this.videoIterator && this.pending.length < 2 && !this.fillPromise) {
-      this.fillPromise = (async () => {
-        try {
-          while (this.pending.length < 2) {
-            const { value, done } = await this.videoIterator.next();
-            if (done || !value) { this.videoIterator = null; this.exhausted = true; break; }
-            this.pending.push(value);
-          }
-        } catch (error) {
-          // A decode failure terminates playback and is reported; the status
-          // must not keep claiming "play" (EC_COMPLETE -> Stop).
-          this.videoIterator = null;
-          this.playing = false;
-          this.view.cancelAnimationFrame(this.raf);
-          this.onError?.(error);
-        } finally { this.fillPromise = null; }
-      })();
+    if (this.playing && !this.completed && this.pipeline.drained && (!this.audio || this.audio.ended)) {
+      this.completed = true; this.pause(); this.onEnded?.(this.info.duration);
     }
   }
-
+  async push(frame, render = true) {
+    try { await this.onUpdate?.(frame, render); }
+    catch (error) { this.fail(error); }
+    finally { closeFrame(frame); }
+  }
   pause() {
-    // Freeze the clock at the current pts; audio node discarded.
-    this.pts = this.wallPts();
-    this.playing = false;
-    this.view.cancelAnimationFrame(this.raf);
-    if (this.source) { this.source.onended = null; try { this.source.stop(); } catch {} this.source.disconnect(); this.source = null; }
+    this.version++;
+    this.presentation = null;
+    this.pts = this.wallPts(); this.playing = false;
+    this.view.cancelAnimationFrame(this.raf); this.audio?.pause(); this.pipeline.stop();
   }
-
-  resume() {
-    this.play().then(() => {}, error => this.onError?.(error));
-  }
-
+  resume() { return this.play().catch(error => this.fail(error)); }
   setRate(rate) {
-    const anchor = this.wallPts();
-    this.rate = rate;
-    this.startPts = anchor;
-    if (this.playing) this.startClock();
+    const time = this.wallPts(); this.rate = rate; this.startPts = this.pts = time;
+    this.startWallTime = performance.now(); this.audio?.setRate(rate);
   }
-
   setVolume(volume, balance) {
     this.volume = Math.max(0, Math.min(1, volume / 100000));
     this.balance = Math.max(-1, Math.min(1, balance / 100000));
-    if (!this.gain) return;
-    this.gain.gain.value = this.volume;
-    const context = this.getAudioContext();
-    // StereoPanner replaces the connection when balance is used.
-    if (this.balance && context.createStereoPanner) {
-      if (!this.pan) {
-        this.gain.disconnect();
-        this.pan = context.createStereoPanner();
-        this.pan.pan.value = this.balance;
-        this.gain.connect(this.pan);
-        this.pan.connect(context.destination);
-      } else this.pan.pan.value = this.balance;
-    }
+    if (this.gain) this.gain.gain.value = this.volume;
+    if (this.pan) this.pan.pan.value = this.balance;
   }
-
   stopPlayback() {
-    this.playing = false; this.stopped = true;
-    this.view.cancelAnimationFrame(this.raf);
-    if (this.source) { this.source.onended = null; try { this.source.stop(); } catch {} this.source.disconnect(); this.source = null; }
-    this.pending = []; this.videoIterator = null; this.pts = 0;
+    this.version++; this.playing = false; this.stopped = true;
+    this.presentation = null;
+    this.view.cancelAnimationFrame(this.raf); this.source.interrupt(); this.audio?.stop();
+    this.pipeline.stop(); this.pipeline.clear(); this.pts = 0; this.needsRewind = true;
   }
-
-  dispose() {
-    this.stopPlayback();
-    if (this.gain) { this.gain.disconnect(); this.gain = null; }
-    if (this.pan) { this.pan.disconnect(); this.pan = null; }
-    this.info.input.dispose();
+  async dispose() {
+    // onUpdate may be awaiting a script event that calls close(). Invalidating
+    // presentation cancels its continuation; push() still releases its frame.
+    // Waiting for that same event here would deadlock the VM event queue.
+    this.stopPlayback(); await this.operation;
+    await this.audio?.dispose(); await this.pipeline.dispose();
+    this.gain?.disconnect(); this.pan?.disconnect();
   }
-}
-
-// VideoSample -> scratch canvas. Rotation metadata is applied by sample.draw;
-// the canvas matches the current video size and uploads directly to the GPU.
-let scratchCanvas = null, scratchContext = null, scratchKey = '';
-function sampleToCanvas(sample) {
-  const width = sample.displayWidth, height = sample.displayHeight;
-  const key = width + 'x' + height;
-  if (scratchKey !== key) {
-    scratchCanvas = new OffscreenCanvas(width, height);
-    scratchContext = scratchCanvas.getContext('2d');
-    scratchKey = key;
-  }
-  scratchContext.clearRect(0, 0, width, height);
-  sample.draw(scratchContext, 0, 0, width, height);
-  return scratchCanvas;
 }
 
 // tTJSNI_VideoOverlay state machine, geometry and TJS surface.
-export function createVideoOverlayClass({ Window, Layer, storage, getAudioContext }) {
+export function createVideoOverlayClass({ Window, Layer, storage, getAudioContext, enqueueEvent }) {
   const { document, inform: report } = config;
   const view = document.defaultView;
   const players = new Set();
   let schedulingActive = true;
-  // TVP_ACTION_INVOKE: call the named member on the action owner closure
-  // (VideoOvlIntf.cpp TVP_ACTION_INVOKE_BEGIN/MEMBER/END).
+  // Overlay pixels use the same upload/presentation path as movie layers, but
+  // live above the window canvas, like the native overlay draw device.
+  const overlayLayer = {
+    peekState: node => ({ node }),
+    peekNode: node => node,
+    resizeNode(node, width, height) {
+      node.width = width; node.height = height;
+      if (node.image.width !== width || node.image.height !== height) node.image.resize(width, height);
+    },
+  };
+  const moveOverlay = (s, left, top) => {
+    s.rect.right += left - s.rect.left;
+    s.rect.bottom += top - s.rect.top;
+    s.rect.left = left; s.rect.top = top;
+  };
+  const updateOverlay = s => {
+    if (!s.overlay) return;
+    const canvas = s.window.canvas;
+    const box = canvas.getBoundingClientRect();
+    const sx = box.width / s.window.width, sy = box.height / s.window.height;
+    Object.assign(s.overlay.canvas.style, {
+      left: `${box.left + s.rect.left * sx}px`, top: `${box.top + s.rect.top * sy}px`,
+      width: `${(s.rect.right - s.rect.left) * sx}px`, height: `${(s.rect.bottom - s.rect.top) * sy}px`,
+    });
+    s.overlay.canvas.hidden = !s.visible || canvas.hidden;
+  };
+  const closeOverlay = s => {
+    if (!s.overlay) return;
+    s.overlay.canvas.remove();
+    s.overlay.image.release();
+    s.overlay = null;
+  };
+  // Backend events target the VideoOverlay object so script overrides run.
+  // Only the native default handlers below forward an event to ActionOwner.
   const fire = async (s, name, args) => {
-    const owner = s.actionOwner;
+    const owner = s.owner;
     if (!owner) return;
-    await callScript(owner, name, args, { receiver: owner, ignoreMissing: true });
+    const result = await callScript(owner, name, args);
+    await disposeScriptValue(result);
+  };
+  const post = (s, name, args) => {
+    if (!s.owner) return Promise.resolve();
+    const owner = retainScriptValue(s.owner);
+    const token = s.eventToken;
+    return enqueueEvent(async () => {
+      if (!s.owner || token !== s.eventToken) return;
+      const result = await callScript(owner, name, args);
+      await disposeScriptValue(result);
+    }, () => disposeScriptValue(owner)).catch(error => report(`video ${name} failed: ${error.message}`));
+  };
+  const action = async (s, type, fields) => {
+    if (!s.actionOwner) return;
+    const event = nativeDictionary(s.owner, [['type', type], ['target', s.owner], ...fields]);
+    try {
+      const result = await callScript(s.actionOwner, 'action', [event]);
+      await disposeScriptValue(result);
+    } finally { await disposeScriptValue(event); }
   };
   const statusString = s => ({ unload: 'unload', play: 'play', stop: 'stop', pause: 'pause', ready: 'ready' })[s] ?? 'unknown';
-  const setStatus = (s, status) => {
+  const setStatus = (s, status, deliver = fire) => {
     if (s.status === status) return;
     s.status = status;
-    if (s.owner) fire(s, 'onStatusChanged', [statusString(status)]);
+    s.eventToken++;
+    if (s.owner) return deliver(s, 'onStatusChanged', [statusString(status)]);
   };
   // EC_UPDATE branch: size both layers to the video, replace the main
   // image, then fire onFrameUpdate / period events.
-  const pushFrame = (s, sample, frame) => {
-    const canvas = sampleToCanvas(sample);
-    let frameImage;
-    for (const slot of [1, 2]) {
-      const owner = s['layer' + slot];
-      if (!owner) continue;
-      const node = Layer.peekNode(owner);
-      if (!node) continue;
-      if (node.image.width !== canvas.width || node.image.height !== canvas.height) {
-        node.image = new Image(canvas.width, canvas.height, { defer: true });
-        node.width = canvas.width;
-        node.height = canvas.height;
+  const pushFrame = async (s, frame, render) => {
+    const token = s.eventToken;
+    // Prepare still needs its first image; layer events run even without upload.
+    render ||= s.isPrepare;
+    if (s.mode === 0) {
+      if (!render) return;
+      if (!s.overlay) {
+        const canvas = document.createElement('canvas');
+        Object.assign(canvas.style, { position: 'fixed', pointerEvents: 'none', zIndex: '1' });
+        s.window.canvas.parentNode.append(canvas);
+        s.overlay = { canvas, image: new Image(1, 1) };
       }
-      if (!frameImage) { uploadVideoCanvas(node.image, canvas); frameImage = node.image; }
-      else if (node.image !== frameImage) getGPU().copy(node.image, frameImage);
-      node.imageModified = true;
-      if (s.onLayerChange) s.onLayerChange();
+      await presentVideoFrame([s.overlay], frame, { Layer: overlayLayer });
+      if (token !== s.eventToken || !s.overlay) return;
+      const { canvas, image } = s.overlay;
+      if (canvas.width !== image.width) canvas.width = image.width;
+      if (canvas.height !== image.height) canvas.height = image.height;
+      if (image.width && image.height) present(getGPU(), image, canvas);
+      updateOverlay(s);
+      // VideoOvlImpl.cpp EC_UPDATE dispatches frame/period events only for vomLayer.
+      return;
+    } else if (render) {
+      await presentVideoFrame([s.layer1, s.layer2], frame, { Layer });
+      if (token !== s.eventToken) return;
+      s.onLayerChange?.();
     }
-    fire(s, 'onFrameUpdate', [frame]);
+    await post(s, 'onFrameUpdate', [frame.frame]);
+    if (token !== s.eventToken) return;
     if (s.isPrepare) {
       s.isPrepare = false;
-      fire(s, 'onPeriod', [perPrepare]);
-    } else if (s.eventFrame >= 0 && !s.isEventPast && frame >= s.eventFrame) {
+      await post(s, 'onPeriod', [perPrepare]);
+    } else if (s.eventFrame >= 0 && !s.isEventPast && frame.frame >= s.eventFrame) {
       s.eventFrame = -1;
-      fire(s, 'onPeriod', [perPeriod]);
+      await post(s, 'onPeriod', [perPeriod]);
     }
   };
   const eachVideoLayer = (s, fn) => {
@@ -348,67 +309,71 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       if (!arguments.length) throw new Error('TJS VideoOverlay.open requires a storage name');
       const s = this;
       await this.close();
-      const bytes = await storage.read(String(name));
+      if (s.mode !== 0 && s.mode !== 1) throw new Error('VideoOverlay supports only vomOverlay and vomLayer playback');
+      const target = String(name);
       // Open (VideoOvlImpl.cpp 132) closes first, then throws when no decoder
       // can be built; the exception propagates so the caller can fall back.
-      s.info = await probeVideo(bytes);
+      const bytes = await storage.read(target);
+      s.info = await probeLibavVideo(bytes);
       const player = s.player = new Player(s.info, getAudioContext, view);
       players.add(player);
-      player.onUpdate = (sample, frame) => pushFrame(s, sample, frame);
+      player.onUpdate = (frame, render) => pushFrame(s, frame, render);
       player.onError = error => {
         // A mid-playback decode failure terminates playback (EC_COMPLETE ->
         // Stop + ssStop) and is reported rather than shown as success.
         s.lastError = error;
         player.stopPlayback();
-        if (s.mode !== 3) setStatus(s, 'stop');
+        if (s.mode !== 3) setStatus(s, 'stop', post);
         report(`video decode failed: ${error?.message ?? error}`);
       };
       player.onEnded = finishedPts => {
         if (s.loop) {
-          player.startAt(0);
-          player.play(0).then(() => fire(s, 'onPeriod', [perLoop]), error => player.onError?.(error));
+          player.startAt(0, true).then(() => player.playing && post(s, 'onPeriod', [perLoop]), error => player.onError?.(error));
         } else {
           // All data has been rendered (WndProc EC_COMPLETE).
-          setStatus(s, 'stop');
+          setStatus(s, 'stop', post);
         }
       };
       player.onSegmentLoop = start => {
-        player.startAt(start / s.info.fps);
-        player.play(start / s.info.fps).then(() => fire(s, 'onPeriod', [perSegLoop]), error => player.onError?.(error));
+        player.startAt(start / s.info.fps, true).then(() => player.playing && post(s, 'onPeriod', [perSegLoop]), error => player.onError?.(error));
       };
-      // Audio decode failure must not be hidden: report it and let the video
-      // run silently on the wall clock, or fail the open. The reference treats
-      // a missing audio track as normal, but a decode error surfaces.
-      try { await player.decodeAudio(); } catch (error) {
+      // Initialize decoders and output only; PCM is produced during playback.
+      try { await player.prepareAudio(); } catch (error) {
         report(`video audio decode failed: ${error?.message ?? error}`);
+        players.delete(player);
+        await player.dispose();
+        s.player = null;
+        s.info = null;
         throw error;
       }
-      setStatus(s, 'stop');
+      return setStatus(s, 'stop');
     },
-    play: function() {
+    play: async function() {
       const s = this;
       if (!schedulingActive || !s.player) return;
-      s.player.resume();
-      if (s.mode !== 3) setStatus(s, 'play');
+      await s.player.play();
+      if (s.mode !== 3) return setStatus(s, 'play');
     },
     stop: function() {
       const s = this;
       if (!s.player) return;
       s.player.stopPlayback();
-      if (s.mode !== 3) setStatus(s, 'stop');
+      if (s.mode !== 3) return setStatus(s, 'stop');
     },
-    close: function() {
+    close: async function() {
       const s = this;
-      if (s.player) { players.delete(s.player); s.player.dispose(); s.player = null; s.info = null; }
+      if (s.player) { players.delete(s.player); await s.player.dispose(); s.player = null; s.info = null; }
+      closeOverlay(s);
       s.isPrepare = false;
-      setStatus(s, 'unload');
+      return setStatus(s, 'unload');
     },
     setPos: function(left, top) {
       if (arguments.length < 2) throw new Error('TJS VideoOverlay.setPos requires 2 arguments');
       const s = this;
       left = Math.trunc(number(left)); top = Math.trunc(number(top));
       if (s.mode === 1) eachVideoLayer(s, node => { node.left = left; node.top = top; });
-      else { s.rect.left = left; s.rect.top = top; }
+      else moveOverlay(s, left, top);
+      updateOverlay(s);
     },
     setSize: function(width, height) {
       if (arguments.length < 2) throw new Error('TJS VideoOverlay.setSize requires 2 arguments');
@@ -416,6 +381,7 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       if (s.mode === 1) return;
       s.rect.right = s.rect.left + Math.trunc(number(width));
       s.rect.bottom = s.rect.top + Math.trunc(number(height));
+      updateOverlay(s);
     },
     setBounds: function(left, top, width, height) {
       if (arguments.length < 4) throw new Error('TJS VideoOverlay.setBounds requires 4 arguments');
@@ -424,28 +390,29 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       s.rect.left = Math.trunc(number(left)); s.rect.top = Math.trunc(number(top));
       s.rect.right = s.rect.left + Math.trunc(number(width));
       s.rect.bottom = s.rect.top + Math.trunc(number(height));
+      updateOverlay(s);
     },
     pause: function() {
       const s = this;
       if (!s.player) return;
       s.player.pause();
-      if (s.mode !== 3) setStatus(s, 'pause');
+      if (s.mode !== 3) return setStatus(s, 'pause');
     },
-    rewind: function() {
+    rewind: async function() {
       const s = this;
       if (!schedulingActive || !s.player) return;
-      s.player.startAt(0);
-      if (s.status === 'play') s.player.resume();
+      await s.player.startAt(0);
+      if (s.status === 'play' && !s.player.playing) await s.player.play();
       if (s.eventFrame >= 0 && s.isEventPast) s.isEventPast = false;
     },
-    prepare: function() {
+    prepare: async function() {
       // Prepare mode only exists for vomLayer (VideoOvlImpl.cpp 350).
       const s = this;
       if (!schedulingActive || !s.player || s.mode !== 1) return;
       s.player.pause();
-      s.player.startAt(0);
+      await s.player.startAt(0);
       s.isPrepare = true;
-      s.player.resume();
+      await s.player.play();
     },
     setSegmentLoop: function(start, end) {
       if (arguments.length < 2) throw new Error('TJS VideoOverlay.setSegmentLoop requires 2 arguments');
@@ -479,30 +446,29 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       // Mixing overlays are a vomMixer feature; accepted and ignored.
     },
     resetMixingLayer: unimplemented('VideoOverlay.resetMixingLayer'),
-    // Event dispatch stubs (VideoOvlIntf.cpp 424-486): the native methods
-    // invoke the same-named member on the action owner with named params.
+    // Native defaults forward TVP_ACTION_INVOKE event dictionaries to action().
     onStatusChanged: function(status) {
       const s = this;
-      if (s.actionOwner) fire(s, 'status', [status]);
+      return action(s, 'onStatusChanged', [['status', status]]);
     },
     onCallbackCommand: function(command, arg) {
       const s = this;
-      if (s.actionOwner) fire(s, 'Go', [command, arg]);
+      return action(s, 'onCallbackCommand', [['command', command], ['arg', arg]]);
     },
     onPeriod: function(reason) {
       const s = this;
-      if (s.actionOwner) fire(s, 'reason', [reason]);
+      return action(s, 'onPeriod', [['reason', reason]]);
     },
     onFrameUpdate: function(frame) {
       const s = this;
-      if (s.actionOwner) fire(s, 'frame', [frame]);
+      return action(s, 'onFrameUpdate', [['frame', frame]]);
     },
   })
   class VideoOverlay {
     static initialize(owner) {
       return {
         owner: null, actionOwner: null, window: null,
-        status: 'unload', player: null, info: null,
+        status: 'unload', player: null, info: null, overlay: null,
         rect: { left: 0, top: 0, right: 320, bottom: 240 },
         visible: false, loop: false, mode: 0,
         layer1: null, layer2: null, onLayerChange: null,
@@ -511,29 +477,32 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
         eventFrame: -1, isEventPast: false,
         audioVolume: 100000, audioBalance: 0, playRate: 1,
         lastError: null,
+        eventToken: 0,
       };
     }
 
     @nativeProperty get position() { const s = this; return s.player ? Math.round(s.player.pts * 1000) : 0; }
-    @nativeProperty set position(value) { const s = this; if (s.player) s.player.startAt(number(value) / 1000); }
+    @nativeProperty set position(value) { const s = this; if (s.player) return s.player.startAt(number(value) / 1000); }
     @nativeProperty get left() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.left ?? 0) : s.rect.left; }
     @nativeProperty set left(value) {
       const s = this;
       const left = Math.trunc(number(value));
       if (s.mode === 1) eachVideoLayer(s, node => { node.left = left; });
-      else s.rect.left = left;
+      else moveOverlay(s, left, s.rect.top);
+      updateOverlay(s);
     }
     @nativeProperty get top() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.top ?? 0) : s.rect.top; }
     @nativeProperty set top(value) {
       const s = this;
       const top = Math.trunc(number(value));
       if (s.mode === 1) eachVideoLayer(s, node => { node.top = top; });
-      else s.rect.top = top;
+      else moveOverlay(s, s.rect.left, top);
+      updateOverlay(s);
     }
     @nativeProperty get width() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.width ?? 0) : s.rect.right - s.rect.left; }
-    @nativeProperty set width(value) { const s = this; s.rect.right = s.rect.left + Math.trunc(number(value)); }
+    @nativeProperty set width(value) { const s = this; s.rect.right = s.rect.left + Math.trunc(number(value)); updateOverlay(s); }
     @nativeProperty get height() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.height ?? 0) : s.rect.bottom - s.rect.top; }
-    @nativeProperty set height(value) { const s = this; s.rect.bottom = s.rect.top + Math.trunc(number(value)); }
+    @nativeProperty set height(value) { const s = this; s.rect.bottom = s.rect.top + Math.trunc(number(value)); updateOverlay(s); }
     @nativeProperty get originalWidth() { return this.info?.width ?? 0; }
     @nativeProperty get originalHeight() { return this.info?.height ?? 0; }
     @nativeProperty get visible() { return Number(this.visible); }
@@ -541,12 +510,13 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       const s = this;
       s.visible = !!truth(value);
       eachVideoLayer(s, node => { node.visible = s.visible; });
+      updateOverlay(s);
       if (s.onLayerChange) s.onLayerChange();
     }
     @nativeProperty get loop() { return Number(this.loop); }
     @nativeProperty set loop(value) { this.loop = !!truth(value); }
     @nativeProperty get frame() { const s = this; return s.player && s.info ? Math.floor(s.player.pts * s.info.fps) : 0; }
-    @nativeProperty set frame(value) { const s = this; if (s.player) s.player.startAt(number(value) / (s.info?.fps || 1)); }
+    @nativeProperty set frame(value) { const s = this; if (s.player) return s.player.startAt(number(value) / (s.info?.fps || 1)); }
     @nativeProperty get fps() { return this.info?.fps ?? 0; }
     @nativeProperty get numberOfFrame() { return this.info?.numberOfFrame ?? 0; }
     @nativeProperty get totalTime() { return this.info?.totalTime ?? 0; }
@@ -581,8 +551,8 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
     // Stream counts and the mixing/color parameter groups follow the reference
     // behavior when no mixer backend is attached: one enabled stream and the
     // disabled (-1) filter values (VideoOvlImpl.cpp 946-1098).
-    @nativeProperty get numberOfAudioStream() { return this.info?.audioTrack ? 1 : 0; }
-    @nativeProperty get enabledAudioStream() { return this.info?.audioTrack ? 0 : -1; }
+    @nativeProperty get numberOfAudioStream() { return this.info?.hasAudio ? 1 : 0; }
+    @nativeProperty get enabledAudioStream() { return this.info?.hasAudio ? 0 : -1; }
     @nativeProperty get numberOfVideoStream() { return 1; }
     @nativeProperty get enabledVideoStream() { return 0; }
     @nativeProperty get mixingMovieAlpha() { return 0; }
@@ -603,7 +573,10 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
   };
   VideoOverlay.invalidate = async owner => {
     const s = state(owner);
-    if (s.player) { players.delete(s.player); s.player.dispose(); }
+    s.owner = null;
+    s.eventToken++;
+    if (s.player) { players.delete(s.player); await s.player.dispose(); }
+    closeOverlay(s);
     s.player = null;
     s.info = null;
     await disposeScriptValue(s.actionOwner);

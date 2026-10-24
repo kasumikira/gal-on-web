@@ -1,7 +1,7 @@
 // Debug class from cpp/core/utils/DebugIntf.cpp. The browser console replaces
 // the log file, and logging handlers are TJS closures held by the engine.
 import { defineNativeClass, NativeProperty, reportUnimplemented } from '#krkr/native';
-import { truth } from '#krkr/values';
+import { string, truth } from '#krkr/values';
 const maxLines = 1000;
 export function createDebugClass(write) {
   // DebugImpl.cpp exposes singleton class objects; its port disables both
@@ -26,7 +26,7 @@ export function createDebugClass(write) {
   };
   const format = values => {
     if (!values.length) throw new Error('TJS Debug method requires arguments');
-    return values.length === 1 ? String(values[0]) : values.map(value => String(value)).join(', ');
+    return values.map(string).join(', ');
   };
   return {
     get console() { return consoleClass; },

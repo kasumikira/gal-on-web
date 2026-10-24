@@ -1,14 +1,12 @@
-import { TextStreamDecoder } from './text-stream.js';
 import { reportUnimplemented } from '#krkr/native';
 import { registerFstat } from './plugins/fstat.js';
-import { registerCSVParser } from './plugins/csvparser.js';
-import { registerMotion } from './plugins/motion.js';
+import { registerAlphaMovie } from './plugins/alphamovie.js';
 import { registerPSBFile } from './plugins/psb-plugin.js';
+import { registerMotion } from './plugins/motion.js';
 import { registerExtrans } from './plugins/extrans.js';
 import { registerTextRender } from './plugins/textrender.js';
 import { registerLayerExDraw } from './plugins/layerex-draw.js';
 import { registerGamepad } from './plugins/gamepad.js';
-import { registerSaveStruct } from './plugins/savestruct.js';
 import { registerGetSample } from './plugins/getsample.js';
 import { registerGetAbout } from './plugins/getabout.js';
 import { registerWindowEx } from './plugins/windowex.js';
@@ -25,7 +23,7 @@ import { registerLayerExBTOA } from './plugins/layerexbtoa.js';
 // does not use every one of them. Unported entries report their status without
 // installing placeholder APIs on unrelated classes.
 const emptyPluginNames = [
-  'alphamovie.dll', 'drawdeviced3d.dll', 'drawdeviced3dz.dll',
+  'drawdeviced3d.dll', 'drawdeviced3dz.dll',
   'extkagparser.dll', 'kagparserex.dll', 'kagparserexb.dll',
   'kaichotrans.dll', 'layereximage.dll',
   'layerexsave.dll',
@@ -35,7 +33,6 @@ const emptyPluginNames = [
   'layerexareaaverage.dll', 'layerexmovie.dll',
   'layerexshimmer.dll', 'lzfs.dll',
   'minizip.dll', 'multiimage.dll', 'perspective.dll',
-  'scriptsex.dll',
   'sqlite3.dll', 'util_generic.dll',
   'util_graph.dll', 'util_system.dll', 'varfile.dll',
   'wutcwf.dll', 'xp3filter.dll',
@@ -46,8 +43,14 @@ const emptyPluginNames = [
 const browserBackedPluginNames = ['wuvorbis.dll', 'wuopus.dll'];
 const registerBrowserBackedPlugin = () => {};
 // Plugins whose interface the core already provides: addFont.cpp attaches
-// System.addFont, which system.js implements with FontFace.
-const coreBackedPluginNames = ['addfont.dll'];
+// System.addFont, which system.js implements with FontFace. ScriptsEx's
+// complete interface is registered by C++ when the runtime creates Scripts.
+// csvParser.dll and saveStruct.dll register from C++ at runtime creation
+// (native/kirikiri/plugins/csvParser.cpp and saveStruct.cpp), so their
+// globals and Array/Dictionary members exist before any script runs.
+const coreBackedPluginNames = [
+  'addfont.dll', 'scriptsex.dll', 'csvparser.dll', 'savestruct.dll',
+];
 const registerCoreBackedPlugin = () => {};
 
 const builtinPlugins = [
@@ -55,11 +58,7 @@ const builtinPlugins = [
   ...browserBackedPluginNames.map(name => ({ names: [name], load: registerBrowserBackedPlugin })),
   ...coreBackedPluginNames.map(name => ({ names: [name], load: registerCoreBackedPlugin })),
   { names: ['fstat.dll'], load: registerFstat },
-  { names: ['savestruct.dll'], load: registerSaveStruct },
-  { names: ['csvparser.dll'], load: context => {
-    const decoder = new TextStreamDecoder();
-    return registerCSVParser(context, async name => decoder.read(await context.storage.read(name)));
-  } },
+  { names: ['alphamovie.dll'], load: registerAlphaMovie },
   { names: ['psbfile.dll'], load: registerPSBFile },
   { names: ['motionplayer.dll', 'emoteplayer.dll'], load: registerMotion },
   { names: ['extrans.dll'], load: registerExtrans },

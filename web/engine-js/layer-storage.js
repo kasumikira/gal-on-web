@@ -4,7 +4,7 @@
 // and bitmap class are available.
 import { Image } from './bitmap.js';
 import { getFontAscentOffsets, clipBlit, blurGlyphImage, fontCoverageImage } from './font.js';
-import { encodeTLG, makeBMP, canvasBytes } from './image-codecs/encode.js';
+import { encodeTLG, makeBMP, canvasBytes } from './codecs/encode.js';
 import { number, truth } from '#krkr/values';
 import { nativeOwner } from '#krkr/native';
 

@@ -87,6 +87,14 @@ ttstr TVPExtractStorageName(const ttstr &name)
     auto position = text.find_last_of("/\\>");
     return ttstr(text.substr(position == std::string::npos ? 0 : position + 1).c_str());
 }
+// core/environ/Application.cpp routes this through the locale config manager,
+// whose GetText returns the message id itself for keys that have no entry. The
+// runtime ships no locale table, so every lookup resolves to its own key; this
+// keeps tTJSBinaryStream::ReadBuffer raising a located read error.
+ttstr TVPGetMessageByLocale(const std::string &key)
+{
+    return ttstr(key);
+}
 [[noreturn]] void TVPThrowExceptionMessage(const tjs_char *message)
 {
     throw eTJSError(message);

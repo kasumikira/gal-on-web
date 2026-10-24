@@ -6,7 +6,7 @@
 import { nativeClass, nativeMethod, nativeProperty } from '#krkr/native';
 import { number, truth, Closure } from '#krkr/values';
 import { Image, toActualColor } from './bitmap.js';
-import { makeBMP, encodeTLG } from './image-codecs/encode.js';
+import { makeBMP, encodeTLG } from './codecs/encode.js';
 
 const unwrap = value => value instanceof Closure ? value.object : value;
 const integer = value => Math.trunc(number(value));

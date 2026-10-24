@@ -13,19 +13,20 @@
     "build:js": "vite build",
     "engine:inventory": "node tools/engine-inventory.mjs",
     "build:vm": "node native/kirikiri/build.mjs",
-    "build:image-codecs": "node native/image-codecs/build.mjs"
+    "build:codecs": "node native/codecs/build.mjs"
   },
   "dependencies": {
     "fft.js": "4.0.4",
     "gl-matrix": "3.4.4",
     "libarchive.js": "2.0.2",
+    "libavjs-webcodecs-bridge": "^0.3.2",
     "lru-cache": "11.5.3",
     "mediabunny": "1.61.3",
     "uuid": "14.0.3"
   },
   "devDependencies": {
-    "@babel/core": "^7.24.0",
-    "@babel/plugin-proposal-decorators": "^7.24.0",
+    "@babel/core": "^7.29.7",
+    "@babel/plugin-proposal-decorators": "^7.29.7",
     "@rollup/plugin-babel": "^7.1.0",
     "concurrently": "9.2.1",
     "vite": "7.1.9"

@@ -2,9 +2,9 @@
 
 ## 执行与职责
 
-脚本引擎使用一个 WASM 模块，包含原版 TJS2 编译器、解释执行器和内建类型。可选归档库 libarchive.js 的解压 WASM 是独立依赖，不承载脚本或 Native 业务。源码与已有字节码由同一个 tTJS 实例处理。KAGParser、Scripts 和 scriptsEx 在该实例内直接使用原版 Variant 与 dispatch。
+脚本引擎使用一个 WASM 模块，包含原版 TJS2 编译器、解释执行器和内建类型。源码与已有字节码由同一个 tTJS 实例处理；KAGParser、Scripts、scriptsEx、csvParser 和 saveStruct 在该实例内使用原版 Variant 与 dispatch。
 
-JS 实现图像、渲染、音频、资源 IO 和其余业务 Native 接口。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
+JS 实现图像、渲染、音频、资源 IO 和 PSBFile 等平台及插件接口。XP3 过滤脚本使用独立的 TJS2 实例执行，`xp3-filter.js` 提供 BinaryAccessor 字节读写桥接。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
 
 ## 初始化配置
 
@@ -16,7 +16,7 @@ JS 实现图像、渲染、音频、资源 IO 和其余业务 Native 接口。�
 
 两个存储均提供异步 `list()` 和 `read(path, offset, length)`：前者返回 `{ path, size }` 文件列表，后者返回指定字节范围的独立 `Uint8Array`，路径使用列表中的拼写。`saveStorage` 额外提供 `write(path, bytes)` 和 `delete(path)`，写入路径是引擎规范化后的虚拟绝对路径。同路径文件由存档存储覆盖游戏存储；XP3 成员和插件媒体保持只读。
 
-HTTP Range 游戏存储由 `web/main.js` 创建；存档默认写入 Go 服务的 SQLite 后端（每个存档文件一行为 BLOB），`?save=memory` 切回刷新即丢失的内存存储。引擎保留 XP3 格式解析、7z 归档适配、虚拟路径、自动路径、插件媒体和写入后的缓存失效语义，不依赖清单格式或网络协议，不提供默认存储后端，也不负责猜测 XP3 入口。
+HTTP Range 游戏存储由 `web/main.js` 创建；存档默认写入 Go 服务的 SQLite 后端，`?save=memory` 切回刷新即丢失的内存存储。引擎维护虚拟路径、自动路径、插件媒体和写入后的缓存失效语义，不依赖清单格式或网络协议，不提供默认存储后端，也不负责猜测 XP3 入口。
 
 ## 对象与生命周期
 
@@ -50,6 +50,10 @@ WASM 通过 JSPI 等待 JS 宿主操作，宿主也能调用脚本。正常调�
 
 ## 源码与构建
 
-正式项目为 `native/kirikiri`。`core/tjs2` 保存语言核心，`core/base` 保存 KAGParser、ScriptMgnIntf 与平台声明，`core/utils` 保存原版工具，`plugins` 保存脚本工具扩展；`runtime.cpp` 保存运行时状态，`runtime-api.cpp`、`runtime-host.cpp`、`runtime-platform.cpp` 分别提供导出 API、宿主绑定和平台接入。
+C++ 项目为 `native/kirikiri`。`core/tjs2` 保存语言核心，`core/base` 保存 KAGParser、ScriptMgnIntf 与平台声明，`core/utils` 保存原版工具，`plugins` 保存 scriptsEx、csvParser 和 saveStruct；`runtime.cpp`、`runtime-api.cpp`、`runtime-host.cpp`、`runtime-platform.cpp` 提供运行时状态、导出 API、宿主绑定和平台接入。
 
 `pnpm build:vm` 生成一个 WASM 运行时及其 JS 加载器；`pnpm build:js` 从 `web/index.html` 打包游戏页面到 `web/build`，同目录的 `main.js` 通过 ES import 加载引擎代码。Go 构建通过 `//go:embed` 把 `web/build` 编入二进制，运行时不再读取该目录。构建缓存位于 `out/kirikiri`，依赖位于 `out/vcpkg_installed`。工具链见 [原生项目说明](../native/kirikiri/README.md)。
+
+## 归档边界
+
+`xp3.js` 在 JS 中解析 XP3 索引、分段和内嵌归档，zlib 分段通过浏览器 DecompressionStream 解压。`seven-zip.js` 通过 npm 的 libarchive.js Worker 提供 7z 读取。当前没有独立的 archive-runtime WASM 构建目标。

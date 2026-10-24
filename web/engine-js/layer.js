@@ -557,18 +557,10 @@ export function createLayerClass(document, {
     update(l, t, w, h) {
       if (arguments.length && arguments.length < 4) throw new Error('TJS Layer.update requires zero or four arguments');
       const node = this.node;
-      if (node.paintPending) return;
-      node.paintPending = true;
-      const owner = retainScriptValue(nativeOwner(this));
-      // UpdateByScript sets CallOnPaint; BeforeCompletion clears it before
-      // dispatch, so another update from onPaint can request a later paint.
-      const complete = async () => {
-        node.paintPending = false;
-        if (owner.invalid) return;
-        await this.onPaint();
-        updateTree(node);
-      };
-      enqueueEvent(complete, () => disposeScriptValue(owner)).catch(error => console.error(error));
+      // BeforeCompletion consumes this flag at the compositor's frame boundary.
+      // An update from onPaint requests the next frame, not another queue turn.
+      node.callOnPaint = true;
+      updateTree(node);
     }
     @nativeMethod
     setCursorPos(x, y) {
@@ -1243,6 +1235,9 @@ export function createLayerClass(document, {
     for (const state of Layer.instances.values()) stopTransitionScheduling(state.node);
   };
   Layer.peekNode = peekNode;
+  // Layer::SetSize for host-side presenters (video pipeline): same path as the
+  // script method, including province resize and the repaint request.
+  Layer.resizeNode = resizeLayer;
   Layer.peekState = owner => {
     try {
       return Layer.state(owner);

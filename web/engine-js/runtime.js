@@ -1,5 +1,5 @@
 import { config, initializeGlobals } from './global.js';
-import { initializeImageCodec } from './image-codecs/wasm.js';
+import { initializeCodecs } from './codecs/wasm.js';
 import { initializeGPU } from './gpu.js';
 import { TJSInterop } from './wasm-vm.js';
 import { Closure } from '#krkr/values';
@@ -25,7 +25,7 @@ import { nativeOwner, defineNativeClass, NativeProperty, installNativeStubs, uni
 import { nativeGlobals } from '#krkr/native-api';
 
 export async function createRuntime(options) {
-  await initializeImageCodec();
+  await initializeCodecs();
   initializeGlobals(options);
   const { entry, gameStorage, saveStorage, wasmURL, document, inform, message } = config;
   const storage = new Storages(gameStorage, saveStorage, entry + '>');
@@ -173,11 +173,11 @@ export async function createRuntime(options) {
   // PhaseVocoder is a global native class in the reference, in addition to the
   // linked WaveSoundBuffer.PhaseVocoder member.
   if (global.WaveSoundBuffer?.PhaseVocoder) register('PhaseVocoder', global.WaveSoundBuffer.PhaseVocoder);
-  // VideoOverlay decodes with mediabunny and renders through layer1/layer2
+  // VideoOverlay decodes with libav/WebCodecs and renders through layer1/layer2
   // (KRMovieLayer's vomLayer path).
   register('VideoOverlay', createVideoOverlayClass({
     Window: global.Window, Layer, storage,
-    getAudioContext,
+    getAudioContext, enqueueEvent,
   }));
   register('Storages', storage);
   vm.attachStorage(storage);

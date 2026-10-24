@@ -8,6 +8,7 @@
 
 ~~~powershell
 pnpm install
+pnpm build:js
 pnpm dev
 ~~~
 
@@ -17,21 +18,26 @@ pnpm dev
 go run ./cmd/galweb -game "D:/games/游戏目录" -addr 127.0.0.1:8080
 ~~~
 
-Go 服务在编译时内嵌前端，直接运行 `go run` 或 `galweb.exe` 前需先执行一次 `pnpm build:js`；`pnpm dev` 会自动先构建前端。浏览器需支持 WebAssembly JSPI。开发服务器通过 /api 代理访问 Go 服务。运行时资源按 HTTP Range 读取，不预先解包整个 XP3。
+Go 构建通过 `//go:embed` 内嵌 `web/build`。运行 `pnpm dev`、`go run` 或 `go build` 前需先执行一次 `pnpm build:js`；`pnpm dev` 并行启动 Go API 与 Vite，开发时页面由 Vite 提供。浏览器需支持 WebAssembly JSPI。开发服务器通过 /api 代理访问 Go 服务。运行时资源按 HTTP Range 读取，不预先解包整个 XP3。
 
 存档默认写入 `tests/savedata.sqlite`（可用 `-save` 指定）：每个存档文件一行，内容存为 BLOB，便于把整个存档目录当单个文件复制复现问题。`?save=memory` 可切回刷新即丢弃的内存存档。
 
 ## 构建
 
-native/kirikiri 是唯一 C++ 项目，按原版 core 与 plugins 布局组织。首次配置、工具链及依赖说明见 [native/kirikiri/README.md](native/kirikiri/README.md)。
+原生构建默认利用全部可用逻辑 CPU：VM 的 CMake/Ninja、vcpkg 和 libav Make 自动按可用 CPU 数并行；Rust Cargo 和 Go 使用各自默认的 CPU 并行调度。显式设置的 `CMAKE_BUILD_PARALLEL_LEVEL`、`VCPKG_MAX_CONCURRENCY` 等工具环境配置仍受尊重。Vite 保持自身的构建调度，串行阶段不会强制拆分。
+
+native/kirikiri 是唯一 C++ 项目，按原版 core 与 plugins 布局组织。先在当前终端加载已安装 SDK 的官方环境脚本，设置 `VCPKG_ROOT`，并确保 CMake、Ninja、Python、Bison 可用。具体步骤见 [native/kirikiri/README.md](native/kirikiri/README.md)。首次构建不依赖 VS Code 或已有 CMake 缓存。
+
+完整构建还需要 Rust stable 和 `wasm32-unknown-unknown` target（`rustup target add wasm32-unknown-unknown`），以及 Go 1.24 或以上。先在 MSYS2 终端加载 SDK 环境并执行 `bash native/libav/build.sh` 构建 WMV 后端，详见 [native/libav/README.md](native/libav/README.md)。再在 PowerShell 中构建其余部分：
 
 ~~~powershell
 pnpm build:vm
+pnpm build:codecs
 pnpm build:js
 go build -o galweb.exe ./cmd/galweb
 ~~~
 
-WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web/build`。Go 构建通过 `//go:embed` 把 `web/build` 编进二进制，因此必须先完成前端构建；生成的 `galweb.exe` 不再依赖外部前端文件。打开 8080 根页面即可进入游戏。开发时仍可通过 `-web` 指定其它前端构建目录覆盖内嵌内容。
+WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web/build`。Go 通过 `web/embed.go` 将前端产物编入二进制；生成的 `galweb.exe` 不再依赖外部前端文件。打开 8080 根页面即可进入游戏。开发时可通过 `-web` 指定其它前端构建目录覆盖内嵌内容。
 
 ## 页面配置
 

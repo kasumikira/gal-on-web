@@ -1,0 +1,15 @@
+[
+  "avcodec",
+  "avformat",
+  "avfilter",
+  "demuxer-asf",
+  "demuxer-mov",
+  "demuxer-matroska",
+  "parser-h264",
+  "parser-aac",
+  "decoder-h264",
+  "decoder-wmv3",
+  "decoder-wmav2",
+  "filter-format",
+  "swscale"
+]

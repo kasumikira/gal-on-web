@@ -1,7 +1,7 @@
 // GraphicsLoaderIntf.cpp: storage lookup, decoded-image cache and _m/_p siblings.
 import { tileImage as tiledImage } from './bitmap.js';
 import { LRUCache } from 'lru-cache';
-import { loadGraphicAsync as loadGraphic } from './image-codecs/async-decode.js';
+import { loadGraphicAsync as loadGraphic } from './codecs/async-decode.js';
 import { gpuBtoa } from './plugins/gpu-btoa.js';
 
 // TVPGraphicCacheSystemLimit: the browser platform's maximum decoded-image

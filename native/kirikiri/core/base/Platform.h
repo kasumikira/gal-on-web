@@ -22,3 +22,7 @@ ttstr TVPExtractStorageName(const ttstr &name);
 void TVPRegisterKAGParser(iTJSDispatch2 *owner);
 void TVPUnregisterKAGParser(iTJSDispatch2 *owner);
 void TVPClearScnearioCache();
+
+// Plugins rebuilt into the runtime; each installs its TJS globals once at startup.
+void TVPRegisterCSVParser();
+void TVPRegisterSaveStruct();

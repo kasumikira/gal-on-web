@@ -40,6 +40,7 @@ export function createWindowClass(BasicDrawDevice) {
       canvas.width = 0; canvas.height = 0; canvas.hidden = true;
       canvas.style.maxWidth = '100%'; canvas.style.maxHeight = '100%';
       canvas.style.touchAction = 'none';
+      canvas.addEventListener('pointermove', () => { canvas.style.cursor = ''; });
       container.append(canvas);
       const state = {
         owner, canvas, handle: Array.from(Window.instances.values()).length + 1,
@@ -121,7 +122,7 @@ export function createWindowClass(BasicDrawDevice) {
     @nativeMethod setMinSize(w,h){ if(arguments.length<2) throw new Error('TJS Window.setMinSize requires 2 arguments'); }
     @nativeMethod setMaxSize(w,h){ if(arguments.length<2) throw new Error('TJS Window.setMaxSize requires 2 arguments'); }
     @nativeMethod setZoom(numer,denom){ if(arguments.length<2) throw new Error('TJS Window.setZoom requires 2 arguments'); }
-    @nativeMethod hideMouseCursor(){ return unimplemented('Window.hideMouseCursor').apply(this, arguments); }
+    @nativeMethod hideMouseCursor(){ this.canvas.style.cursor = 'none'; }
     @nativeMethod async postInputEvent(name,params){
       if(!arguments.length) throw new Error('TJS Window.postInputEvent requires an event name');
       if (!['onKeyDown', 'onKeyUp', 'onKeyPress'].includes(name)) throw new Error(`Unknown input event: ${name}`);

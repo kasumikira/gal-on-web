@@ -18,6 +18,8 @@ add_executable(tjs-runtime runtime.cpp
     runtime-platform.cpp
     core/base/KAGParser.cpp
     core/base/ScriptMgnIntf.cpp
+    plugins/csvParser.cpp
+    plugins/saveStruct.cpp
     plugins/scriptsEx.cpp
     core/utils/md5.c
 )
@@ -32,4 +34,3 @@ target_link_options(tjs-runtime PRIVATE --no-entry -fwasm-exceptions -g2 --emit-
   "-sJSPI_EXPORTS=['tjs_execute_source','tjs_execute_bytecode','tjs_object_get','tjs_object_set','tjs_object_call','tjs_object_clone','tjs_object_construct','tjs_object_invalidate','tjs_runtime_shutdown','tjs_runtime_destroy','tjs_value_release_async','tjs_runtime_collect','tjs_borrow_end','tjs_window_objects']"
   "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['stringToUTF16','UTF16ToString','HEAPU8','HEAPU32']")
-
