@@ -217,6 +217,9 @@ void Runtime::shutdown()
         held.mapped().value.Clear();
     }
     engine->Shutdown();
+    pluginValues.clear();
+    pluginClasses.clear();
+    loadedPlugins.clear();
     // Native Invalidate callbacks must have released every owner-held
     // value. Do not guess an order for any handle left after finalization.
     if (!values.empty())

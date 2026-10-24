@@ -18,10 +18,7 @@ import { initializeConstants } from './constants.js';
 import { createDebugClass } from './debug.js';
 import { createSystem } from './system.js';
 import { createTimerClass, createAsyncTriggerClass } from './timer.js';
-import { createRectClass } from './rect.js';
-import { createMenuItemClass } from './menu.js';
-import { createPadClass } from './pad.js';
-import { nativeOwner, defineNativeClass, NativeProperty, installNativeStubs, unimplemented, retainScriptValue, disposeScriptValue } from '#krkr/native';
+import { nativeOwner, defineNativeClass, installNativeStubs, unimplemented, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { nativeGlobals } from '#krkr/native-api';
 
 export async function createRuntime(options) {
@@ -52,9 +49,9 @@ export async function createRuntime(options) {
     return vm.registerGlobal(name, value);
   };
   for (const [name, value] of Object.entries(initializeConstants())) register(name, value);
-  register('Rect', createRectClass());
   let plugins;
   plugins = new Plugins({
+    nativePlugins: (operation, name) => vm.nativePlugins(operation, name),
     global,
     storage,
     registerGlobal: register,
@@ -79,11 +76,6 @@ export async function createRuntime(options) {
   register('Plugins', plugins);
   register('BasicDrawDevice', createBasicDrawDeviceClass());
   register('Window', createWindowClass(global.BasicDrawDevice));
-  register('MenuItem', createMenuItemClass(global.Window));
-  global.Window.defineMember('menu',new NativeProperty(async owner=>{
-    const state = global.Window.state(owner);
-    return state.menu ??= await vm.call(global.MenuItem,owner,[owner,new Closure(owner,owner)],true);
-  }));
   const paintAll = () => compositor.requestPaintAll();
   // TVPFindGraphicLoadHandler (GraphicsLoaderIntf.cpp 1583): extension-less
   // graphic names try each registered graphic extension until a storage
@@ -187,7 +179,6 @@ export async function createRuntime(options) {
   }));
   const system = createSystem({vm,enqueueEvent,storage,graphicCache});
   register('System', system.api);
-  register('Pad', createPadClass());
   for (const name of nativeGlobals) {
     if (!global[name]) register(name, defineNativeClass(name, { initialize: unimplemented(`${name}: 原生类尚未实现`) }));
   }

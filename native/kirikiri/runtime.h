@@ -1,6 +1,7 @@
 #pragma once
 #include "tjs.h"
 #include "tjsError.h"
+#include "core/plugin/PluginRegistry.h"
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -26,6 +27,7 @@ struct Runtime : iTJSConsoleOutput
     {
         int reference, host = 0;
         std::vector<tTJSVariant> windowObjects;
+        tTJSVariant windowMenu;
         bool windowObjectsLocked = false;
     };
     std::map<iTJSDispatch2 *, Owner> owners;
@@ -41,6 +43,9 @@ struct Runtime : iTJSConsoleOutput
     std::unordered_map<iTJSDispatch2 *, std::set<int>> exportsByObject;
     int next = 1, alive = 0, invalidations = 0, storage = 0;
     bool stopped = false;
+    std::set<std::u16string> loadedPlugins;
+    std::map<const void *, NativePluginClassInfo> pluginClasses;
+    std::map<const void *, tTJSVariant> pluginValues;
     std::u16string error, text, diagnostic;
     Runtime();
     void Print(const tjs_char *message) override;

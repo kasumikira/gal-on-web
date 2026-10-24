@@ -201,6 +201,8 @@ export function createWindowClass(BasicDrawDevice) {
     @nativeProperty set innerHeight(value) { resize(this,this.width,value); }
     @nativeProperty get caption() { return this.caption; }
     @nativeProperty set caption(value) { this.caption = String(value); document.title = this.caption; }
+    @nativeProperty get enabled() { return Number(this.enabled); }
+    @nativeProperty set enabled(value) { this.enabled = !!truth(value); }
     @nativeProperty get visible() { return Number(this.visible); }
     @nativeProperty set visible(value) { this.visible=!!truth(value); this.canvas.hidden=!this.visible; }
     @nativeProperty get left() { return 0; }

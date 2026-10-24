@@ -1,10 +1,9 @@
 import { reportUnimplemented } from '#krkr/native';
 import { registerFstat } from './plugins/fstat.js';
 import { registerAlphaMovie } from './plugins/alphamovie.js';
-import { registerPSBFile } from './plugins/psb-plugin.js';
+import { registerPSBMedia } from './plugins/psb-media.js';
 import { registerMotion } from './plugins/motion.js';
 import { registerExtrans } from './plugins/extrans.js';
-import { registerTextRender } from './plugins/textrender.js';
 import { registerLayerExDraw } from './plugins/layerex-draw.js';
 import { registerGamepad } from './plugins/gamepad.js';
 import { registerGetSample } from './plugins/getsample.js';
@@ -13,7 +12,6 @@ import { registerWindowEx } from './plugins/windowex.js';
 import { registerPackinOne } from './plugins/packinone.js';
 import { registerWin32Dialog } from './plugins/win32dialog.js';
 import { registerFftGraph } from './plugins/fftgraph.js';
-import { registerKirikiroid2 } from './plugins/kirikiroid2.js';
 import { registerDirList } from './plugins/dirlist.js';
 import { registerShrinkCopy } from './plugins/shrinkcopy.js';
 import { registerLayerExRaster } from './plugins/layerexraster.js';
@@ -27,8 +25,8 @@ const emptyPluginNames = [
   'extkagparser.dll', 'kagparserex.dll', 'kagparserexb.dll',
   'kaichotrans.dll', 'layereximage.dll',
   'layerexsave.dll',
-  'expat.dll', 'extnagano.dll',
-  'gfxeffect.dll', 'json.dll',
+  'extnagano.dll',
+  'gfxeffect.dll',
   'layerexalpha.dll',
   'layerexareaaverage.dll', 'layerexmovie.dll',
   'layerexshimmer.dll', 'lzfs.dll',
@@ -42,15 +40,8 @@ const emptyPluginNames = [
 // Vorbis and Opus gain-query callbacks already exposed by the browser backend.
 const browserBackedPluginNames = ['wuvorbis.dll', 'wuopus.dll'];
 const registerBrowserBackedPlugin = () => {};
-// Plugins whose interface the core already provides: addFont.cpp attaches
-// System.addFont, which system.js implements with FontFace. ScriptsEx's
-// complete interface is registered by C++ when the runtime creates Scripts.
-// csvParser.dll and saveStruct.dll register from C++ at runtime creation
-// (native/kirikiri/plugins/csvParser.cpp and saveStruct.cpp), so their
-// globals and Array/Dictionary members exist before any script runs.
-const coreBackedPluginNames = [
-  'addfont.dll', 'scriptsex.dll', 'csvparser.dll', 'savestruct.dll',
-];
+// System.addFont is supplied by the browser backend.
+const coreBackedPluginNames = ['addfont.dll'];
 const registerCoreBackedPlugin = () => {};
 
 const builtinPlugins = [
@@ -59,10 +50,9 @@ const builtinPlugins = [
   ...coreBackedPluginNames.map(name => ({ names: [name], load: registerCoreBackedPlugin })),
   { names: ['fstat.dll'], load: registerFstat },
   { names: ['alphamovie.dll'], load: registerAlphaMovie },
-  { names: ['psbfile.dll'], load: registerPSBFile },
+  { names: ['psbfile.dll'], load: ({ storage }) => { if (storage) registerPSBMedia(storage); } },
   { names: ['motionplayer.dll', 'emoteplayer.dll'], load: registerMotion },
   { names: ['extrans.dll'], load: registerExtrans },
-  { names: ['textrender.dll'], load: registerTextRender },
   { names: ['layerexdraw.dll'], load: registerLayerExDraw },
   { names: ['gamepad.dll'], load: registerGamepad },
   { names: ['getsample.dll'], load: registerGetSample },
@@ -71,7 +61,6 @@ const builtinPlugins = [
   { names: ['packinone.dll'], load: registerPackinOne },
   { names: ['win32dialog.dll'], load: registerWin32Dialog },
   { names: ['fftgraph.dll'], load: registerFftGraph },
-  { names: ['kirikiroid2.dll'], load: registerKirikiroid2 },
   { names: ['dirlist.dll'], load: registerDirList },
   { names: ['shrinkcopy.dll'], load: registerShrinkCopy },
   { names: ['layerexraster.dll'], load: registerLayerExRaster },
@@ -99,13 +88,14 @@ export class Plugins {
   async link(name) {
     if (!arguments.length) throw new Error('Plugins.link requires a name');
     const key = String(name).toLowerCase();
+    const native = await this.context.nativePlugins?.(0, key);
     if (this.loaded.has(key)) return;
     const load = this.modules.get(key);
-    if (!load) {
+    if (!native && !load) {
       reportUnimplemented(`Plugins.link("${key}"): 插件入口未注册`);
       return;
     }
-    const unload = await load(this.context);
+    const unload = await load?.(this.context);
     if (typeof unload === 'function') this.unloaders.set(key, unload);
     this.loaded.add(key);
   }
@@ -119,10 +109,9 @@ export class Plugins {
     }
     return 1;
   }
-  getList() {
-    const result = [];
-    result.push(...Array.from(this.loaded).sort());
-    return result;
+  async getList() {
+    const native = await this.context.nativePlugins?.(1) ?? [];
+    return [...new Set([...this.loaded, ...native])].sort();
   }
 }
 

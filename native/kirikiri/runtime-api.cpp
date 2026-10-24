@@ -1,3 +1,6 @@
+#include "RectItf.h"
+#include "PadIntf.h"
+#include "MenuItemIntf.h"
 #include "runtime.h"
 #include "ScriptMgnIntf.h"
 #include "KAGParser.h"
@@ -40,13 +43,24 @@ extern "C"
         klass->Release();
         runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, TJS_W("KAGParser"), nullptr, &value, nullptr);
         auto *scripts = TVPCreateNativeClass_Scripts();
-        RegisterScriptsExtensions(scripts);
         tTJSVariant scriptsValue(scripts, nullptr);
         scripts->Release();
         runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, TJS_W("Scripts"), nullptr, &scriptsValue, nullptr);
-        TVPRegisterCSVParser();
-        TVPRegisterSaveStruct();
+        for (auto *coreClass : {TVPCreateNativeClass_Rect(), TVPCreateNativeClass_Pad(), TVPCreateNativeClass_MenuItem()}) {
+            tTJSVariant held(coreClass, nullptr);
+            coreClass->Release();
+            success(runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, coreClass->GetClassName().c_str(), nullptr, &held, nullptr));
+        }
+        TVPInitializePlugins();
         return runtime;
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_plugins(Runtime *r, int operation, const tjs_char *name)
+    {
+        return checked(r, [&] {
+            if (operation == 0) return r->keep(tTJSVariant((tjs_int)TVPLinkNativePlugin(name)));
+            if (operation == 1) return r->keep(TVPGetLoadedNativePlugins());
+            throw eTJSError(TJS_W("Unknown plugin operation"));
+        });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_kag_parsers(Runtime *r)
     {
@@ -199,6 +213,10 @@ extern "C"
             if (operation == 2) {
                 state.windowObjectsLocked = true;
                 auto objects = std::move(state.windowObjects);
+                if (state.windowMenu.Type() != tvtVoid) {
+                    objects.push_back(state.windowMenu);
+                    state.windowMenu.Clear();
+                }
                 std::exception_ptr failure;
                 for (auto &entry : objects) {
                     try {
@@ -367,6 +385,14 @@ extern "C"
     }
     EMSCRIPTEN_KEEPALIVE int tjs_array_count(Runtime *r, int id)
     {
-        return TJSGetArrayElementCount(r->value(id).AsObjectNoAddRef());
+        auto *object = r->value(id).AsObjectNoAddRef();
+        iTJSNativeInstance *instance = nullptr;
+        if (TJS_SUCCEEDED(object->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+                TJSGetArrayClassID(), &instance)))
+            return static_cast<tTJSArrayNI *>(instance)->Items.size();
+        // Read-only PSB arrays implement the dispatch count without Array NI.
+        tjs_int count;
+        success(object->GetCount(&count, nullptr, nullptr, nullptr));
+        return count;
     }
 }

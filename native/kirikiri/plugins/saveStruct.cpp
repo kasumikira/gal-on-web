@@ -2,8 +2,7 @@
 // saveStruct native methods, adapted from cpp/plugins/saveStruct.cpp.
 //
 // The reference registers through ncbind (NCB_ATTACH_CLASS / NCB_POST_REGIST_CALLBACK).
-// This port keeps the serializer body verbatim and registers the members directly
-// on the Array and Dictionary class objects.
+// The serializer uses the same declarations, with Array.count held per Runtime.
 //
 // The reference writes raw UTF-16 code units through a binary stream, with no
 // text-stream BOM, so save2 keeps that framing rather than the BOM-prefixed
@@ -11,6 +10,7 @@
 //---------------------------------------------------------------------------
 #include "MemoryOutput.h"
 #include "ScriptMgnIntf.h"
+#include "ncbind.hpp"
 #include "tjsNative.h"
 
 #include <fmt/format.h>
@@ -167,7 +167,10 @@ static void getDictString(iTJSDispatch2 *dict, tTVPStringStream *writer)
 }
 
 // Array class member (Array.count), resolved after registration.
-static iTJSDispatch2 *ArrayCountProp = nullptr;
+static const char arrayCountKey = 0;
+static iTJSDispatch2 *arrayCountProp() {
+    return TVPPluginValue(&arrayCountKey).AsObjectNoAddRef();
+}
 
 static void getArrayString(iTJSDispatch2 *array, tTVPStringStream *writer)
 {
@@ -175,7 +178,7 @@ static void getArrayString(iTJSDispatch2 *array, tTVPStringStream *writer)
     tjs_int count = 0;
     {
         tTJSVariant result;
-        if (TJS_SUCCEEDED(ArrayCountProp->PropGet(0, nullptr, nullptr, &result, array)))
+        if (TJS_SUCCEEDED(arrayCountProp()->PropGet(0, nullptr, nullptr, &result, array)))
         {
             count = result;
         }
@@ -261,7 +264,7 @@ class ArrayAdd
         tjs_int count = 0;
         {
             tTJSVariant countResult;
-            if (TJS_SUCCEEDED(ArrayCountProp->PropGet(0, nullptr, nullptr, &countResult, objthis)))
+            if (TJS_SUCCEEDED(arrayCountProp()->PropGet(0, nullptr, nullptr, &countResult, objthis)))
             {
                 count = countResult;
             }
@@ -342,13 +345,6 @@ class DictAdd
 //---------------------------------------------------------------------------
 // Registration
 //---------------------------------------------------------------------------
-static void registerMember(iTJSDispatch2 *klass, const tjs_char *classname, const tjs_char *name,
-                           tTJSNativeClassMethodCallback callback, tjs_uint32 flags)
-{
-    static_cast<tTJSNativeClass *>(klass)->RegisterNCM(name, TJSCreateNativeClassMethod(callback),
-                                                        classname, nitMethod, flags);
-}
-
 static iTJSDispatch2 *classObject(const tjs_char *name, tTJSVariant &held)
 {
     // TVPExecuteExpression is the reference's lookup path for Array/Dictionary.
@@ -370,30 +366,16 @@ static void PostRegistCallback()
     }
     // Held for the runtime's lifetime: the reference only releases it from
     // NCB_PRE_UNREGIST_CALLBACK, a DLL-unload path this build has no equivalent for.
-    ArrayCountProp = val.AsObject();
+    TVPPluginValue(&arrayCountKey) = val;
 }
 
-void TVPRegisterSaveStruct()
-{
-    tTJSVariant arrayValue, dictValue;
-    iTJSDispatch2 *array = classObject(TJS_W("Array"), arrayValue);
-    iTJSDispatch2 *dict = classObject(TJS_W("Dictionary"), dictValue);
-    if (!array || !dict)
-        TVPThrowExceptionMessage(TJS_W("can't get Array/Dictionary"));
-
-    // Array members are instance methods (flags 0).
-    registerMember(array, TJS_W("Array"), TJS_W("save2"), &ArrayAdd::save2, 0);
-    registerMember(array, TJS_W("Array"), TJS_W("saveStruct2"), &ArrayAdd::saveStruct2, 0);
-    registerMember(array, TJS_W("Array"), TJS_W("toStructString"), &ArrayAdd::toStructString, 0);
-
-    // ncbind preserves TJS_STATICMEMBER: callers bind the dictionary with
-    // (Dictionary.toStructString incontextof value)(). Instance members would
-    // become dictionary data, even when marked hidden.
-    registerMember(dict, TJS_W("Dictionary"), TJS_W("saveStruct2"), &DictAdd::saveStruct2,
-                   TJS_STATICMEMBER);
-    registerMember(dict, TJS_W("Dictionary"), TJS_W("toStructString"), &DictAdd::toStructString,
-                   TJS_STATICMEMBER);
-
-    PostRegistCallback();
+NCB_ATTACH_CLASS(ArrayAdd, Array) {
+    RawCallback("save2", &ArrayAdd::save2, 0);
+    RawCallback("saveStruct2", &ArrayAdd::saveStruct2, 0);
+    RawCallback("toStructString", &ArrayAdd::toStructString, 0);
 }
-//---------------------------------------------------------------------------
+NCB_ATTACH_CLASS(DictAdd, Dictionary) {
+    RawCallback("saveStruct2", &DictAdd::saveStruct2, TJS_STATICMEMBER);
+    RawCallback("toStructString", &DictAdd::toStructString, TJS_STATICMEMBER);
+}
+NCB_POST_REGIST_CALLBACK(PostRegistCallback);

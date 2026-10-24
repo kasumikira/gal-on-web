@@ -291,6 +291,8 @@ static ttstr placedPath(const ttstr &name)
     invoke(activeRuntime, activeRuntime->storage, 9, nullptr, &result, 1, args);
     return ttstr(result);
 }
+ttstr TVPGetPlacedPath(const ttstr &name) { return placedPath(name); }
+
 void TVPExecuteStorage(const ttstr &name, iTJSDispatch2 *context, tTJSVariant *result, bool expression,
                        const tjs_char *mode)
 {

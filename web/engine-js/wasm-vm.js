@@ -27,6 +27,9 @@ const INTERPRETER_CLASSES = [
   "Date",
   "KAGParser",
   "Scripts",
+  "Rect",
+  "Pad",
+  "MenuItem",
 ];
 const TJS_MEMBER_ENSURE_IGNORE_PROPERTY = 0x0a00;
 const TJS_HIDDEN_MEMBER = 0x1000;
@@ -593,6 +596,10 @@ export class TJSInterop {
   }
   keys(value) {
     return this.withReference(value, id => this.readArray(this.module._tjs_object_keys(this.runtime, id)));
+  }
+  async nativePlugins(operation, name = '') {
+    const id = await this.withString(name, namePtr => this.module._tjs_plugins(this.runtime, operation, namePtr));
+    return operation === 1 ? this.readArray(id) : Boolean(this.decode(id));
   }
   readArray(id) {
     if (!id) this.fail();

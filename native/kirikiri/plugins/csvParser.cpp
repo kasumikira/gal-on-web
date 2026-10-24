@@ -1,16 +1,15 @@
 //---------------------------------------------------------------------------
 // CSVParser native class, adapted from cpp/plugins/csvParser.cpp.
 //
-// The reference registers through ncbind from a plugin DLL and takes Array.clear
-// as a post-registration property it never reads. This port keeps the parser
-// body verbatim and registers the class directly on the global object, the same
-// way plugins/scriptsEx.cpp replaces ncbind.
+// The original TJS class is installed through an ncbind module callback.
+// The unused reference Array.clear registration cache is omitted.
 //
 // parse() invokes the target's doLine in the current call frame, matching the
 // reference's nested FuncCall rather than the asynchronous JS implementation it
 // replaces.
 //---------------------------------------------------------------------------
 #include "ScriptMgnIntf.h"
+#include "ncbind.hpp"
 #include "tjsArray.h"
 #include "tjsNative.h"
 
@@ -445,3 +444,5 @@ void TVPRegisterCSVParser()
                                                        nullptr, &value, nullptr);
 }
 //---------------------------------------------------------------------------
+
+NCB_PRE_REGIST_CALLBACK(TVPRegisterCSVParser);

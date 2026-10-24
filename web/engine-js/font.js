@@ -1,4 +1,4 @@
-import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner } from '#krkr/native';
+import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner, constructNative } from '#krkr/native';
 import { number, truth, Closure } from '#krkr/values';
 import { Image, colorBytes } from './bitmap.js';
 import { getGPU, QUAD_VERTEX } from './gpu.js';
@@ -140,17 +140,6 @@ export function createFontInstance(layerNode) {
   // TVPCreateFontObject: a Font native instance bound to a layer node.
   if (!LayerFontClass) throw new Error('TJS Font class is not registered');
   return createNativeInstance(LayerFontClass, { layer: layerNode });
-}
-
-// TVPCreateRectObject returns a real Rect native instance, including its
-// width/height properties and methods.  Constructing it here mirrors the VM's
-// NativeClass path because getGlyphDrawRect is a synchronous native method.
-function createRectObject(Rect, left, top, right, bottom) {
-  if (!Rect) throw new Error('TJS Font.getGlyphDrawRect requires the Rect native class');
-  const owner = createNativeInstance(Rect, Rect.initialize());
-  const rect = Rect.state(owner).rect;
-  rect.left = left; rect.top = top; rect.right = right; rect.bottom = bottom;
-  return owner;
 }
 
 const PRERENDERED_HEADER = new TextEncoder().encode('TVP pre-rendered font\x1a');
@@ -625,10 +614,10 @@ export function createFontClass(document, { storage, Rect } = {}) {
     @nativeMethod getEscWidthY(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthY requires text'); const f = fontOf(this); return measure(f, String(args[0])).width * -Math.sin(f.angle * Math.PI / 1800); }
     @nativeMethod getEscHeightX(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightX requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.sin(f.angle * Math.PI / 1800); }
     @nativeMethod getEscHeightY(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightY requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.cos(f.angle * Math.PI / 1800); }
-    @nativeMethod getGlyphDrawRect(...args) {
+    @nativeMethod async getGlyphDrawRect(...args) {
       if (arguments.length < 1) throw new Error('TJS Font.getGlyphDrawRect requires text');
       const font = fontOf(this), text = String(args[0]);
-      if (!text.length) return createRectObject(Rect, 0, 0, 0, 0);
+      if (!text.length) return constructNative(this, Rect, 0, 0, 0, 0);
       const size = Math.abs(font.height) | 0;
       let left = 0, top = -Math.trunc(size * 0.8), right = measure(font, text).width, bottom = size - Math.trunc(size * 0.8);
       if (document?.createElement) {
@@ -643,7 +632,7 @@ export function createFontClass(document, { storage, Rect } = {}) {
       // Canvas exposes no portable underline/strikeout metrics; retain the
       // native text extent convention by extending to the advance width.
       if (font.flags & (0x0400 | 0x0800)) right = Math.max(right, measure(font, text).width);
-      return createRectObject(Rect, left, top, right, bottom);
+      return constructNative(this, Rect, left, top, right, bottom);
     }
     @nativeMethod async mapPrerenderedFont(...args) {
       if (!args.length) throw new Error('TJS Font.mapPrerenderedFont requires a storage');

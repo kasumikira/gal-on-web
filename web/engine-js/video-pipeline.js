@@ -185,7 +185,7 @@ export function uploadVideoCanvas(image, canvas) {
 // Direct sample upload; transforms use a reusable GPU source texture.
 let sampleImage = null;
 function uploadVideoSample(image, sample) {
-  // Borrow synchronously: MediaBunny closes temporary VideoFrames next microtask.
+  // Upload the borrowed source before the caller releases the sample.
   const source = sample.toCanvasImageSource();
   const width = source.displayWidth ?? source.width;
   const height = source.displayHeight ?? source.height;

@@ -1,4 +1,6 @@
-// Adapted from cpp/plugins/scriptsEx.cpp: direct registration replaces ncbind.
+// Reference ScriptsEx implementation and NCB module declarations.
+#define NCB_MODULE_NAME TJS_W("ScriptsEx.dll")
+#include "ncbind.hpp"
 #include "ScriptMgnIntf.h"
 #include "tjsArray.h"
 #include "tjsDictionary.h"
@@ -790,102 +792,29 @@ tjs_error ScriptsAdd::safeEvalStorage(tTJSVariant *result, tjs_int numparams,
 }
 //----------------------------------------------------------------------
 
-void RegisterScriptsExtensions(tTJSNativeClass *klass)
-{
-    klass->RegisterNCM(TJS_W("getObjectKeys"), TJSCreateNativeClassMethod(ScriptsAdd::getKeys), TJS_W("Scripts"),
-                       nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("getObjectCount"), TJSCreateNativeClassMethod(ScriptsAdd::getCount), TJS_W("Scripts"),
-                       nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("foreach"), TJSCreateNativeClassMethod(ScriptsAdd::foreach), TJS_W("Scripts"), nitMethod,
-                       TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("getMD5HashString"), TJSCreateNativeClassMethod(ScriptsAdd::getMD5HashString),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("propSet"), TJSCreateNativeClassMethod(ScriptsAdd::propSet), TJS_W("Scripts"), nitMethod,
-                       TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("propGet"), TJSCreateNativeClassMethod(ScriptsAdd::propGet), TJS_W("Scripts"), nitMethod,
-                       TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("safeEvalStorage"), TJSCreateNativeClassMethod(ScriptsAdd::safeEvalStorage),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("getObjectContext"),
-                       TJSCreateNativeClassMethod(
-                           [](tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *) -> tjs_error {
-                               if (count < 1)
-                                   return TJS_E_BADPARAMCOUNT;
-                               auto value = ScriptsAdd::getObjectContext(*args[0]);
-                               if (result)
-                                   *result = value;
-                               return TJS_S_OK;
-                           }),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("isNullContext"),
-                       TJSCreateNativeClassMethod(
-                           [](tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *) -> tjs_error {
-                               if (count < 1)
-                                   return TJS_E_BADPARAMCOUNT;
-                               auto value = ScriptsAdd::isNullContext(*args[0]);
-                               if (result)
-                                   *result = value;
-                               return TJS_S_OK;
-                           }),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("equalStruct"),
-                       TJSCreateNativeClassMethod(
-                           [](tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *) -> tjs_error {
-                               if (count < 2)
-                                   return TJS_E_BADPARAMCOUNT;
-                               auto value = ScriptsAdd::equalStruct(*args[0], *args[1]);
-                               if (result)
-                                   *result = value;
-                               return TJS_S_OK;
-                           }),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("equalStructNumericLoose"),
-                       TJSCreateNativeClassMethod(
-                           [](tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *) -> tjs_error {
-                               if (count < 2)
-                                   return TJS_E_BADPARAMCOUNT;
-                               auto value = ScriptsAdd::equalStructNumericLoose(*args[0], *args[1]);
-                               if (result)
-                                   *result = value;
-                               return TJS_S_OK;
-                           }),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(TJS_W("clone"),
-                       TJSCreateNativeClassMethod(
-                           [](tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *) -> tjs_error {
-                               if (count < 1)
-                                   return TJS_E_BADPARAMCOUNT;
-                               auto value = ScriptsAdd::clone(*args[0]);
-                               if (result)
-                                   *result = value;
-                               return TJS_S_OK;
-                           }),
-                       TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    klass->RegisterNCM(
-        TJS_W("rehash"),
-        TJSCreateNativeClassMethod([](tTJSVariant *, tjs_int, tTJSVariant **, iTJSDispatch2 *) -> tjs_error {
-            TJSDoRehash();
-            return TJS_S_OK;
-        }),
-        TJS_W("Scripts"), nitMethod, TJS_STATICMEMBER);
-    {
-        tTJSVariant value((tjs_int)TJS_MEMBERENSURE);
-        klass->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER, TJS_W("pfMemberEnsure"), nullptr, &value, klass);
-    }
-    {
-        tTJSVariant value((tjs_int)TJS_MEMBERMUSTEXIST);
-        klass->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER, TJS_W("pfMemberMustExist"), nullptr, &value, klass);
-    }
-    {
-        tTJSVariant value((tjs_int)TJS_IGNOREPROP);
-        klass->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER, TJS_W("pfIgnoreProp"), nullptr, &value, klass);
-    }
-    {
-        tTJSVariant value((tjs_int)TJS_HIDDENMEMBER);
-        klass->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER, TJS_W("pfHiddenMember"), nullptr, &value, klass);
-    }
-    {
-        tTJSVariant value((tjs_int)TJS_STATICMEMBER);
-        klass->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER, TJS_W("pfStaticMember"), nullptr, &value, klass);
-    }
-}
+NCB_ATTACH_CLASS(ScriptsAdd, Scripts) {
+    RawCallback(TJS_W("getObjectKeys"), &ScriptsAdd::getKeys, TJS_STATICMEMBER);
+    RawCallback(TJS_W("getObjectCount"), &ScriptsAdd::getCount,
+                TJS_STATICMEMBER);
+    NCB_METHOD(getObjectContext);
+    NCB_METHOD(isNullContext);
+    NCB_METHOD(equalStruct);
+    NCB_METHOD(equalStructNumericLoose);
+    RawCallback(TJS_W("foreach"), &ScriptsAdd::foreach, TJS_STATICMEMBER);
+    RawCallback(TJS_W("getMD5HashString"), &ScriptsAdd::getMD5HashString,
+                TJS_STATICMEMBER);
+    NCB_METHOD(clone);
+
+    RawCallback("propSet", &ScriptsAdd::propSet, TJS_STATICMEMBER);
+    RawCallback("propGet", &ScriptsAdd::propGet, TJS_STATICMEMBER);
+    Variant(TJS_W("pfMemberEnsure"), TJS_MEMBERENSURE);
+    Variant(TJS_W("pfMemberMustExist"), TJS_MEMBERMUSTEXIST);
+    Variant(TJS_W("pfIgnoreProp"), TJS_IGNOREPROP);
+    Variant(TJS_W("pfHiddenMember"), TJS_HIDDENMEMBER);
+    Variant(TJS_W("pfStaticMember"), TJS_STATICMEMBER);
+
+    RawCallback(TJS_W("safeEvalStorage"), &ScriptsAdd::safeEvalStorage,
+                TJS_STATICMEMBER);
+};
+
+NCB_ATTACH_FUNCTION(rehash, Scripts, TJSDoRehash);

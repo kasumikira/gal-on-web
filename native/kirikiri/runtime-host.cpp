@@ -1,3 +1,4 @@
+#include "MenuItemIntf.h"
 #include "runtime.h"
 #include "tjsNative.h"
 #include "tjsArray.h"
@@ -359,6 +360,7 @@ public:
     HostClass(Runtime *r, const tjs_char *name, int initialize) : tTJSNativeClass(name), r(r), initialize(initialize)
     {
         SetClassID(TJSRegisterNativeClass(name));
+        if (!TJS_strcmp(name, TJS_W("Window"))) TVPRegisterWindowMenu(this);
         // tjsNative.h: TJS_DECL_EMPTY_FINALIZE_METHOD has no instance lookup.
         RegisterNCM(TJS_W("finalize"), TJSCreateNativeClassMethod([](tTJSVariant *, tjs_int, tTJSVariant **, iTJSDispatch2 *) -> tjs_error
                                                                   { return TJS_S_OK; }),

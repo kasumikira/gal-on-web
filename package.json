@@ -21,7 +21,6 @@
     "libarchive.js": "2.0.2",
     "libavjs-webcodecs-bridge": "^0.3.2",
     "lru-cache": "11.5.3",
-    "mediabunny": "1.61.3",
     "uuid": "14.0.3"
   },
   "devDependencies": {
