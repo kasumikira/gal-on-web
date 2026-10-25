@@ -1,5 +1,4 @@
 import { reportUnimplemented } from '#krkr/native';
-import { registerFstat } from './plugins/fstat.js';
 import { registerAlphaMovie } from './plugins/alphamovie.js';
 import { registerPSBMedia } from './plugins/psb-media.js';
 import { registerMotion } from './plugins/motion.js';
@@ -12,7 +11,6 @@ import { registerWindowEx } from './plugins/windowex.js';
 import { registerPackinOne } from './plugins/packinone.js';
 import { registerWin32Dialog } from './plugins/win32dialog.js';
 import { registerFftGraph } from './plugins/fftgraph.js';
-import { registerDirList } from './plugins/dirlist.js';
 import { registerShrinkCopy } from './plugins/shrinkcopy.js';
 import { registerLayerExRaster } from './plugins/layerexraster.js';
 import { registerLayerExBTOA } from './plugins/layerexbtoa.js';
@@ -33,7 +31,7 @@ const emptyPluginNames = [
   'minizip.dll', 'multiimage.dll', 'perspective.dll',
   'sqlite3.dll', 'util_generic.dll',
   'util_graph.dll', 'util_system.dll', 'varfile.dll',
-  'wutcwf.dll', 'xp3filter.dll',
+  'wutcwf.dll',
 ];
 
 // Ogg decoding is handled by WaveSoundBuffer.open through Web Audio, with both
@@ -48,7 +46,6 @@ const builtinPlugins = [
   ...emptyPluginNames.map(name => ({ names: [name], load: () => reportUnimplemented(`Plugins.link("${name}"): 插件尚未实现`) })),
   ...browserBackedPluginNames.map(name => ({ names: [name], load: registerBrowserBackedPlugin })),
   ...coreBackedPluginNames.map(name => ({ names: [name], load: registerCoreBackedPlugin })),
-  { names: ['fstat.dll'], load: registerFstat },
   { names: ['alphamovie.dll'], load: registerAlphaMovie },
   { names: ['psbfile.dll'], load: ({ storage }) => { if (storage) registerPSBMedia(storage); } },
   { names: ['motionplayer.dll', 'emoteplayer.dll'], load: registerMotion },
@@ -61,7 +58,6 @@ const builtinPlugins = [
   { names: ['packinone.dll'], load: registerPackinOne },
   { names: ['win32dialog.dll'], load: registerWin32Dialog },
   { names: ['fftgraph.dll'], load: registerFftGraph },
-  { names: ['dirlist.dll'], load: registerDirList },
   { names: ['shrinkcopy.dll'], load: registerShrinkCopy },
   { names: ['layerexraster.dll'], load: registerLayerExRaster },
   { names: ['layerexbtoa.dll'], load: registerLayerExBTOA },

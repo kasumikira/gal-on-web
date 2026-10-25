@@ -1,3 +1,6 @@
+#include "StoragesIntf.h"
+#include "TextStream.h"
+#include "BinaryStream.h"
 #include "runtime.h"
 #include "ScriptMgnIntf.h"
 #include "MemoryOutput.h"
@@ -7,55 +10,12 @@
 #include <memory>
 #include <emscripten/emscripten.h>
 
-class TextReadStream : public iTJSTextReadStream
-{
-    std::u16string text;
-    size_t position = 0;
-
-public:
-    explicit TextReadStream(const ttstr &value) : text(value.c_str(), value.GetLen()) {}
-    tjs_uint Read(ttstr &target, tjs_uint size) override
-    {
-        const auto count = size ? std::min<size_t>(size, text.size() - position) : text.size() - position;
-        target = ttstr(text.data() + position, count);
-        position += count;
-        return count;
-    }
-    void Destruct() override { delete this; }
-};
-static iTJSTextReadStream *readText(const ttstr &name, const ttstr &mode)
-{
-    if (!activeRuntime || !activeRuntime->storage)
-        throw eTJSError(TJS_W("TJS text storage is not attached"));
-    tTJSVariant filename(name), options(mode), result;
-    tTJSVariant *args[] = {&filename, &options};
-    invoke(activeRuntime, activeRuntime->storage, 5, nullptr, &result, 2, args);
-    return new TextReadStream(ttstr(result));
+static ttstr RequiredStorage(const ttstr &name) {
+ const auto path = TVPNativePlacedPath(name);
+ if (path.IsEmpty()) TVPThrowExceptionMessage(TJS_W("Storage not found: %1"), name);
+ return path;
 }
-class TextWriteStream : public iTJSTextWriteStream
-{
-    Runtime *runtime;
-    ttstr name, mode;
-    std::u16string text;
 
-public:
-    TextWriteStream(Runtime *runtime, const ttstr &name, const ttstr &mode)
-        : runtime(runtime), name(name), mode(mode) {}
-    void Write(const ttstr &value) override
-    {
-        if (!value.GetLen() || !value.c_str()[0])
-            return;
-        for (tjs_int i = 0; i < value.GetLen(); i++)
-            text.push_back(value.c_str()[i] ? value.c_str()[i] : u' ');
-    }
-    void Destruct() override
-    {
-        std::unique_ptr<TextWriteStream> self(this);
-        tTJSVariant filename(name), content(ttstr(text.data(), text.size())), options(mode);
-        tTJSVariant *args[] = {&filename, &content, &options};
-        invoke(runtime, runtime->storage, 11, nullptr, nullptr, 3, args);
-    }
-};
 void TVPRegisterKAGParser(iTJSDispatch2 *owner)
 {
     activeRuntime->attachOwner(owner);
@@ -68,10 +28,6 @@ static tTVPCompactEventCallbackIntf *compactCallback = nullptr;
 void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf *callback)
 {
     compactCallback = callback;
-}
-iTJSTextReadStream *TVPCreateTextStreamForRead(const ttstr &name, const ttstr &mode)
-{
-    return readText(name, mode);
 }
 void TVPExecuteExpression(const ttstr &expression, iTJSDispatch2 *context, tTJSVariant *result)
 {
@@ -125,7 +81,12 @@ class MemoryInput : public tTJSBinaryStream
 
 public:
     MemoryInput(const unsigned char *data, size_t size) : data(data), size(size) {}
-    explicit MemoryInput(std::vector<unsigned char> bytes) : storage(std::move(bytes)), data(storage.data()), size(storage.size()) {}
+    explicit MemoryInput(std::vector<unsigned char> bytes, tjs_uint64 offset = 0)
+        : storage(std::move(bytes)), data(storage.data()), size(storage.size()) {
+        if (offset > size) throw eTJSError(TJS_W("TJS stream seek outside input"));
+        data += offset;
+        size -= offset;
+    }
     tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override
     {
         const auto next = (whence == TJS_BS_SEEK_SET ? 0 : whence == TJS_BS_SEEK_CUR ? position
@@ -146,17 +107,6 @@ public:
     tjs_uint Write(const void *, tjs_uint) override { throw eTJSError(TJS_W("TJS input stream is read-only")); }
     tjs_uint64 GetSize() override { return size; }
 };
-static tTJSBinaryStream *readBinary(const ttstr &name, const ttstr &mode)
-{
-    if (!activeRuntime || !activeRuntime->storage)
-        throw eTJSError(TJS_W("TJS binary storage is not attached"));
-    tTJSVariant filename(name), options(mode), result;
-    tTJSVariant *args[] = {&filename, &options};
-    invoke(activeRuntime, activeRuntime->storage, 6, nullptr, &result, 2, args);
-    const auto *bytes = result.AsOctetNoAddRef();
-    return new MemoryInput(std::vector<unsigned char>(bytes->GetData(), bytes->GetData() + bytes->GetLength()));
-}
-
 static bool binaryWriteOffset(const ttstr &mode, tjs_uint64 &offset)
 {
     const tjs_char *position = TJS_strchr(mode.c_str(), TJS_W('o'));
@@ -175,11 +125,25 @@ static bool binaryWriteOffset(const ttstr &mode, tjs_uint64 &offset)
     return true;
 }
 
+static tTJSBinaryStream *readBinary(const ttstr &name, const ttstr &mode)
+{
+    if (!activeRuntime || !activeRuntime->storage)
+        throw eTJSError(TJS_W("TJS binary storage is not attached"));
+    tTJSVariant filename(RequiredStorage(name)), options(mode), result;
+    tTJSVariant *args[] = {&filename, &options};
+    invoke(activeRuntime, activeRuntime->storage, 6, nullptr, &result, 2, args);
+    const auto *bytes = result.AsOctetNoAddRef();
+    tjs_uint64 offset = 0;
+    binaryWriteOffset(mode, offset);
+    return new MemoryInput(std::vector<unsigned char>(bytes->GetData(), bytes->GetData() + bytes->GetLength()), offset);
+}
+
 class BinaryWriteStream final : public tTJSBinaryStream
 {
     Runtime *runtime;
     ttstr name;
     MemoryOutput output;
+    bool commitOnDestruction;
 
     void commit()
     {
@@ -191,8 +155,8 @@ class BinaryWriteStream final : public tTJSBinaryStream
     }
 
 public:
-    BinaryWriteStream(Runtime *runtime, const ttstr &name, const ttstr &mode)
-        : runtime(runtime), name(name)
+    BinaryWriteStream(Runtime *runtime, const ttstr &name, const ttstr &mode, bool commitOnDestruction = true)
+        : runtime(runtime), name(TVPNativeFullPath(name)), commitOnDestruction(commitOnDestruction)
     {
         tjs_uint64 offset;
         if (!binaryWriteOffset(mode, offset))
@@ -218,8 +182,11 @@ public:
         output.Seek(static_cast<tjs_int64>(offset), TJS_BS_SEEK_SET);
     }
 
+    void Commit() { commit(); }
+
     ~BinaryWriteStream() override
     {
+        if (!commitOnDestruction) return;
         try
         {
             commit();
@@ -238,7 +205,11 @@ public:
 
     tjs_uint Read(void *buffer, tjs_uint length) override
     {
-        return output.Read(buffer, length);
+        const auto count = static_cast<tjs_uint>(std::min<size_t>(length,
+            output.position < output.bytes.size() ? output.bytes.size() - output.position : 0));
+        if (count) std::memcpy(buffer, output.bytes.data() + output.position, count);
+        output.position += count;
+        return count;
     }
 
     tjs_uint Write(const void *buffer, tjs_uint length) override
@@ -271,26 +242,20 @@ void TVPDumpScriptEngine()
 {
     activeRuntime->engine->Dump();
 }
-const tjs_char *TVPGetDefaultReadEncoding()
-{
-    tTJSVariant result;
-    invoke(activeRuntime, activeRuntime->storage, 7, nullptr, &result, 0, nullptr);
-    activeRuntime->text = ttstr(result).c_str();
-    return activeRuntime->text.c_str();
+tTJSBinaryStream *TVPCreateStream(const ttstr &name, tjs_uint32 flags) {
+    switch (flags & TJS_BS_ACCESS_MASK) {
+        case TJS_BS_READ: return readBinary(name, ttstr());
+        case TJS_BS_WRITE: return new BinaryWriteStream(activeRuntime, name, ttstr(), false);
+        case TJS_BS_UPDATE: return new BinaryWriteStream(activeRuntime, name, TJS_W("o0"), false);
+        default: TVPThrowExceptionMessage(TJS_W("Unsupported binary stream access mode"));
+    }
 }
-void TVPSetDefaultReadEncoding(const ttstr &encoding)
-{
-    tTJSVariant value(encoding);
-    tTJSVariant *args[] = {&value};
-    invoke(activeRuntime, activeRuntime->storage, 8, nullptr, nullptr, 1, args);
+void TVPCommitStream(tTJSBinaryStream *stream) {
+    // Text writers receive only BinaryWriteStream from TVPCreateStream.
+    static_cast<BinaryWriteStream *>(stream)->Commit();
 }
-static ttstr placedPath(const ttstr &name)
-{
-    tTJSVariant value(name), result;
-    tTJSVariant *args[] = {&value};
-    invoke(activeRuntime, activeRuntime->storage, 9, nullptr, &result, 1, args);
-    return ttstr(result);
-}
+static ttstr placedPath(const ttstr &name) { return TVPNativePlacedPath(name); }
+
 ttstr TVPGetPlacedPath(const ttstr &name) { return placedPath(name); }
 
 void TVPExecuteStorage(const ttstr &name, iTJSDispatch2 *context, tTJSVariant *result, bool expression,
@@ -300,7 +265,7 @@ void TVPExecuteStorage(const ttstr &name, iTJSDispatch2 *context, tTJSVariant *r
     std::unique_ptr<tTJSBinaryStream> binary(readBinary(place, mode));
     if (activeRuntime->engine->LoadByteCode(binary.get(), result, context, shortname.c_str()))
         return;
-    auto *stream = readText(place, mode);
+    auto *stream = TVPCreateTextStreamForRead(place, mode);
     ttstr content;
     try
     {
@@ -320,7 +285,7 @@ void TVPExecuteStorage(const ttstr &name, iTJSDispatch2 *context, tTJSVariant *r
 void TVPCompileStorage(const ttstr &name, bool result, bool debug, bool expression, const ttstr &output)
 {
     const ttstr place = placedPath(name), shortname = TVPExtractStorageName(place);
-    auto *stream = readText(place, TJS_W(""));
+    auto *stream = TVPCreateTextStreamForRead(place, TJS_W(""));
     ttstr content;
     try
     {
@@ -334,20 +299,15 @@ void TVPCompileStorage(const ttstr &name, bool result, bool debug, bool expressi
     stream->Destruct();
     MemoryOutput binary;
     activeRuntime->engine->CompileScript(content.c_str(), &binary, result, debug, expression, shortname.c_str(), 0);
-    tTJSVariant filename(output), bytes(binary.bytes.data(), binary.bytes.size());
+    tTJSVariant filename(TVPNativeFullPath(output)), bytes(binary.bytes.data(), binary.bytes.size());
     tTJSVariant *args[] = {&filename, &bytes};
     invoke(activeRuntime, activeRuntime->storage, 10, nullptr, nullptr, 2, args);
 }
 
 void initializeStorageCallbacks()
 {
-    TJSCreateTextStreamForRead = readText;
-    TJSCreateTextStreamForWrite = [](const ttstr &name, const ttstr &mode) -> iTJSTextWriteStream *
-    {
-        if (!activeRuntime || !activeRuntime->storage)
-            throw eTJSError(TJS_W("TJS text storage is not attached"));
-        return new TextWriteStream(activeRuntime, name, mode);
-    };
+    TJSCreateTextStreamForRead = TVPCreateTextStreamForRead;
+    TJSCreateTextStreamForWrite = TVPCreateTextStreamForWrite;
     TJSCreateBinaryStreamForRead = readBinary;
     TJSCreateBinaryStreamForWrite = [](const ttstr &name, const ttstr &mode) -> tTJSBinaryStream *
     {

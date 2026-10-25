@@ -69,7 +69,7 @@ const context = {
 };
 const storage = {
   async read(name) { const bytes = files.get(name); if (!bytes) throw new Error(`missing ${name}`); return bytes; },
-  async isExistentStorage(name) { return files.has(name); },
+  async has(name) { return files.has(name); },
 };
 
 const server = await createServer({

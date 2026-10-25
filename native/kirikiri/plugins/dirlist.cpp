@@ -1,0 +1,78 @@
+//---------------------------------------------------------------------------
+// Adapted from Kirikiroid2 cpp/plugins/dirlist.cpp.
+#include "local-files.h"
+#include "ncbind.hpp"
+//---------------------------------------------------------------------------
+
+#define NCB_MODULE_NAME TJS_W("dirlist.dll")
+
+//---------------------------------------------------------------------------
+// 指定されたディレクトリ内のファイルの一覧を得る関数
+//---------------------------------------------------------------------------
+class tGetDirListFunction
+    : public tTJSDispatch{ tjs_error FuncCall(
+          tjs_uint32 flag, const tjs_char *membername, tjs_uint32 *hint,
+          tTJSVariant *result, tjs_int numparams, tTJSVariant **param,
+          iTJSDispatch2 *objthis){ if(membername) return TJS_E_MEMBERNOTFOUND;
+
+// 引数 : ディレクトリ
+if(numparams < 1)
+    return TJS_E_BADPARAMCOUNT;
+
+ttstr dir(*param[0]);
+
+if(dir.GetLastChar() != TJS_W('/'))
+    TVPThrowExceptionMessage(
+        TJS_W("'/' must be specified at the end of given directory name."));
+
+// OSネイティブな表現に変換
+dir = TVPNormalizeStorageName(dir);
+
+if(result)
+    *result = LocalDirectoryNames(dir, false, false);
+
+// 戻る
+return TJS_S_OK;
+}
+};
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+static void PostRegistCallback() {
+    // GetDirListFunction の作成と登録
+    tTJSVariant val;
+
+    // TJS のグローバルオブジェクトを取得する
+    iTJSDispatch2 *global = TVPGetScriptDispatch();
+
+    // 1 まずオブジェクトを作成
+    auto *GetDirListFunction = new tGetDirListFunction();
+
+    // 2 GetDirListFunction を tTJSVariant 型に変換
+    val = tTJSVariant(GetDirListFunction);
+
+    // 3 すでに val が GetDirListFunction
+    // を保持しているので、GetDirListFunction は
+    //   Release する
+    GetDirListFunction->Release();
+
+    // 4 global の PropSet メソッドを用い、オブジェクトを登録する
+    global->PropSet(
+        TJS_MEMBERENSURE, // メンバがなかった場合には作成するようにするフラグ
+        TJS_W("getDirList"), // メンバ名 ( かならず TJS_W( ) で囲む )
+        nullptr, // ヒント ( 本来はメンバ名のハッシュ値だが、nullptr
+                 // でもよい )
+        &val, // 登録する値
+        global // コンテキスト ( global でよい )
+    );
+
+    // - global を Release する
+    global->Release();
+
+    // val をクリアする。
+    // これは必ず行う。そうしないと val が保持しているオブジェクト
+    // が Release されず、次に使う TVPPluginGlobalRefCount
+    // が正確にならない。
+    val.Clear();
+}
+NCB_POST_REGIST_CALLBACK(PostRegistCallback);

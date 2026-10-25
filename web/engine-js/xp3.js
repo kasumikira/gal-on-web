@@ -1,3 +1,7 @@
+import { TJSInterop } from './wasm-vm.js';
+import { createDebugClass } from './debug.js';
+import { createSystem } from './system.js';
+
 // Port of cpp/core/base/XP3Archive.cpp: index chunks and segmented streams.
 const signature = [88, 80, 51, 13, 10, 32, 10, 26, 139, 103, 1];
 const utf16 = new TextDecoder('utf-16le');
@@ -20,7 +24,7 @@ function chunkEnd(data, offset, limit) {
   return end;
 }
 export class XP3Archive {
-  constructor(source, filter) { this.source = source; this.filter = filter; this.entries = new Map(); }
+  constructor(source, filter, name) { this.source = source; this.filter = filter; this.name = name; this.entries = new Map(); }
   async open(header) {
     header ??= await this.source.read(0, 19);
     if (!signature.every((byte, i) => header[i] === byte)) throw new Error('Invalid XP3 signature');
@@ -86,18 +90,64 @@ export class XP3Archive {
   async read(name) {
     const entry = this.entries.get(name.replaceAll('\\', '/').toLowerCase());
     if (!entry) throw new Error(`XP3 storage not found: ${name}`);
-    const single = entry.segments.length === 1;
-    let result = single ? null : new Uint8Array(entry.size);
-    let offset = 0;
-    for (const segment of entry.segments) {
-      let bytes = await this.source.read(segment.start, segment.storedSize);
-      if (segment.encoding === 1) bytes = await inflate(bytes, segment.size);
-      if (this.filter) await this.filter(entry.hash, offset, bytes, entry.name);
-      if (single) result = bytes;
-      else result.set(bytes, offset);
-      offset += bytes.length;
+    const stream = this.filter ? await this.filter.open(entry.name, this.name, entry.size) : null;
+    try {
+      const single = entry.segments.length === 1;
+      let result = single ? null : new Uint8Array(entry.size);
+      let offset = 0;
+      for (const segment of entry.segments) {
+        let bytes = await this.source.read(segment.start, segment.storedSize);
+        if (segment.encoding === 1) bytes = await inflate(bytes, segment.size);
+        if (stream) bytes = await this.filter.apply(stream, entry.hash, offset, bytes);
+        if (single) result = bytes;
+        else result.set(bytes, offset);
+        offset += bytes.length;
+      }
+      if (offset !== entry.size) throw new Error('XP3 segment size mismatch');
+      return result;
+    } finally {
+      if (stream) await this.filter.close(stream);
     }
-    if (offset !== entry.size) throw new Error('XP3 segment size mismatch');
-    return result;
   }
+}
+
+// Archive IO stays in JS. Native owns the decoder, file contexts and accessors.
+export async function createXP3Filter(storage, wasmURL, message) {
+  if (!await storage.exists('/xp3filter.tjs')) return;
+  const vm = await new TJSInterop(wasmURL).init(Object.create(null));
+  const system = createSystem({ vm, storage, enqueueEvent: callback => vm.enqueue(callback) });
+  let service;
+  try {
+    vm.registerGlobal('Debug', createDebugClass(message));
+    vm.registerGlobal('System', system.api);
+    vm.attachStorage(storage);
+    await vm.nativePlugins(0, 'xp3filter.dll');
+    service = await vm.get(vm.global.Storages, '_xp3Filter');
+    await vm.callMember(service, 'initialize');
+    await vm.dispose(await vm.callMember(vm.global.Scripts, 'execStorage', undefined, ['/xp3filter.tjs']));
+  } catch (error) {
+    system.stop();
+    try { await vm.enqueue(() => system.finalize()); }
+    finally { await vm.dispose(); }
+    throw error;
+  }
+  return {
+    open(name, archiveName, size) {
+      return vm.enqueue(() => vm.callMember(service, 'open', undefined, [name, archiveName, size]));
+    },
+    apply(stream, hash, offset, bytes) {
+      // Independent archive reads serialize only their calls into this VM.
+      return vm.enqueue(() => vm.callMember(stream, 'apply', undefined, [hash, offset, bytes]));
+    },
+    close(stream) { return vm.enqueue(() => vm.dispose(stream)); },
+    async finalize() {
+      system.stop();
+      try {
+        await vm.enqueue(async () => {
+          await system.finalize();
+          await vm.dispose(service);
+        });
+      } finally { await vm.dispose(); }
+    },
+  };
 }

@@ -87,9 +87,7 @@ async function checkSharedImages() {
   let reads = 0;
   const loader = createGraphicLoader({
     getPlacedPath: async name => name === 'shared.tlg' ? name : '',
-    read: async () => { reads++; return encoded; },
-    extractStorageExt: name => name.slice(-4),
-    chopStorageExt: name => name.slice(0, -4),
+    readPlaced: async () => { reads++; return encoded.slice(); },
   });
   const beforeLoad = gpu.diagnostics();
   const first = await loader.load('shared.tlg');

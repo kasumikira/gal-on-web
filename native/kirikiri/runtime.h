@@ -43,6 +43,9 @@ struct Runtime : iTJSConsoleOutput
     std::unordered_map<iTJSDispatch2 *, std::set<int>> exportsByObject;
     int next = 1, alive = 0, invalidations = 0, storage = 0;
     bool stopped = false;
+    ttstr defaultReadEncoding = TJS_W("UTF-8");
+    int (*defaultReadConverter)(unsigned short *, const unsigned char *) = nullptr;
+    tTJSVariant timerScheduler;
     std::set<std::u16string> loadedPlugins;
     std::map<const void *, NativePluginClassInfo> pluginClasses;
     std::map<const void *, tTJSVariant> pluginValues;

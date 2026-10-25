@@ -1,11 +1,4 @@
-import {
-  TextStreamDecoder,
-  streamOffset,
-  hasStreamOffset,
-  encodeTextStream,
-  encodeCipheredTextStream,
-  encodeCompressedTextStream,
-} from "./text-stream.js";
+import { createTJS2Storage } from './storage.js';
 import { TJSRuntime } from "./tjs-runtime/runtime.js";
 import { Closure, SHADOW, TJSValueType, unwrap, setPrimitiveRuntime, clearPrimitiveRuntime } from "#krkr/values";
 import {
@@ -30,6 +23,9 @@ const INTERPRETER_CLASSES = [
   "Rect",
   "Pad",
   "MenuItem",
+  "Timer",
+  "AsyncTrigger",
+  "Storages",
 ];
 const TJS_MEMBER_ENSURE_IGNORE_PROPERTY = 0x0a00;
 const TJS_HIDDEN_MEMBER = 0x1000;
@@ -612,50 +608,19 @@ export class TJSInterop {
     }
   }
   attachStorage(storage) {
-    const decoder = new TextStreamDecoder(storage.textEncoding);
-    storage.attachTextDecoder(decoder);
+    const backend = createTJS2Storage(storage);
+    this.registerGlobal('TJS2Storage', backend.klass);
     const callback = this.storeHost(async ({ operation, args: [name, value, mode] }) => {
       switch (operation) {
-        case 5:
-          return decoder.read((await storage.read(name)).subarray(streamOffset(value)));
-        case 6:
-          return (await storage.read(name)).subarray(streamOffset(value));
-        case 7: return storage.textEncoding ?? 'utf-8';
-        case 8: storage.setTextEncoding(name); return;
-        case 9: return storage.getPlacedPath(name);
-        case 10: return storage.write(name, value);
-        case 11: {
-          const compressionMarker = mode.indexOf('z');
-          const compressionDigit = compressionMarker < 0
-            ? undefined
-            : /^\d/.exec(mode.slice(compressionMarker + 1))?.[0];
-          const compressionLevel = compressionDigit === undefined ? undefined : Number(compressionDigit);
-          if (compressionMarker >= 0 && compressionLevel !== undefined)
-            console.log(`TJS text stream: using generic browser compression; control of level z${compressionLevel} is not implemented`);
-
-          let cipherMode = -1;
-          if (compressionMarker < 0) {
-            const cipherMarker = mode.indexOf('c');
-            cipherMode = cipherMarker < 0
-              ? -1
-              : Number(/^\d/.exec(mode.slice(cipherMarker + 1))?.[0] ?? 1);
-            if (cipherMode !== -1 && cipherMode !== 1 && cipherMode !== 2)
-              throw new Error(`Unsupported TJS text cipher mode ${cipherMode}`);
-          }
-          const compressed = compressionMarker >= 0 || cipherMode === 2;
-          const offset = streamOffset(mode);
-          const hasOffset = hasStreamOffset(mode);
-          // CompressionStream does not expose a compression-level option.
-          const content = compressed
-            ? await encodeCompressedTextStream(value)
-            : cipherMode === 1 ? encodeCipheredTextStream(value) : encodeTextStream(value);
-          if (!hasOffset) return storage.write(name, content);
-          const previous = await storage.read(name);
-          const bytes = new Uint8Array(Math.max(previous.length, offset + content.length));
-          bytes.set(previous);
-          bytes.set(content, offset);
-          return storage.write(name, bytes);
-        }
+        case 6: return backend.read(name);
+        // Shared JS capabilities used by the native Storages interface.
+        case 14: return storage.clearArchiveCache();
+        case 15: return storage.currentDirectory;
+        case 16: storage.currentDirectory = name; return;
+        case 17: storage.addAutoPath(name); return;
+        case 18: storage.removeAutoPath(name); return;
+        case 19: return storage.getPlacedPath(name);
+        case 10: return backend.write(name, value);
         default: throw Error('Unknown storage operation: ' + operation);
       }
     });

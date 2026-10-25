@@ -49,7 +49,7 @@ export class MotionResourceManager {
     const placed = await this.storage.getPlacedPath(String(path));
     this.modules.delete(placed);
   }
-  async isExistStorage(path) { return (await this.storage.isExistentStorage(String(path))) !== 0; }
+  async isExistStorage(path) { return this.storage.has(String(path)); }
   async placedPath(path) { return this.storage.getPlacedPath(String(path)); }
   unloadAll() { this.modules.clear(); }
   clearCache() { this.sourceCache.clear(); }

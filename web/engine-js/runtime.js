@@ -4,7 +4,7 @@ import { initializeGPU } from './gpu.js';
 import { TJSInterop } from './wasm-vm.js';
 import { Closure } from '#krkr/values';
 import { Storages } from './storage.js';
-import { createXP3Filter } from './xp3-filter.js';
+import { createXP3Filter } from './xp3.js';
 import { createWindowClass, createBasicDrawDeviceClass } from './window.js';
 import { createLayerClass } from './layer.js';
 import { createFontClass, TEXT_BLEND } from './font.js';
@@ -17,7 +17,7 @@ import { Plugins } from './plugins.js';
 import { initializeConstants } from './constants.js';
 import { createDebugClass } from './debug.js';
 import { createSystem } from './system.js';
-import { createTimerClass, createAsyncTriggerClass } from './timer.js';
+import { createTimerScheduler } from './timer.js';
 import { nativeOwner, defineNativeClass, installNativeStubs, unimplemented, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { nativeGlobals } from '#krkr/native-api';
 
@@ -82,10 +82,10 @@ export async function createRuntime(options) {
   // exists, and _m/_p sibling lookups follow the same rule.
   const graphicExtensions = ['.tlg', '.png', '.jpg', '.jpeg', '.bmp', '.webp'];
   const resolveGraphicName = async name => {
-    if (await storage.isExistentStorage(name)) return name;
+    if (await storage.has(name)) return name;
     if (!/[.][A-Za-z0-9]+$/.test(name)) {
       for (const ext of graphicExtensions) {
-        if (await storage.isExistentStorage(name + ext)) return name + ext;
+        if (await storage.has(name + ext)) return name + ext;
       }
     }
     return name;
@@ -141,24 +141,10 @@ export async function createRuntime(options) {
   };
   register('Font', createFontClass(document, { storage, Rect: global.Rect }));
   Layer.attachFontClass(global.Font, Layer);
-  const invokeAction = (owner, name, args, actionName, shouldDispatch) => {
-    owner = retainScriptValue(owner);
-    return enqueueEvent(async () => {
-      if (owner.invalid) return;
-      if (shouldDispatch && !shouldDispatch()) return;
-      const key = actionName || name;
-      const handler = await vm.get(owner, key, true);
-      try {
-        if (handler) {
-          const result = await vm.call(handler, owner, args);
-          await disposeScriptValue(result);
-        }
-      } finally { await disposeScriptValue(handler); }
-      return undefined;
-    }, () => disposeScriptValue(owner));
-  };
-  register('Timer', createTimerClass({ invokeAction }));
-  register('AsyncTrigger', createAsyncTriggerClass({ invokeAction }));
+  const timerScheduler = await createTimerScheduler({
+    vm, enqueueEvent, isIdle: () => pendingEvents === 1, reportError: inform,
+    laxTimer: config.arguments['-laxtimer'] === 'yes',
+  });
   let audioContext;
   const getAudioContext = () => audioContext ??= new document.defaultView.AudioContext();
   register('WaveSoundBuffer', createWaveSoundBufferClass(storage, getAudioContext, { enqueueEvent }));
@@ -171,7 +157,6 @@ export async function createRuntime(options) {
     Window: global.Window, Layer, storage,
     getAudioContext, enqueueEvent,
   }));
-  register('Storages', storage);
   vm.attachStorage(storage);
   register('Debug', Object.assign(createDebugClass((important,value)=>message(important?`! ${value}`:value)),{
     // The JS plugin registry does not search native debug DLL directories.
@@ -257,7 +242,7 @@ export async function createRuntime(options) {
   };
   // stop cancels browser work synchronously; finalize may enter the VM and
   // therefore runs serially after startup and event delivery have drained.
-  const resources = [global.Timer, system, global.VideoOverlay, Layer, compositor, global.WaveSoundBuffer];
+  const resources = [timerScheduler, system, global.VideoOverlay, Layer, compositor, global.WaveSoundBuffer];
   const dispose = () => {
     if (disposePromise) return disposePromise;
     acceptingEvents = false;

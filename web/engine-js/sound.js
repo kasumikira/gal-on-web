@@ -415,7 +415,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
         if (generation !== state.openGeneration) return;
 
         const sliName = String(name) + '.sli';
-        if (typeof storage.isExistentStorage === 'function' && await storage.isExistentStorage(sliName)) {
+        if (await storage.has(sliName)) {
           const sli = await storage.read(sliName);
           if (generation !== state.openGeneration) return;
           try {

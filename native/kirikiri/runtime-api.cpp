@@ -1,3 +1,5 @@
+#include "StoragesIntf.h"
+#include "TimerIntf.h"
 #include "RectItf.h"
 #include "PadIntf.h"
 #include "MenuItemIntf.h"
@@ -46,7 +48,8 @@ extern "C"
         tTJSVariant scriptsValue(scripts, nullptr);
         scripts->Release();
         runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, TJS_W("Scripts"), nullptr, &scriptsValue, nullptr);
-        for (auto *coreClass : {TVPCreateNativeClass_Rect(), TVPCreateNativeClass_Pad(), TVPCreateNativeClass_MenuItem()}) {
+        TVPInitializeTimers();
+        for (auto *coreClass : {TVPCreateNativeClass_Storages(), TVPCreateNativeClass_Timer(), TVPCreateNativeClass_AsyncTrigger(), TVPCreateNativeClass_Rect(), TVPCreateNativeClass_Pad(), TVPCreateNativeClass_MenuItem()}) {
             tTJSVariant held(coreClass, nullptr);
             coreClass->Release();
             success(runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, coreClass->GetClassName().c_str(), nullptr, &held, nullptr));

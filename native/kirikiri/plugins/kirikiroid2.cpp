@@ -1,5 +1,5 @@
 // kirikiroid2.dll: the script-value helper runs inside TJS. The existing
-// Storages.setTextEncoding implementation continues to own text decoding.
+// Storages.setTextEncoding delegates to the native TextStream converter.
 #include "ncbind.hpp"
 #define NCB_MODULE_NAME TJS_W("kirikiroid2.dll")
 

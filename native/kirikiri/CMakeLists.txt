@@ -19,12 +19,21 @@ add_executable(tjs-runtime runtime.cpp
     runtime-host.cpp
     core/plugin/PluginRegistry.cpp
     runtime-platform.cpp
+    core/base/TextStream.cpp
+    core/utils/encoding/jis2unicode.c
+    core/utils/encoding/gbk2unicode.c
+    core/base/StoragesIntf.cpp
+    core/base/TimerIntf.cpp
     core/base/RectItf.cpp
     core/base/RectMath.cpp
     core/base/PadIntf.cpp
     core/base/MenuItemIntf.cpp
     core/base/KAGParser.cpp
     core/base/ScriptMgnIntf.cpp
+    plugins/dirlist.cpp
+    plugins/fstat.cpp
+    plugins/xp3filter.cpp
+    plugins/BinaryAccessor.cpp
     plugins/csvParser.cpp
     plugins/saveStruct.cpp
     plugins/scriptsEx.cpp

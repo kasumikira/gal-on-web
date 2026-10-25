@@ -62,19 +62,22 @@ export function createGraphicLoader(storage) {
     const cacheKey = JSON.stringify([path, key, gray, province, width, height, storage.revision]);
     let result = cache.get(cacheKey);
     if (!result) {
-      result = await loadGraphic({ read: () => storage.read(path), name: path, transferOwnership: true }, key, { gray, province });
+      result = await loadGraphic({ read: () => storage.readPlaced(path), name: path, transferOwnership: true }, key, { gray, province });
       result.image = tiledImage(result.image, width, height);
       if (!gray && !province) {
-        const extension = storage.extractStorageExt(path), base = storage.chopStorageExt(path);
+        const filename = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('>')) + 1);
+        const dot = filename.lastIndexOf('.');
+        const extension = dot < 0 ? '' : filename.slice(dot);
+        const base = path.slice(0, path.length - extension.length);
         const maskPath = await sibling(base, '_m', extension);
         if (maskPath) {
-          const mask = tiledImage((await loadGraphic({ read: () => storage.read(maskPath), name: maskPath, transferOwnership: true }, 0, { gray: true })).image, width, height);
+          const mask = tiledImage((await loadGraphic({ read: () => storage.readPlaced(maskPath), name: maskPath, transferOwnership: true }, 0, { gray: true })).image, width, height);
           if (mask.width !== result.image.width || mask.height !== result.image.height) throw new Error('TJS mask size mismatch');
           gpuBtoa.assignAlpha(result.image, mask);
         }
         const provincePath = await sibling(base, '_p', '');
         if (provincePath) {
-          result.province = tiledImage((await loadGraphic({ read: () => storage.read(provincePath), name: provincePath, transferOwnership: true }, 0, { province: true })).image, result.image.width, result.image.height);
+          result.province = tiledImage((await loadGraphic({ read: () => storage.readPlaced(provincePath), name: provincePath, transferOwnership: true }, 0, { province: true })).image, result.image.width, result.image.height);
           if (result.province.width !== result.image.width || result.province.height !== result.image.height) throw new Error('TJS province size mismatch');
         }
         if ((key >>> 24) === 4) alphaColorMat(result.image, key & 0xffffff);

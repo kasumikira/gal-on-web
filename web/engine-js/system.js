@@ -3,7 +3,6 @@ import { config } from './global.js';
 // The browser supplies the platform values in place of the native platform layer.
 import { v4 as uuidv4 } from 'uuid';
 import { readScript, disposeScriptValue } from '#krkr/native';
-import { TextStreamDecoder } from './text-stream.js';
 import { queryKeyState } from './key-state.js';
 const FRAME_INTERVAL_60_MS = 1000 / 60;
 const FRAME_TIME_EPSILON_MS = 1e-6;
@@ -90,9 +89,7 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
       registerDataLoaded = true;
       return;
     }
-    const decoder = new TextStreamDecoder();
-    registerData = await vm.source(
-      await decoder.read(await storage.read(name)), 'RegisterData.tjs', 0, undefined, true);
+    registerData = await vm.callMember(vm.global.Scripts, 'evalStorage', undefined, [name]);
     registerDataLoaded = true;
   };
   const walkRegisterData = async path => {

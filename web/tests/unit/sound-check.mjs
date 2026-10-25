@@ -43,7 +43,7 @@ try {
     async decodeAudioData() { return audioBuffer; },
   };
   const vm = await new TJSInterop().init(Object.create(null));
-  const Wave = createWaveSoundBufferClass({ async read() { return new Uint8Array([0]); } }, () => context, {
+  const Wave = createWaveSoundBufferClass({ async read() { return new Uint8Array([0]); }, async has() { return false; } }, () => context, {
     enqueueEvent: callback => Promise.resolve().then(callback),
   });
   const global = Object.create(null);

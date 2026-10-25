@@ -5,7 +5,6 @@ import assert from 'node:assert/strict';
 import { TJSInterop } from '../../engine-js/wasm-vm.js';
 import { config } from '../../engine-js/global.js';
 import { createSystem } from '../../engine-js/system.js';
-import { encodeTextStream } from '../../engine-js/text-stream.js';
 
 const create = async storage => {
   const vm = await new TJSInterop().init(Object.create(null));
@@ -13,12 +12,17 @@ const create = async storage => {
     document: { defaultView: {} }, inform: () => {}, arguments: {},
     continuousFrameRate: 60, onTitleChange: () => {},
   });
+  vm.attachStorage({
+    ...storage, currentDirectory: '/',
+    getPlacedPath: async name => await storage.exists(name) ? name : '',
+    readPlaced: name => storage.read(name),
+  });
   const system = createSystem({ vm, enqueueEvent: callback => Promise.resolve().then(callback), storage });
   vm.registerGlobal('System', system.api);
   return vm;
 };
 const missingStorage = {
-  normalize: name => String(name),
+  normalize: name => String(name).toLowerCase(),
   async exists() { return false; },
   async read() { throw new Error('missing'); },
 };
@@ -33,9 +37,9 @@ await vm.dispose();
 // --- RegisterData.tjs is evaluated as an expression and walked --------------
 const data = '%[ "HKEY_CURRENT_USER" => %[ "Software" => %[ "Foo" => "bar", "N" => 42 ] ] ]';
 const registryStorage = {
-  normalize: name => String(name),
-  async exists(name) { return name === '/RegisterData.tjs'; },
-  async read(name) { return name === '/RegisterData.tjs' ? encodeTextStream(data) : new Uint8Array(); },
+  normalize: name => String(name).toLowerCase(),
+  async exists(name) { return name === '/registerdata.tjs'; },
+  async read(name) { return name === '/registerdata.tjs' ? new Uint8Array(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(data, 'utf16le')])) : new Uint8Array(); },
 };
 const vm2 = await create(registryStorage);
 assert.equal(await vm2.source('return System.readRegValue("HKEY_CURRENT_USER/Software/Foo");', 'reg-foo'), 'bar');

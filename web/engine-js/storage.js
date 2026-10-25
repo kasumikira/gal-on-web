@@ -1,5 +1,5 @@
+import { defineNativeClass } from '#krkr/native';
 import { XP3Archive } from './xp3.js';
-import { normalizeTextEncoding } from './text-stream.js';
 // StorageIntf.cpp TVPParseStorageName: a name with a "<media>://" prefix
 // belongs to the media registered for that prefix; the media receives the
 // normalized local name only ("domain/path", without the prefix).
@@ -22,8 +22,6 @@ export class Storages {
     this.gameStorage = gameStorage;
     this.currentDirectory = currentDirectory;
     this.saveStorage = saveStorage;
-    this.textEncoding = null;
-    this.textDecoder = null;
     // Graphic caches include this monotonically increasing generation.  A
     // successful host write therefore cannot leave a decoded pre-write image
     // in createGraphicLoader's cache.
@@ -50,8 +48,8 @@ export class Storages {
   // local name after TVPParseStorageName.
   registerMedia(prefix, media) {
     prefix = String(prefix).toLowerCase();
-    if (!prefix.endsWith('://')) throw new Error('TJS storage media prefix requires ://');
-    if (typeof media?.isExistent!=='function' || typeof media?.read!=='function') throw new Error('TJS storage media requires isExistent and read');
+    if (!prefix.endsWith('://')) throw new Error('Storage media prefix requires ://');
+    if (typeof media?.isExistent!=='function' || typeof media?.read!=='function') throw new Error('Storage media requires isExistent and read');
     this.mediaTable.set(prefix,media);
   }
   findMedia(name) {
@@ -61,11 +59,6 @@ export class Storages {
     const media = this.mediaTable.get(split.prefix);
     return media?{ ...split, media }:null;
   }
-  setTextEncoding(encoding) {
-    this.textEncoding = normalizeTextEncoding(encoding);
-    if (this.textDecoder) this.textDecoder.encoding = this.textEncoding;
-  }
-  attachTextDecoder(decoder) { this.textDecoder = decoder; }
   normalize(name) {
     name = String(name).replaceAll('\\','/').toLowerCase();
     const found = this.findMedia(name);
@@ -81,22 +74,6 @@ export class Storages {
     if (this.findMedia(path)) return this.normalize(path);
     return this.normalize(path.startsWith('/')?path:this.currentDirectory+path);
   }
-  getLocalName(name) {
-    if (!arguments.length) throw new Error('Storages.getLocalName requires a name');
-    name = String(name);
-    if (!name || splitMediaName(name.replaceAll('\\', '/')))
-      throw new Error(`Cannot get local name from ${name}`);
-    const path = this.getFullPath(name);
-    // StorageIntf.cpp TVPGetLocalName: archive entries have no local name.
-    // Our local filesystem is the virtual namespace shared with fstat/saves;
-    // conversion does not test existence or perform an auto-path lookup.
-    if (path.includes('>')) throw new Error(`Cannot get local name from ${name}`);
-    return path;
-  }
-  extractStorageName(name) { return String(name).replaceAll('\\','/').split(/[\/>]/).at(-1); }
-  extractStoragePath(name) { const path = String(name).replaceAll('\\','/'); return path.slice(0,Math.max(path.lastIndexOf('/'),path.lastIndexOf('>'))+1); }
-  extractStorageExt(name) { const base = this.extractStorageName(name); const dot = base.lastIndexOf('.'); return dot<0?'':base.slice(dot); }
-  chopStorageExt(name) { return String(name).slice(0,String(name).length-this.extractStorageExt(name).length); }
   async archive(name) {
     const path = this.normalize(name);
     if (this.archives.has(path)) return this.archives.get(path);
@@ -109,7 +86,7 @@ export class Storages {
     const sevenZip = [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c].every((byte, i) => header[i] === byte);
     const archive = sevenZip
       ? await (await import('./seven-zip.js')).openSevenZip(source, file.size)
-      : await new XP3Archive(source, this.extractionFilter?.apply).open(header);
+      : await new XP3Archive(source, this.extractionFilter, path).open(header);
     this.archives.set(path,archive); return archive;
   }
   async closeArchive(name) {
@@ -117,6 +94,10 @@ export class Storages {
     if (!archive) return;
     await archive.finalize?.();
     this.archives.delete(path);
+  }
+  async clearArchiveCache() {
+    await this.finalize();
+    this.autoPathTable = undefined;
   }
   async finalize() {
     await Promise.all([...this.archives.values()].map(archive => archive.finalize?.()));
@@ -131,13 +112,13 @@ export class Storages {
     return (await this.archive(path.slice(0,sharp))).entries.has(path.slice(sharp+1));
   }
   addAutoPath(name) {
-    if (!/[\/>\\]$/.test(name)) throw new Error('TJS auto path requires a trailing delimiter');
+    if (!/[\/>\\]$/.test(name)) throw new Error('Auto path requires a trailing delimiter');
     const path = this.getFullPath(name);
     if (!this.autoPaths.includes(path)) this.autoPaths.push(path);
     this.autoPathTable = undefined;
   }
   removeAutoPath(name) {
-    if (!/[\/>\\]$/.test(name)) throw new Error('TJS auto path requires a trailing delimiter');
+    if (!/[\/>\\]$/.test(name)) throw new Error('Auto path requires a trailing delimiter');
     const path = this.getFullPath(name);
     this.autoPaths = this.autoPaths.filter(value=>value!==path);
     this.autoPathTable = undefined;
@@ -164,15 +145,18 @@ export class Storages {
     if (found) return (await found.media.isExistent(found.local))?path:'';
     if (await this.exists(path)) return path;
     if (!this.autoPathTable) await this.rebuildAutoPaths();
-    const base = this.extractStorageName(path), directory = this.autoPathTable.get(base);
+    const base = path.split(/[\/>]/).at(-1), directory = this.autoPathTable.get(base);
     return directory===undefined?'':directory+base;
   }
-  async isExistentStorage(name) { return Number((await this.getPlacedPath(name))!==''); }
+  async has(name) { return (await this.getPlacedPath(name)) !== ''; }
   async read(name) {
     // Return independently owned writable bytes. Consumers may transfer a
     // complete result buffer; backends/media must not expose cached buffers.
     const path = await this.getPlacedPath(name);
     if (!path) throw new Error(`Storage not found: ${name}`);
+    return this.readPlaced(path);
+  }
+  async readPlaced(path) {
     const found = this.findMedia(path);
     if (found) return found.media.read(found.local);
     const sharp = path.indexOf('>');
@@ -180,9 +164,36 @@ export class Storages {
     const file = this.files.get(path);
     return (file.saved ? this.saveStorage : this.gameStorage).read(file.path, 0, file.size);
   }
+  listDirectory(path) {
+    if (path.includes('>') || this.findMedia(path)) throw new Error('Local directory required');
+    const entries = new Map();
+    for (const [key, file] of this.files) {
+      if (!key.startsWith(path)) continue;
+      const name = key.slice(path.length).split('/')[0];
+      if (!name || entries.has(name)) continue;
+      const depth = path.split('/').filter(Boolean).length;
+      const displayName = file.path.replaceAll('\\', '/').split('/').filter(Boolean)[depth];
+      entries.set(name, { name, displayName, directory: key.slice(path.length).includes('/') });
+    }
+    return { exists: path === '/' || entries.size > 0, entries: [...entries.values()] };
+  }
+  stat(path) {
+    if (path.includes('>') || this.findMedia(path)) throw new Error('Local path required');
+    const file = this.files.get(path);
+    if (file) return { directory: false, size: file.size, writable: !!file.saved, displayName: file.path.replaceAll('\\', '/').split('/').at(-1) };
+    const directory = path.endsWith('/') ? path : path + '/';
+    if (!this.listDirectory(directory).exists) return null;
+    const parent = directory.slice(0, -1).lastIndexOf('/');
+    const name = directory.slice(parent + 1, -1);
+    const entry = this.listDirectory(directory.slice(0, parent + 1)).entries.find(entry => entry.name === name);
+    return { directory: true, displayName: entry?.displayName ?? '' };
+  }
   async delete(name) {
     const path = await this.getPlacedPath(name);
-    if (!path || this.findMedia(path) || path.includes('>')) return false;
+    return path ? this.deletePlaced(path) : false;
+  }
+  async deletePlaced(path) {
+    if (this.findMedia(path) || path.includes('>')) return false;
     const file = this.files.get(path);
     if (!file?.saved || !this.saveStorage) return false;
     await this.closeArchive(path);
@@ -206,4 +217,19 @@ export class Storages {
     this.autoPathTable = undefined;
     this.revision++;
   }
+}
+
+
+export function createTJS2Storage(storage) {
+  const methods = {
+    read: path => storage.readPlaced(String(path)),
+    write: (path, bytes) => storage.write(String(path), bytes),
+    listDirectory: path => storage.listDirectory(String(path)),
+    stat: path => storage.stat(String(path)),
+    exists: path => storage.exists(String(path)),
+    deleteFile: path => storage.deletePlaced(String(path)),
+  };
+  const klass = defineNativeClass('TJS2Storage', { initialize() { throw new Error('TJS2Storage cannot be instantiated'); } });
+  for (const [name, method] of Object.entries(methods)) klass.defineMember(name, method, { static: true });
+  return { klass, ...methods };
 }

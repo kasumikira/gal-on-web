@@ -217,6 +217,7 @@ void Runtime::shutdown()
         held.mapped().value.Clear();
     }
     engine->Shutdown();
+    timerScheduler.Clear();
     pluginValues.clear();
     pluginClasses.clear();
     loadedPlugins.clear();
