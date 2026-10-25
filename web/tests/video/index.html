@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>视频播放管线验证</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; color: #222; background: #fafafa; }
+  table { border-collapse: collapse; width: 100%; max-width: 900px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; vertical-align: top; }
+  .fail { color: #b21e28; } .pass { color: #12623a; }
+  canvas { image-rendering: pixelated; border: 1px solid #888; width: 256px; height: 192px; background: #333; }
+  #previews { display: flex; gap: 24px; flex-wrap: wrap; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>视频播放管线验证</h1>
+<p>真实浏览器验证：AMV 专用 Worker 后端（真实 Worker + Rust/WASM 解码）、libav/WebCodecs 后端与时钟驱动消费、公共图层呈现入口到共享 WebGL2 纹理。素材在页面内合成，不依赖游戏归档。</p>
+<p id="status">运行中…</p>
+<div id="previews">
+  <section><h3>AlphaMovie（脚本驱动，AMV Worker）</h3><canvas id="amv" width="16" height="16"></canvas><pre id="amvInfo"></pre></section>
+  <section><h3>VideoOverlay（时钟驱动，libav/WebCodecs）</h3><canvas id="movie" width="64" height="48"></canvas><pre id="movieInfo"></pre></section>
+</div>
+<h2>检查结果</h2>
+<table><thead><tr><th>检查</th><th>结论</th><th>详情</th></tr></thead><tbody id="rows"></tbody></table>
+<script type="module" src="./run.js"></script>
+</html>

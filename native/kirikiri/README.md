@@ -1,14 +1,15 @@
 # Kirikiri WASM 运行时
 
-这是正式的 C++ 脚本运行时项目。CMake 生成 tjs-runtime，包含原版 TJS2、KAGParser、Scripts、scriptsEx、csvParser 和 saveStruct；源码编译、字节码加载和执行使用同一个 tTJS 实例。
+这是正式的 C++ 脚本运行时项目。CMake 生成 tjs-runtime，包含原版 TJS2、KAGParser、Scripts、核心类及按需加载的原生插件；源码编译、字节码加载和执行使用同一个 tTJS 实例。
 
 ## 源码布局
 
 - core/tjs2/：TJS2 编译、执行、对象系统、内建类及语法生成输入。
-- core/base/：KAGParser、ScriptMgnIntf、平台接口和内存流。
+- core/base/：KAGParser、Scripts、Rect/Pad/MenuItem、平台接口和内存流。
+- core/plugin/：同模块插件注册器、ncbind 及运行时类元数据。
 - core/utils/：原版 MD5 实现。
 - core/common/：公共头文件。
-- plugins/：scriptsEx、csvParser、saveStruct、TextRenderBase 和脚本 PSBFile 的参考实现及同模块注册。
+- plugins/：scriptsEx、csvParser、saveStruct、TextRenderBase、脚本 PSBFile、JSON、Expat 与 kirikiroid2 扩展的同模块注册。
 - runtime.h / runtime.cpp：运行时状态、借用与 owner 持有值、导出索引和生命周期。
 - runtime-api.cpp：值、对象、脚本执行等 WASM 导出 API。
 - runtime-host.cpp：JS Native 类、方法、属性、只读对象及异步调用桥接。

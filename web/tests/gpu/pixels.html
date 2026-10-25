@@ -1,0 +1,1322 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GPU text pixel check</title>
+<pre id="result">running</pre>
+<script type="module">
+import { Image, tileImage } from '/engine-js/bitmap.js';
+import { shrinkArea, rasterCopy } from '/engine-js/plugins/gpu-resample.js';
+import { gpuBtoa } from '/engine-js/plugins/gpu-btoa.js';
+import { uploadVideoCanvas } from '/engine-js/video.js';
+import { initializeGPU, getGPU } from '/engine-js/gpu.js';
+import { clipBlit, blurGlyphImage, createTextRenderer, TEXT_BLEND } from '/engine-js/font.js';
+import { decodeSource } from '/engine-js/codecs/psb.js';
+import { loadGraphic } from '/engine-js/codecs/decode.js';
+import { loadGraphicAsync } from '/engine-js/codecs/async-decode.js';
+import { encodeTLG, makeBMP } from '/engine-js/codecs/encode.js';
+import { codecs } from '/engine-js/codecs/wasm.js';
+import { createGraphicLoader } from '/engine-js/graphic.js';
+
+const gpu = initializeGPU(document, TEXT_BLEND);
+const result = [];
+const fail = message => { throw new Error(message); };
+async function checkSharedImages() {
+  const bmpPixels = new Uint8ClampedArray(64 * 64 * 4);
+  for (let i = 0; i < bmpPixels.length; i += 4) bmpPixels.set([12, 34, 56, 255], i);
+  const bmp = makeBMP(new Image(64, 64, { pixels: bmpPixels }), 24);
+  const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQMAAABIeJ9nAAAABlBMVEUMIjhOWnuhvGg+AAAAAnRSTlMAgJsrThgAAAAMSURBVHicY3BgaAAAAUQAwTp6HFYAAAAASUVORK5CYII='), c => c.charCodeAt(0));
+  const clear = gpu.gl.clear;
+  let clears = 0;
+  gpu.gl.clear = function(...args) { clears++; return clear.apply(this, args); };
+  try {
+    for (const [bytes, province, expected] of [
+      [bmp, false, bmpPixels],
+      [png, false, new Uint8ClampedArray([12,34,56,0,78,90,123,128,78,90,123,128,12,34,56,0])],
+      [png, true, new Uint8ClampedArray([0,1,1,0])],
+    ]) {
+      const before = gpu.diagnostics();
+      const { image } = await loadGraphic({ read: async () => bytes, name: 'decoder-check' }, 0x1fffffff, { province });
+      if (clears || gpu.diagnostics().textureCount !== before.textureCount || image.gpuValid)
+        fail('BMP/PNG decoding performed GPU pixel writes');
+      if (firstDifference(expected, image.pixels) !== -1) fail('CPU decoder changed image bytes');
+      gpu.texture(image);
+      if (gpu.diagnostics().uploads !== before.uploads + 1) fail('decoded image must upload once on first GPU use');
+      image.release();
+    }
+  } finally { gpu.gl.clear = clear; }
+  result.push('BMP/indexed PNG: exact CPU pixels, zero GPU clears during decode, one deferred upload');
+  const rect = { left: 0, top: 0, right: 8, bottom: 8 };
+  const source = new Image(8, 8);
+  gpu.fill(source, rect, [12, 23, 34, 127]);
+  const assigned = new Image(1, 1), before = gpu.diagnostics();
+  assigned.assign(source);
+  if (assigned.gpu !== source.gpu || gpu.diagnostics().textureCount !== before.textureCount)
+    fail('Assign must share storage without allocating a texture');
+  assigned.fill({ left: 1, top: 1, right: 2, bottom: 2 }, 0xff445566);
+  if (source.point(1, 1) !== 0x7f0c1722 || assigned.point(1, 1) !== (0xff445566 | 0) || assigned.point(0, 0) !== 0x7f0c1722)
+    fail('partial GPU write changed shared source or lost preserved pixels');
+  const cpuCopy = source.copyReference();
+  cpuCopy.writablePixels[0] = 99;
+  if (source.point(0, 0) !== 0x7f0c1722 || cpuCopy.pixels[0] !== 99) fail('CPU write changed shared source');
+  const filled = source.copyReference();
+  filled.fill(rect, 0xffabcdef);
+  if (source.point(0, 0) !== 0x7f0c1722 || filled.point(0, 0) !== (0xffabcdef | 0)) fail('full fill changed shared source');
+  const sized = source.copyReference();
+  sized.resize(10, 9);
+  if (source.width !== 8 || sized.width !== 10 || sized.point(0, 0) !== 0x7f0c1722) fail('resize changed shared source');
+  const external = source.clone(), writable = external.writablePixels;
+  external.externallyWritable = true;
+  const externalAssigned = new Image(1, 1);
+  externalAssigned.assign(external);
+  const externalCopy = external.copyReference();
+  writable[0] = 99;
+  if (externalAssigned.point(0, 0) !== 0x7f0c1722 || externalCopy.point(0, 0) !== 0x7f0c1722)
+    fail('exported array write changed an assigned snapshot');
+  gpu.texture(external);
+  if (gpu.read(external.gpu)[0] !== 99 || external.pixels !== writable || !external.externallyWritable)
+    fail('GPU use lost the exported writable buffer');
+  externalAssigned.fill(rect, 0xffabcdef);
+  if (writable[0] !== 99) fail('assigned GPU write changed exported array');
+  const prepared = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);
+  const preparedCopy = prepared.copyReference(), shared = prepared._storage;
+  const beforePreparation = gpu.diagnostics();
+  await gpu.prepareTextures([prepared, preparedCopy, new Image(1, 1)]);
+  if (prepared._storage !== shared || preparedCopy.gpu !== prepared.gpu || !preparedCopy.gpuValid
+    || gpu.diagnostics().uploads !== beforePreparation.uploads + 1 || preparedCopy.point(0, 0) !== 0x7f0c1722)
+    fail('texture preparation split shared storage or uploaded it twice');
+  const encoded = encodeTLG(Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1));
+  let reads = 0;
+  const loader = createGraphicLoader({
+    getPlacedPath: async name => name === 'shared.tlg' ? name : '',
+    read: async () => { reads++; return encoded; },
+    extractStorageExt: name => name.slice(-4),
+    chopStorageExt: name => name.slice(0, -4),
+  });
+  const beforeLoad = gpu.diagnostics();
+  const first = await loader.load('shared.tlg');
+  if (gpu.diagnostics().uploads !== beforeLoad.uploads) fail('loading forced a texture upload');
+  await gpu.prepareTextures([first.image]);
+  const second = await loader.load('shared.tlg');
+  const entry = first.image.gpu, beforeClear = gpu.diagnostics();
+  if (reads !== 1 || second.image.gpu !== entry) fail('cached load did not share texture');
+  loader.clear();
+  if (second.image.gpu !== entry || !second.image.gpuValid
+    || gpu.diagnostics().readbacks !== beforeClear.readbacks
+    || gpu.diagnostics().textureCount !== beforeClear.textureCount)
+    fail('cache eviction released or read back a live shared texture');
+  first.image.fill({ left: 0, top: 0, right: 1, bottom: 1 }, 0xffabcdef);
+  if (second.image.point(0, 0) !== 0x7f0c1722) fail('cached image write changed another caller');
+  first.image.release();
+  second.image.release();
+  if (gpu.imageTextures.has(entry)) fail('last explicit image release retained texture');
+  result.push('Graphic cache: deferred upload, shared hits, eviction preserves live GPU storage, isolated writes');
+  const commands = Array.from({ length: 3 }, () => ({ source, options: { motion: true, mode: 0, opacity: 255 } }));
+  // Startup Motion changes target dimensions, forcing accumulation-buffer
+  // replacement. The texture cache is keyed by storage, not Image wrappers.
+  for (const size of [8, 10, 6]) {
+    const target = new Image(size, size);
+    gpu.compositeOffscreen(target, commands);
+    if (!target.gpuValid || gpu.gl.getError() !== 0) fail('offscreen resize lost its framebuffer');
+  }
+  result.push('COW: allocation-free Assign; isolated CPU/GPU writes and resize; Motion accumulation resize succeeds');
+}
+function target(alpha) {
+  const pixels = new Uint8ClampedArray(12 * 9 * 4);
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = (i * 7) & 255; pixels[i + 1] = (i * 11) & 255;
+    pixels[i + 2] = (i * 13) & 255; pixels[i + 3] = alpha;
+  }
+  return Image.from(pixels, 12, 9);
+}
+function glyph(color, seed) {
+  const pixels = new Uint8ClampedArray(4 * 4 * 4);
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+    const i = (y * 4 + x) * 4;
+    pixels[i] = color[0]; pixels[i + 1] = color[1]; pixels[i + 2] = color[2];
+    pixels[i + 3] = (x === 0 || y === 0) ? 0 : ((x * 61 + y * 47 + seed) & 255);
+  }
+  return Image.from(pixels, 4, 4);
+}
+function firstDifference(a, b) {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return i;
+  return -1;
+}
+function compare(name, cpuImage, gpuImage) {
+  const a = cpuImage.pixels, b = gpuImage.pixels, index = firstDifference(a, b);
+  if (index !== -1) fail(`${name}: byte ${index} differs, pixel (${(index >> 2) % cpuImage.width}, ${Math.floor((index >> 2) / cpuImage.width)}), CPU=[${a.slice(index & ~3, (index & ~3) + 4)}], GPU=[${b.slice(index & ~3, (index & ~3) + 4)}]`);
+  result.push(`${name}: exact RGBA`);
+}
+// Canvas uploads avoid getImageData's unpremultiply/round-trip. Compare the
+// visible result instead of unstable RGB bytes underneath fractional alpha.
+function compareCanvasFont(name, cpuImage, gpuImage, tolerance = 2) {
+  const a = cpuImage.pixels, b = gpuImage.pixels;
+  let error = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    if (a[i + 3] !== b[i + 3]) fail(`${name}: alpha differs at ${i / 4}`);
+    for (let c = 0; c < 3; c++) error = Math.max(error, Math.abs(a[i+c]-b[i+c])*a[i+3]/255);
+  }
+  if (error > tolerance) fail(`${name}: visible channel error ${error}`);
+  result.push(`${name}: exact alpha, visible RGB error ${error.toFixed(3)}/255`);
+}
+function draw(image, commands, face, clip = { left: 2, top: 1, right: 10, bottom: 8 }) {
+  const node = { image, clip, drawFace: face, holdAlpha: false, markImageModified() {} };
+  for (const command of commands) clipBlitCPU(node, command.image, command.left, command.top, { opa: command.opa });
+}
+function drawGpu(image, commands, face, clip = { left: 2, top: 1, right: 10, bottom: 8 }) {
+  const node = { image, clip, drawFace: face, holdAlpha: false, markImageModified() {} };
+  for (const command of commands) clipBlit(node, command.image, command.left, command.top, { opa: command.opa });
+}
+
+// CPU reference algorithms live only in this test page.
+function textClipRect(node, source, left, top) {
+  const clip = node.clip ?? { left: 0, top: 0, right: node.image.width, bottom: node.image.height };
+  const rect = {
+    left: Math.max(0, left, clip.left), top: Math.max(0, top, clip.top),
+    right: Math.min(node.image.width, left + source.width, clip.right),
+    bottom: Math.min(node.image.height, top + source.height, clip.bottom),
+  };
+  return rect.right <= rect.left || rect.bottom <= rect.top ? null : rect;
+}
+
+function clipErase(node, source, left, top, strength) {
+  const rect = textClipRect(node, source, left, top);
+  if (!rect) return false;
+  strength = Math.max(0, Math.min(255, Math.trunc(Math.abs(strength))));
+  const destination = node.image.writablePixels;
+  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
+    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
+    const coverage = source.pixels[si + 3];
+    destination[di + 3] = Math.max(0, Math.trunc(destination[di + 3] * (255 - coverage * strength / 255) / 255));
+  }
+  node.markImageModified(rect);
+  return true;
+}
+
+function blendTextPixel(p, di, source, si, opa, face) {
+  const coverage = Math.max(0, Math.min(255, Math.trunc(source[si + 3])));
+  const opacity = Math.max(0, Math.min(255, Math.trunc(opa)));
+  if (coverage === 0 || opa === 0) return;
+  if (opa < 0) {
+    // bmAlphaOnAlpha + negative opacity selects RemoveOpacity in the native
+    // renderer.  The source coverage is the removal mask; RGB is untouched.
+    p[di + 3] = Math.max(0, Math.trunc(p[di + 3] * (255 - coverage * opacity / 255) / 255));
+    return;
+  }
+  const alpha = Math.min(255, (coverage * opacity) >> 8);
+  if (face === 1) {
+    // bmAlpha (opaque destination): colour is interpolated, destination
+    // alpha is retained by ApplyColorMap.
+    for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * alpha / 256);
+    return;
+  }
+  if (face === 4) {
+    // bmAlphaOnAddAlpha: the destination and source RGB values are additive
+    // alpha (premultiplied) channels, as in TVPAddAlphaBlend_a_a.
+    const inverse = 255 - alpha, destAlpha = p[di + 3];
+    for (let c = 0; c < 3; c++) p[di + c] = Math.min(255, ((p[di + c] * inverse) >> 8) + ((source[si + c] * alpha) >> 8));
+    const union = alpha + destAlpha - ((destAlpha * alpha) >> 8);
+    p[di + 3] = union - (union >> 8);
+    return;
+  }
+  if (face !== 0) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  // bmAlphaOnAlpha: source-over in straight RGB, with destination alpha
+  // participating in the source colour ratio.
+  const destAlpha = p[di + 3];
+  const outAlpha = 255 - Math.trunc((255 - alpha) * (255 - destAlpha) / 255);
+  let ratio = 255;
+  if (destAlpha) {
+    const sourceOverDest = alpha / destAlpha;
+    ratio = Math.trunc((sourceOverDest / (1 - alpha / 255 + sourceOverDest)) * 255);
+  }
+  for (let c = 0; c < 3; c++) p[di + c] = Math.trunc(p[di + c] + (source[si + c] - p[di + c]) * ratio / 256);
+  p[di + 3] = outAlpha;
+}
+
+function clipBlitCPU(node, source, left, top, { opa = 255 } = {}) {
+  const face = node.drawFace ?? 0;
+  if (face !== 0 && face !== 1 && face !== 4) throw new Error(`TJS text drawing is unsupported on draw face ${face}`);
+  if (opa === 0) return false;
+  if (opa < 0) return clipErase(node, source, left, top, opa);
+  const rect = textClipRect(node, source, left, top);
+  if (!rect) return false;
+  const destination = node.image.writablePixels;
+  for (let sy = rect.top - top, y = rect.top; y < rect.bottom; y++, sy++) for (let sx = rect.left - left, x = rect.left; x < rect.right; x++, sx++) {
+    const si = (sy * source.width + sx) * 4, di = (y * node.image.width + x) * 4;
+    blendTextPixel(destination, di, source.pixels, si, opa, face);
+  }
+  node.markImageModified(rect);
+  return true;
+}
+
+
+const le32 = (b, o) => (b[o] | b[o + 1] << 8 | b[o + 2] << 16 | b[o + 3] << 24) >>> 0;
+// ---- TLG5 (LoadTLG.cpp TVPLoadTLG5 + tvpgl.cpp TLG5 functions) ----
+function tlg5DecompressSlide(out, inBytes, insize, text, initialr) {
+  let r = initialr, flags = 0, ip = 0, op = 0;
+  const inlim = insize;
+  while (ip < inlim) {
+    if (((flags >>= 1) & 0x100) === 0) {
+      flags = inBytes[ip++] | 0xff00;
+      if (flags === 0xff00 && r < 4096 - 8 && ip < inlim - 8) {
+        for (let i = 0; i < 8; i++) { out[op] = text[r] = inBytes[ip]; op++; r++; ip++; }
+        flags = 0;
+        continue;
+      }
+    }
+    if (flags & 1) {
+      const in16 = inBytes[ip] | (inBytes[ip + 1] << 8); ip += 2;
+      let mpos = in16 & 0xfff;
+      let mlen = (in16 >> 12) + 3;
+      if (mlen === 18) mlen += inBytes[ip++];
+      while (mlen--) {
+        out[op] = text[r] = text[mpos];
+        op++; mpos = (mpos + 1) & 0xfff; r = (r + 1) & 0xfff;
+      }
+    } else {
+      out[op] = text[r] = inBytes[ip++];
+      op++; r = (r + 1) & 0xfff;
+    }
+  }
+  return r;
+}
+
+function tlg5ComposeColors3To4(out, upper, bufs, width) {
+  // tvpgl.cpp TVPTLG5ComposeColors3To4_c: out is BGRA bytes; buf planes are
+  // B,G,R with the C-order accumulation from the native code.
+  const pc = [0, 0, 0];
+  for (let x = 0; x < width; x++) {
+    const c0 = bufs[0][x], c1 = bufs[1][x], c2 = bufs[2][x];
+    // Native: c[2]=buf[0][x]; c[1]=buf[1][x]; c[0]=buf[2][x]; c[0]+=c[1]; c[2]+=c[1];
+    const cc0 = (c2 + c1) & 0xff; // c[0] = buf[2] + buf[1]
+    const cc1 = c1 & 0xff;
+    const cc2 = (c0 + c1) & 0xff; // c[2] = buf[0] + buf[1]
+    const b = ((pc[0] = (pc[0] + cc0) & 0xff) + upper[x * 4]) & 0xff;
+    const g = ((pc[1] = (pc[1] + cc1) & 0xff) + upper[x * 4 + 1]) & 0xff;
+    const r = ((pc[2] = (pc[2] + cc2) & 0xff) + upper[x * 4 + 2]) & 0xff;
+    out[x * 4] = b; out[x * 4 + 1] = g; out[x * 4 + 2] = r; out[x * 4 + 3] = 0xff;
+  }
+}
+
+function tlg5ComposeColors4To4(out, upper, bufs, width) {
+  const [red, green, blue, alpha] = bufs;
+  let b = 0, g = 0, r = 0, a = 0;
+  for (let x = 0, p = 0; x < width; x++, p += 4) {
+    const c = green[x];
+    b = (b + blue[x] + c) & 255;
+    g = (g + c) & 255;
+    r = (r + red[x] + c) & 255;
+    a = (a + alpha[x]) & 255;
+    out[p] = (b + upper[p]) & 255;
+    out[p + 1] = (g + upper[p + 1]) & 255;
+    out[p + 2] = (r + upper[p + 2]) & 255;
+    out[p + 3] = (a + upper[p + 3]) & 255;
+  }
+}
+
+function decodeTLG5CPUReference(bytes) {
+  let p = 11; // after "TLG5.0\x00raw\x1a\x00"
+  const colors = bytes[p]; p += 1;
+  if (colors !== 3 && colors !== 4) throw new Error('TJS unsupported color type in TLG');
+  const width = le32(bytes, p); p += 4;
+  const height = le32(bytes, p); p += 4;
+  const blockheight = le32(bytes, p); p += 4;
+  const blockcount = Math.floor((height - 1) / blockheight) + 1;
+  p += blockcount * 4; // skip block size section
+  const image = new Image(width, height);
+  const text = new Uint8Array(4096);
+  let r = 0;
+  const bufs = [new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16), new Uint8Array(blockheight * width + 16)];
+  let prevRow = null;
+  const upper = new Uint8Array(width * 4);
+  const pixels = image.writablePixels;
+  for (let yblk = 0; yblk < height; yblk += blockheight) {
+    for (let c = 0; c < colors; c++) {
+      const mark = bytes[p++];
+      const size = le32(bytes, p); p += 4;
+      if (mark === 0) {
+        r = tlg5DecompressSlide(bufs[c], bytes.subarray(p, p + size), size, text, r);
+        p += size;
+      } else {
+        bufs[c].set(bytes.subarray(p, p + size));
+        p += size;
+      }
+    }
+    const ylim = Math.min(yblk + blockheight, height);
+    for (let y = yblk; y < ylim; y++) {
+      const row = pixels.subarray(y * width * 4, (y + 1) * width * 4);
+      const rowBufs = bufs.map(buf => buf.subarray((y - yblk) * width));
+      if (prevRow) {
+        if (colors === 3) tlg5ComposeColors3To4(row, prevRow, rowBufs, width);
+        else tlg5ComposeColors4To4(row, prevRow, rowBufs, width);
+      } else {
+        // First block line: upper = zero line (alpha 0xff for colors=3).
+        const zero = new Uint8Array(width * 4);
+        if (colors === 3) for (let x = 0; x < width; x++) zero[x * 4 + 3] = 0xff;
+        if (colors === 3) tlg5ComposeColors3To4(row, zero, rowBufs, width);
+        else tlg5ComposeColors4To4(row, zero, rowBufs, width);
+      }
+      prevRow = row;
+    }
+  }
+  return image;
+}
+
+// ---- TLG6 (LoadTLG.cpp TVPLoadTLG6 + tvpgl.cpp TLG6 decoder) ----
+const GOLOMB_N = 4;
+const GOLOMB_COMPRESSED = [
+  [3, 7, 15, 27, 63, 108, 223, 448, 130],
+  [3, 5, 13, 24, 51, 95, 192, 384, 257],
+  [2, 5, 12, 21, 39, 86, 155, 320, 384],
+  [2, 3, 9, 18, 33, 61, 129, 258, 511],
+];
+const LEADING_ZERO_BITS = 12;
+const LEADING_ZERO_SIZE = 1 << LEADING_ZERO_BITS;
+const LeadingZeroTable = new Uint8Array(LEADING_ZERO_SIZE);
+for (let i = 0; i < LEADING_ZERO_SIZE; i++) {
+  let cnt = 0, j;
+  for (j = 1; j !== LEADING_ZERO_SIZE && !(i & j); j <<= 1, cnt++) ;
+  cnt++;
+  if (j === LEADING_ZERO_SIZE) cnt = 0;
+  LeadingZeroTable[i] = cnt;
+}
+const GolombBitLengthTable = [];
+for (let n = 0; n < GOLOMB_N; n++) {
+  const table = new Uint8Array(GOLOMB_N * 2 * 128);
+  let a = 0;
+  for (let i = 0; i < 9; i++) {
+    for (let j = 0; j < GOLOMB_COMPRESSED[n][i]; j++) table[a++] = i;
+  }
+  GolombBitLengthTable[n] = table;
+}
+
+// Shared by the TLG6 writer; this is the decompressed native table rather
+// than another copy of the compressed constants.
+
+
+function makeBitReader(bytes, start, length) {
+  // TVP_TLG6_FETCH_32BITS semantics on a byte pool.
+  let bitPos = 1, bytePos = start;
+  const zero = (bytes[start] & 1) ? 0 : 1;
+  const fetch32 = () => {
+    let v = 0;
+    for (let i = 0; i < 4; i++) v += (bytes[bytePos + i] ?? 0) * 2 ** (8 * i);
+    return v >>> 0;
+  };
+  return {
+    zero,
+    readCount() {
+      let t = fetch32() >>> bitPos;
+      let b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+      let bitCount = b;
+      while (!b) {
+        bitCount += LEADING_ZERO_BITS; bitPos += LEADING_ZERO_BITS;
+        bytePos += bitPos >> 3; bitPos &= 7;
+        t = fetch32() >>> bitPos;
+        b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+        bitCount += b;
+      }
+      bitPos += b; bytePos += bitPos >> 3; bitPos &= 7;
+      bitCount--;
+      let count = 1 << bitCount;
+      count += (fetch32() >>> bitPos) & (count - 1);
+      bitPos += bitCount; bytePos += bitPos >> 3; bitPos &= 7;
+      return count;
+    },
+    readValue(a, n) {
+      const k = GolombBitLengthTable[n][a];
+      let t = fetch32() >>> bitPos, bitCount, b;
+      if (t) {
+        b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+        bitCount = b;
+        while (!b) {
+          bitCount += LEADING_ZERO_BITS; bitPos += LEADING_ZERO_BITS;
+          bytePos += bitPos >> 3; bitPos &= 7;
+          t = fetch32() >>> bitPos;
+          b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+          bitCount += b;
+        }
+        bitCount--;
+      } else {
+        bytePos += 5; bitCount = bytes[bytePos - 1]; bitPos = 0;
+        t = fetch32(); b = 0;
+      }
+      let v = (bitCount << k) + ((t >>> b) & ((1 << k) - 1));
+      const sign = (v & 1) - 1;
+      v >>= 1;
+      const outByte = (v ^ sign) + sign + 1;
+      bitPos += b; bitPos += k;
+      bytePos += bitPos >> 3; bitPos &= 7;
+      return { outByte, a: a + v };
+    },
+  };
+}
+
+function decodeGolombValues(pixelbuf, pixelCount, bytes, start, forFirst) {
+  // tvpgl.cpp TVPTLG6DecodeGolombValues[_ForFirst]_c.
+  let n = GOLOMB_N - 1, a = 0;
+  const reader = makeBitReader(bytes, start, pixelCount);
+  let bitPos = 1;
+  let zero = (bytes[start] & 1) ? 0 : 1;
+  let idx = 0;
+  const total = pixelCount * 4;
+  while (idx < total) {
+    // running count (shared bit position logic)
+    let t = fetch32(bytes, start) >>> bitPos;
+    let b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+    let bitCount = b;
+    while (!b) {
+      bitCount += LEADING_ZERO_BITS; bitPos += LEADING_ZERO_BITS;
+      start += bitPos >> 3; bitPos &= 7;
+      t = fetch32(bytes, start) >>> bitPos;
+      b = LeadingZeroTable[t & (LEADING_ZERO_SIZE - 1)];
+      bitCount += b;
+    }
+    bitPos += b; start += bitPos >> 3; bitPos &= 7;
+    bitCount--;
+    let count = 1 << bitCount;
+    count += (fetch32(bytes, start) >>> bitPos) & (count - 1);
+    bitPos += bitCount; start += bitPos >> 3; bitPos &= 7;
+    if (zero) {
+      for (let i = 0; i < count; i++) {
+        if (forFirst) { pixelbuf[idx] = pixelbuf[idx + 1] = pixelbuf[idx + 2] = pixelbuf[idx + 3] = 0; }
+        else pixelbuf[idx] = 0;
+        idx += 4;
+      }
+      zero ^= 1;
+    } else {
+      for (let i = 0; i < count; i++) {
+        const k = GolombBitLengthTable[n][a];
+        let t2 = fetch32(bytes, start) >>> bitPos, bitCount2, b2;
+        if (t2) {
+          b2 = LeadingZeroTable[t2 & (LEADING_ZERO_SIZE - 1)];
+          bitCount2 = b2;
+          while (!b2) {
+            bitCount2 += LEADING_ZERO_BITS; bitPos += LEADING_ZERO_BITS;
+            start += bitPos >> 3; bitPos &= 7;
+            t2 = fetch32(bytes, start) >>> bitPos;
+            b2 = LeadingZeroTable[t2 & (LEADING_ZERO_SIZE - 1)];
+            bitCount2 += b2;
+          }
+          bitCount2--;
+        } else {
+          start += 5; bitCount2 = bytes[start - 1]; bitPos = 0;
+          t2 = fetch32(bytes, start); b2 = 0;
+        }
+        let v = (bitCount2 << k) + ((t2 >>> b2) & ((1 << k) - 1));
+        const sign = (v & 1) - 1;
+        v >>= 1;
+        a += v;
+        pixelbuf[idx] = ((v ^ sign) + sign + 1) & 0xff;
+        if (forFirst) { pixelbuf[idx + 1] = pixelbuf[idx + 2] = pixelbuf[idx + 3] = 0; }
+        idx += 4;
+        bitPos += b2; bitPos += k;
+        start += bitPos >> 3; bitPos &= 7;
+        if (--n < 0) { a >>= 1; n = GOLOMB_N - 1; }
+      }
+      zero ^= 1;
+    }
+  }
+}
+
+function fetch32(bytes, pos) {
+  let v = 0;
+  for (let i = 0; i < 4; i++) v += (bytes[pos + i] ?? 0) * 2 ** (8 * i);
+  return v >>> 0;
+}
+
+const W_BLOCK = 8, H_BLOCK = 8;
+
+function packedBytesAdd(a, b) {
+  const tmp = ((((a & b) << 1) + ((a ^ b) & 0xfefefefe)) & 0x01010100) >>> 0;
+  return (a + b - tmp) >>> 0;
+}
+function makeGtMask(a, b) {
+  const tmp2 = ~b >>> 0;
+  let tmp = (((a & tmp2) + (((a ^ tmp2) >>> 1) & 0x7f7f7f7f)) & 0x80808080) >>> 0;
+  tmp = (((tmp >>> 7) + 0x7f7f7f7f) ^ 0x7f7f7f7f) >>> 0;
+  return tmp;
+}
+function med2(a, b, c) {
+  const aaGtBb = makeGtMask(a, b);
+  const axb = ((a ^ b) & aaGtBb) >>> 0;
+  const aa = (axb ^ a) >>> 0, bb = (axb ^ b) >>> 0;
+  const n = makeGtMask(c, bb), nn = makeGtMask(aa, c);
+  const m = (~(n | nn)) >>> 0;
+  return ((n & aa) | (nn & bb) | (((((bb & m) >>> 0) - (c & m) + (aa & m)) >>> 0) & 0)) >>> 0 ||
+    packedBytesAdd(((n & aa) | (nn & bb) | (((bb & m) - (c & m) + (aa & m)) & m)) >>> 0, 0);
+}
+function med(a, b, c, v) { return packedBytesAdd(med2Simple(a, b, c), v); }
+function med2Simple(a, b, c) {
+  const aaGtBb = makeGtMask(a, b);
+  const axb = ((a ^ b) & aaGtBb) >>> 0;
+  const aa = (axb ^ a) >>> 0, bb = (axb ^ b) >>> 0;
+  const n = makeGtMask(c, bb), nn = makeGtMask(aa, c);
+  const m = (~(n | nn)) >>> 0;
+  const select = ((n & aa) | (nn & bb)) >>> 0;
+  const tail = (((((bb & m) >>> 0) - (c & m) + (aa & m)) >>> 0) & m) >>> 0;
+  return (select | tail) >>> 0;
+}
+const avgPacked = (x, y) => (((((x & y) + (((x ^ y) & 0xfefefefe) >>> 1)) + ((x ^ y) & 0x01010101)) >>> 0));
+function avg(a, b, c, v) { return packedBytesAdd(avgPacked(a, b), v); }
+
+function decodeTLG6CPUReference(bytes, palettized = false) {
+  let p = 11;
+  const colors = bytes[p];
+  if (colors !== 1 && colors !== 4 && colors !== 3) throw new Error('TJS unsupported color count in TLG6');
+  if (bytes[p + 1] !== 0) throw new Error('TJS data flag must be zero');
+  if (bytes[p + 2] !== 0) throw new Error('TJS unsupported color type');
+  if (bytes[p + 3] !== 0) throw new Error('TJS unsupported external golomb table');
+  p += 4;
+  const width = le32(bytes, p); p += 4;
+  const height = le32(bytes, p); p += 4;
+  const maxBitLength = le32(bytes, p); p += 4;
+  const image = new Image(width, height);
+  const xBlockCount = Math.floor((width - 1) / W_BLOCK) + 1;
+  const yBlockCount = Math.floor((height - 1) / H_BLOCK) + 1;
+  // chroma filter types: LZSS-compressed
+  const filterTypes = new Uint8Array(xBlockCount * yBlockCount + 16);
+  {
+    const inbufSize = le32(bytes, p); p += 4;
+    const text = new Uint8Array(4096);
+    let offset = 0;
+    for (let i = 0; i < 32; i++) for (let j = 0; j < 16; j++) {
+      text.fill(i, offset, offset + 4);
+      text.fill(j, offset + 4, offset + 8);
+      offset += 8;
+    }
+    tlg5DecompressSlide(filterTypes, bytes.subarray(p, p + inbufSize), inbufSize, text, 0);
+    p += inbufSize;
+  }
+  const pixelbuf = new Uint8Array(width * H_BLOCK * 4 + 4);
+  const zeroline = new Uint8Array(width * 4);
+  if (colors === 3) for (let x = 0; x < width; x++) zeroline[x * 4 + 3] = 0xff;
+  const pixels = image.writablePixels;
+  for (let y = 0; y < height; y += H_BLOCK) {
+    const ylim = Math.min(y + H_BLOCK, height);
+    const pixelCount = (ylim - y) * width;
+    for (let c = 0; c < colors; c++) {
+      const bitLengthRaw = le32(bytes, p); p += 4;
+      const method = (bitLengthRaw >>> 30) & 3;
+      const bitLength = bitLengthRaw & 0x3fffffff;
+      const byteLength = Math.ceil(bitLength / 8);
+      if (method !== 0) throw new Error('TJS unsupported entropy coding method');
+      decodeGolombValues(pixelbuf.subarray(c), pixelCount, bytes, p, c === 0 && colors !== 1);
+      p += byteLength;
+    }
+    const ftBase = (y / H_BLOCK) * xBlockCount;
+    const skipbytes = (ylim - y) * W_BLOCK;
+    for (let yy = y; yy < ylim; yy++) {
+      const curline = pixels.subarray(yy * width * 4, (yy + 1) * width * 4);
+      const dir = (yy & 1) ^ 1;
+      const oddskip = ((ylim - yy - 1) - (yy - y));
+      const up = yy === 0 ? null : pixels.subarray((yy - 1) * width * 4, yy * width * 4);
+      decodeLine(curline, up ?? zeroline, width, xBlockCount, filterTypes, ftBase, skipbytes, pixelbuf, colors === 3 ? 0xff000000 : 0, oddskip, dir, yy - y);
+    }
+  }
+  return image;
+}
+
+function decodeLine(curline, upline, width, xBlockCount, filterTypes, ftBase, skipbytes, pixelbuf, initialp, oddskip, dir, row) {
+  // tvpgl.cpp TVPTLG6DecodeLineGeneric_c: chroma decode + MED/AVG.
+  let p = initialp >>> 0, up = initialp >>> 0;
+  for (let i = 0; i < xBlockCount; i++) {
+    let w = width - i * W_BLOCK;
+    if (w > W_BLOCK) w = W_BLOCK;
+    if (w <= 0) break;
+    const ft = filterTypes[ftBase + i];
+    const method = ft >> 1, postOp = ft & 1;
+    const step = (dir & 1) ? 1 : -1;
+    let inOffset = (skipbytes * i + w * row + (step === -1 ? w - 1 : 0) + (i & 1 ? oddskip * w : 0)) * 4;
+    for (let k = 0; k < w; k++) {
+      const idx = i * W_BLOCK + k;
+      const px = idx * 4;
+      const B = (pixelbuf[inOffset] << 24 >>> 24), G = (pixelbuf[inOffset + 1] << 24 >>> 24), R = (pixelbuf[inOffset + 2] << 24 >>> 24);
+      let bb, gg, rr, aa;
+      switch (method) {
+        case 0: bb = B; gg = G; rr = R; break;
+        case 1: bb = B + G; gg = G; rr = R + G; break;
+        case 2: bb = B; gg = G + B; rr = R + B + G; break;
+        case 3: bb = B + R + G; gg = G + R; rr = R; break;
+        case 4: bb = B + R; gg = G + B + R; rr = R + B + R + G; break;
+        case 5: bb = B + R; gg = G + B + R; rr = R; break;
+        case 6: bb = B + G; gg = G; rr = R; break;
+        case 7: bb = B; gg = G + B; rr = R; break;
+        case 8: bb = B; gg = G; rr = R + G; break;
+        case 9: bb = B + G + R + B; gg = G + R + B; rr = R + B; break;
+        case 10: bb = B + R; gg = G + R; rr = R; break;
+        case 11: bb = B; gg = G + B; rr = R + B; break;
+        case 12: bb = B; gg = G + R + B; rr = R + B; break;
+        case 13: bb = B + G; gg = G + R + B + G; rr = R + B + G; break;
+        case 14: bb = B + G + R; gg = G + R; rr = R + B + G + R; break;
+        case 15: bb = B; gg = G + (B << 1); rr = R + (B << 1); break;
+        default: return;
+      }
+      // IA is a residual; colors=3 keeps it zero and predicts opaque alpha
+      // from initialp/zeroline.
+      aa = pixelbuf[inOffset + 3];
+      const v = ((aa & 0xff) << 24) + ((rr & 0xff) << 16) + ((gg & 0xff) << 8) + (bb & 0xff);
+      const u = (upline[px + 3] << 24 | upline[px] << 16 | upline[px + 1] << 8 | upline[px + 2]) >>> 0;
+      const prevP = p;
+      p = (postOp ? avg : med)(prevP, u, up, v);
+      up = u;
+      curline[px] = (p >>> 16) & 0xff; curline[px + 1] = (p >>> 8) & 0xff;
+      curline[px + 2] = p & 0xff; curline[px + 3] = (p >>> 24) & 0xff;
+      inOffset += step * 4;
+    }
+  }
+}
+
+
+// PSB 32-bit words are little-endian BGRA; return the native ARGB value.
+function psbReadWord(bytes, offset) {
+  return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | ((bytes[offset + 3] ?? 0) << 24)) >>> 0;
+}
+// SourceCache.cpp decodeObjSourceRL8_guess.
+function decodeRL8CPUReference(source, pixelCount) {
+  const out = new Uint8Array(pixelCount);
+  let cursor = 0, written = 0;
+  while (cursor < source.length) {
+    const marker = source[cursor++];
+    if (marker & 0x80) {
+      const count = (marker & 0x7f) + 3, value = source[cursor++];
+      out.fill(value, written, Math.min(pixelCount, written + count));
+      written += count;
+    } else {
+      const count = marker + 1;
+      for (let i = 0; i < count && written < pixelCount; i++) out[written++] = source[cursor++];
+      if (written >= pixelCount) break;
+    }
+  }
+  return out;
+}
+// SourceCache.cpp decodeObjSourceRL32_guess (word fill).
+function decodeRL32CPUReference(source, out) {
+  const pixelCount = out.length;
+  let cursor = 0, written = 0;
+  while (cursor < source.length) {
+    const marker = source[cursor++];
+    if (marker & 0x80) {
+      const count = (marker & 0x7f) + 3, value = rgbaWord(source, cursor);
+      cursor += 4;
+      out.fill(value, written, Math.min(pixelCount, written + count));
+      written += count;
+    } else {
+      const count = marker + 1;
+      for (let i = 0; i < count && written < pixelCount; i++) { out[written++] = rgbaWord(source, cursor); cursor += 4; }
+      if (written >= pixelCount) break;
+    }
+  }
+}
+// Little-endian RGBA storage: swap the red and blue bytes of a BGRA word.
+function rgbaWord(bytes, offset) {
+  const word = psbReadWord(bytes, offset);
+  return (word & 0xff00ff00) | ((word >>> 16) & 0xff) | ((word & 0xff) << 16);
+}
+
+function blurGlyphCPUReference(source, blurWidth, blurLevel = 255) {
+  const radius = Math.abs(Math.trunc(blurWidth));
+  blurLevel = Math.max(0, Math.min(255, Math.trunc(blurLevel)));
+  if (!radius) {
+    if (blurLevel === 255) return { image: source, offsetX: 0, offsetY: 0 };
+    const image = source.clone();
+    const pixels = image.writablePixels;
+    for (let i = 3; i < pixels.length; i += 4) pixels[i] = Math.min(255, (pixels[i] * blurLevel) >> 8);
+    return { image, offsetX: 0, offsetY: 0 };
+  }
+  const hypot = (x, y) => {
+    x = Math.abs(x); y = Math.abs(y);
+    const hi = Math.max(x, y), lo = Math.min(x, y), t = lo + (lo >> 1);
+    return hi - (hi >> 5) - (hi >> 7) + (t >> 2) + (t >> 6);
+  };
+  const kernel = [];
+  let total = 0;
+  for (let y = -radius; y <= radius; y++) for (let x = -radius; x <= radius; x++) {
+    const distance = hypot(x, y);
+    if (distance <= radius) { const weight = radius - distance + 1; kernel.push([x, y, weight]); total += weight; }
+  }
+  const levelScale = Math.trunc((1 << 18) / total);
+  const weightedKernel = kernel.map(([x, y, weight]) => [x, y, Math.trunc(weight * levelScale * blurLevel / 256)]);
+  const image = new Image(source.width + radius * 2, source.height + radius * 2);
+  const pixels = image.writablePixels;
+  let hasActive = false;
+  let minX = source.width, minY = source.height, maxX = -1, maxY = -1;
+  for (let i = 3; i < source.pixels.length; i += 4) {
+    if (!source.pixels[i]) continue;
+    const index = (i - 3) >> 2, x = index % source.width, y = Math.floor(index / source.width);
+    hasActive = true;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  }
+  // Alpha is a sum of nonnegative, integer contributions with a 255 cap, so
+  // transparent source pixels can be omitted without changing the result.
+  // This avoids scanning blank parts of the glyph rectangle for every kernel
+  // position.
+  if (hasActive) {
+    for (let sy = minY; sy <= maxY; sy++) for (let sx = minX; sx <= maxX; sx++) {
+      const src = (sy * source.width + sx) * 4, sourceAlpha = source.pixels[src + 3];
+      if (!sourceAlpha) continue;
+      for (const [ox, oy, kernelLevel] of weightedKernel) {
+        const dst = ((sy + oy + radius) * image.width + sx + ox + radius) * 4 + 3;
+        const contribution = Math.trunc(sourceAlpha * kernelLevel / (1 << 18));
+        pixels[dst] = Math.min(255, pixels[dst] + contribution);
+      }
+    }
+  }
+  // RGB does not participate in the blur; the legacy loop leaves the RGB
+  // value from the last kernel sample touching each output pixel. Reproduce
+  // that value with a reverse kernel lookup, including transparent pixels.
+  for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+    const dst = (y * image.width + x) * 4;
+    for (let i = weightedKernel.length - 1; i >= 0; i--) {
+      const [ox, oy] = weightedKernel[i];
+      const sx = x - ox - radius, sy = y - oy - radius;
+      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) continue;
+      const src = (sy * source.width + sx) * 4;
+      pixels[dst] = source.pixels[src];
+      pixels[dst + 1] = source.pixels[src + 1];
+      pixels[dst + 2] = source.pixels[src + 2];
+      break;
+    }
+  }
+  return { image, offsetX: -Math.trunc(blurWidth), offsetY: -Math.trunc(blurWidth) };
+}
+
+
+try {
+  await checkSharedImages();
+  {
+    for (const [width, height] of [[0, 0], [0, 3], [3, 0]]) for (const radius of [0, 1, -2]) {
+      const empty = new Image(width, height);
+      const expected = blurGlyphCPUReference(empty, radius, 128);
+      const actual = blurGlyphImage(empty, radius, 128);
+      if (actual.image.width !== expected.image.width || actual.image.height !== expected.image.height
+        || firstDifference(actual.image.pixels, expected.image.pixels) !== -1) fail('empty glyph blur');
+    }
+    result.push('Empty glyph blur: preserves CPU dimensions and transparent pixels without zero-sized textures');
+  }
+  {
+    const source = target(128), before = gpu.stats.readbacks;
+    const blurred = blurGlyphImage(source, 2, 173);
+    gpu.glyph(blurred.image);
+    if (gpu.stats.readbacks !== before || blurred.image.cpuValid) fail('GPU glyph blur/atlas caused CPU readback');
+    result.push('GPU glyph blur to atlas: zero CPU readbacks');
+  }
+  {
+    const image = target(128), province = new Image(12, 9, { gray: true });
+    const before = gpu.stats.readbackBytes;
+    const bounds = gpuBtoa.fillToProvince(image, province, [2, 1, 10, 8], 0, 7, 64, true);
+    if (String(bounds) !== '2,1,8,7') fail('GPU province bounding box');
+    if (gpu.stats.readbackBytes - before !== 7 * 4) fail('GPU bbox readback must be per-row');
+    const bytes = province.pixels;
+    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
+      if (bytes[y * 12 + x] !== (x >= 2 && x < 10 && y >= 1 && y < 8 ? 7 : 0)) fail('GPU province clipped write');
+    }
+    if (gpuBtoa.fillToProvince(image, province, [0, 0, 12, 9], 0, 3, 256, true) !== undefined) fail('GPU empty bbox');
+    const mask = Image.from(new Uint8ClampedArray(12 * 9).fill(37), 12, 9, { gray: true });
+    const expected = image.clone(), p = expected.writablePixels;
+    for (let i = 3; i < p.length; i += 4) p[i] = 37;
+    gpuBtoa.assignAlpha(image, mask);
+    compare('GPU gray mask alpha assignment', expected, image);
+    const mat = image.clone(), matExpected = image.clone(), q = matExpected.writablePixels, rgb = [211, 53, 137];
+    for (let i = 0; i < q.length; i += 4) {
+      for (let c = 0; c < 3; c++) q[i + c] = rgb[c] + ((q[i + c] - rgb[c]) * q[i + 3] >> 8);
+      q[i + 3] = 255;
+    }
+    gpuBtoa.alphaColorMat(mat, 0xd33589);
+    compare('GPU alpha color mat signed rounding', matExpected, mat);
+    result.push('GPU province fill: clipped/empty bbox, only 4 bytes readback per row');
+  }
+  {
+    const source = target(128), p = source.pixels;
+    for (const ratio of [[1, 1], [2, 2], [2.5, 2.25], [3.7, 2.9]]) {
+      const dest = new Image(4, 4), expected = new Image(4, 4), out = expected.writablePixels;
+      const offset = [0.4, 0.2];
+      for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) for (let c = 0; c < 4; c++) {
+        const a = [(x - offset[0]) * ratio[0], (y - offset[1]) * ratio[1]], b = [a[0] + ratio[0], a[1] + ratio[1]];
+        let sum = 0;
+        for (let sy = Math.max(0, Math.floor(a[1])); sy <= Math.min(6, Math.ceil(b[1]) - 1); sy++)
+          for (let sx = Math.max(0, Math.floor(a[0])); sx <= Math.min(9, Math.ceil(b[0]) - 1); sx++)
+            sum += p[((sy + 1) * 12 + sx + 1) * 4 + c] * (Math.min(b[0], sx + 1) - Math.max(a[0], sx)) * (Math.min(b[1], sy + 1) - Math.max(a[1], sy));
+        out[(y * 4 + x) * 4 + c] = Math.trunc(sum / (ratio[0] * ratio[1]));
+      }
+      shrinkArea(source, dest, { clip: { left: 0, top: 0, right: 4, bottom: 4 }, ratio, sourceOrigin: [1, 1], sourceExtent: [10, 7], destinationOffset: offset });
+      const actual = dest.pixels;
+      const max = Math.max(...actual.map((v, i) => Math.abs(v - out[i])));
+      if (max > 1) fail('fractional GPU shrink error ' + max);
+      result.push(`GPU fractional area ${ratio}: max byte difference=${max}`);
+    }
+    const fast = new Image(3, 3), expected = new Image(3, 3), out = expected.writablePixels;
+    for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) {
+      const w = Math.min(5, 12 - x * 5), h = Math.min(4, 9 - y * 4);
+      for (let c = 0; c < 3; c++) {
+        let sum = 0;
+        for (let sy = 0; sy < h; sy++) for (let sx = 0; sx < w; sx++) sum += p[((y * 4 + sy) * 12 + x * 5 + sx) * 4 + c];
+        out[(y * 3 + x) * 4 + c] = Math.trunc(sum / (w * h));
+      }
+      out[(y * 3 + x) * 4 + 3] = 255;
+    }
+    shrinkArea(source, fast, { clip: { left: 0, top: 0, right: 3, bottom: 3 }, ratio: [5, 4], fast: true });
+    compare('GPU fast shrink remainder blocks and opaque alpha', expected, fast);
+  }
+  {
+    const gray = Image.from(new Uint8ClampedArray([11, 22, 33, 44]), 2, 2, { gray: true });
+    gpu.texture(gray);
+    const copy = gray.clone();
+    if (!copy.gray || String(copy.pixels) !== '11,22,33,44') fail('R8 clone/readback');
+    const tiled = tileImage(gray, 3, 3);
+    if (String(tiled.pixels) !== '11,22,11,33,44,33,11,22,11') fail('R8 tiled texture');
+    copy.fill({ left: 0, top: 0, right: 1, bottom: 1 }, 99);
+    if (copy.point(0, 0) !== 99 || copy.pixels[3] !== 44) fail('R8 GPU fill');
+    const province = new Image(12, 9, { gray: true }), source = target(128);
+    gpuBtoa.copyAlphaToProvince(source, province, [0, 0, 12, 9], 127, 7, 3, 1);
+    if (!province.pixels.every(x => x === 7)) fail('R8 alpha threshold');
+    result.push('R8 upload, clone, readback, GPU fill, tiling and alpha threshold: exact bytes');
+  }
+  {
+    const source = target(128), dest = target(71), expected = dest.clone();
+    for (let i = 3; i < expected.writablePixels.length; i += 4) expected._pixels[i] = (71 * 128 + (71 * 128 >> 7)) >> 8;
+    gpuBtoa.clipAlphaRect(dest, source, [0, 0, 12, 9], [0, 0, 12, 9], [0, 0]);
+    compare('GPU alpha clip uses alpha channel', expected, dest);
+    const overlap = Image.from(new Uint8ClampedArray([10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255]), 4, 1);
+    gpuBtoa.overwrapRect(overlap, overlap, [1, 0, 4, 1], [1, 0, 4, 1], [0, 0], 1);
+    if ([0, 4, 8, 12].some(i => overlap.pixels[i] !== 10)) fail('GPU forward self-copy');
+    const filled = target(71);
+    gpuBtoa.fillAlpha(filled, [2, 1, 10, 8]);
+    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
+      if (filled.pixels[(y * 12 + x) * 4 + 3] !== (x >= 2 && x < 10 && y >= 1 && y < 8 ? 255 : 71)) fail('GPU fillAlpha clip');
+    }
+    result.push('GPU alpha helper self-copy: exact bytes');
+  }
+  {
+    const source = target(128), dest = new Image(4, 3), expected = new Image(4, 3);
+    const p = source.pixels, out = expected.writablePixels;
+    for (let y = 0; y < 3; y++) for (let x = 0; x < 4; x++) for (let c = 0; c < 4; c++) {
+      let sum = 0;
+      for (let sy = 0; sy < 3; sy++) for (let sx = 0; sx < 3; sx++) sum += p[((y * 3 + sy) * 12 + x * 3 + sx) * 4 + c];
+      out[(y * 4 + x) * 4 + c] = Math.trunc(sum / 9);
+    }
+    const reads = gpu.stats.readbacks;
+    shrinkArea(source, dest, { clip: { left: 0, top: 0, right: 4, bottom: 3 }, ratio: [3, 3] });
+    if (gpu.stats.readbacks !== reads) fail('GPU shrink read pixels');
+    compare('GPU integer area average', expected, dest);
+    const raster = target(71), rasterExpected = raster.clone(), shifts = [0, 1, -1, 2, -2, 30, -30, 0, 3];
+    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
+      const sx = x - shifts[y];
+      if (sx >= 0 && sx < 12) rasterExpected.writablePixels.set(p.subarray((y * 12 + sx) * 4, (y * 12 + sx) * 4 + 4), (y * 12 + x) * 4);
+    }
+    rasterCopy(source, raster, shifts, { left: 0, top: 0, right: 12, bottom: 9 });
+    compare('GPU raster signed shifts and untouched edges', rasterExpected, raster);
+  }
+  {
+    const canvas = new OffscreenCanvas(2, 2), context = canvas.getContext('2d');
+    const pixels = new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 12, 34, 56, 255]);
+    context.putImageData(new ImageData(pixels, 2, 2), 0, 0);
+    const image = new Image(2, 2, { defer: true });
+    uploadVideoCanvas(image, canvas);
+    if (firstDifference(image.pixels, pixels) !== -1) fail('GPU canvas upload orientation');
+    result.push('GPU video canvas upload orientation: exact RGBA');
+  }
+  {
+    for (const radius of [-3, 0, 1, 2]) for (const level of [0, 1, 128, 255]) {
+      const source = target(128);
+      for (let i = 0; i < source.writablePixels.length; i += 4) source._pixels[i + 3] = (i * 7) & 255;
+      const expected = blurGlyphCPUReference(source, radius, level);
+      const actual = blurGlyphImage(source, radius, level);
+      compare(`GPU glyph blur width=${radius},level=${level}`, expected.image, actual.image);
+      if (expected.offsetX !== actual.offsetX || expected.offsetY !== actual.offsetY) fail('glyph blur origin');
+    }
+  }
+  {
+    const image = new Image(2, 1);
+    const rect = { left: 0, top: 0, right: 2, bottom: 1 };
+    gpu.fill(image, rect, [12, 23, 34, 127]);
+    const before = gpu.stats.readbacks;
+    const bytesBefore = gpu.stats.readbackBytes;
+    for (let i = 0; i < 8; i++) if (image.point(0, 0) !== 0x7f0c1722) fail('GPU point colour');
+    if (gpu.stats.readbacks !== before + 8 || gpu.stats.readbackBytes !== bytesBefore + 32)
+      fail('GPU point must read exactly one pixel per query');
+    gpu.fill(image, rect, [56, 67, 78, 127]);
+    if (image.point(0, 0) !== 0x7f38434e || gpu.stats.readbacks !== before + 9) fail('GPU point after fill');
+    image.setPoint(0, 0, 0x7f010203);
+    if (image.point(0, 0) !== 0x7f010203) fail('GPU point after setPoint');
+    result.push('GPU hit pixel: no cache, each query reads exactly one pixel');
+  }
+  {
+    const program = gpu.compositeProgram;
+    for (const alpha of [0, 127, 255]) for (const opacity of [17, 128, 255]) for (const opaque of [false, true]) {
+      const source = target(alpha), generic = target(128), specialized = target(128);
+      const options = { motion: true, mode: 0, opacity, opaque,
+        matrix: [0.8, 0.1, -0.1, 0.8, 1, 0], clip: { left: 1, top: 1, right: 10, bottom: 8 } };
+      try {
+        gpu.compositeProgram = gpu.program;
+        gpu.draw(generic, source, options);
+      } finally { gpu.compositeProgram = program; }
+      gpu.draw(specialized, source, options);
+      compare(`specialized composite alpha=${alpha},opacity=${opacity},opaque=${opaque}`, generic, specialized);
+    }
+  }
+  {
+    for (const layers of [1, 3, 12, 40]) {
+      const reference = new Image(48, 32, { defer: true }), hardware = new Image(48, 32, { defer: true });
+      const rect = { left: 0, top: 0, right: 48, bottom: 32 };
+      gpu.fill(reference, rect, [0, 0, 0, 0]);
+      gpu.fill(hardware, rect, [0, 0, 0, 255]);
+      const sources = [];
+      for (let layer = 0; layer < layers; layer++) {
+        const source = new Image(48, 32);
+        for (let i = 0; i < source.pixels.length; i += 4) {
+          source.pixels[i] = (i * 7 + layer * 23) & 255;
+          source.pixels[i + 1] = (i * 11 + layer * 31) & 255;
+          source.pixels[i + 2] = (i * 13 + layer * 43) & 255;
+          source.pixels[i + 3] = ((i / 4 + layer * 17) * 19) & 255;
+        }
+        const options = { motion: true, mode: 0, opacity: [17, 64, 128, 255][layer % 4],
+          matrix: [1, 0, 0, 1, layer % 3, layer % 2], clip: rect, opaque: layer % 7 === 6 };
+        gpu.draw(reference, source, options);
+        sources.push([source, options]);
+      }
+      const before = gpu.stats.snapshots;
+      for (const [source, options] of sources) gpu.draw(hardware, source, { ...options, windowComposite: true });
+      if (gpu.stats.snapshots !== before) fail('hardware window composite took a snapshot');
+      // Presentation moved into the compositor. Compare its black-matte byte
+      // result without depending on the former GPUDevice.present method.
+      const display = image => {
+        const pixels = image.pixels, output = new Uint8ClampedArray(pixels.length);
+        for (let i = 0; i < pixels.length; i += 4) {
+          for (let c = 0; c < 3; c++) output[i + c] = pixels[i + c] * pixels[i + 3] >> 8;
+          output[i + 3] = 255;
+        }
+        return output;
+      };
+      const expected = display(reference), actual = display(hardware);
+      let max = 0;
+      for (let i = 0; i < expected.length; i++) max = Math.max(max, Math.abs(expected[i] - actual[i]));
+      if (max > 3) fail('hardware window composite pixel difference ' + max);
+      result.push('Hardware window composite: ' + layers + ' overlapping layers, max byte difference=' + max + ', snapshots=0');
+      if (gpu.gl.isEnabled(gpu.gl.BLEND)) fail('hardware composite leaked blend state');
+    }
+  }
+  {
+    for (const alpha of [0, 128, 255]) for (const mixed of [false, true]) {
+      const expected = target(alpha), actual = target(alpha), commands = [];
+      for (let i = 0; i < 11; i++) {
+        const source = target((i * 31 + 17) & 255);
+        source.pixels[3] = 0;
+        const mode = mixed && i === 3 ? 1 : mixed && i === 7 ? 3 : 0;
+        const options = { motion: true, mode, opacity: 90 + i * 13 };
+        commands.push({ source, options });
+        gpu.draw(expected, source, options);
+      }
+      const before = gpu.stats.snapshots;
+      gpu.compositeOffscreen(actual, commands);
+      const used = gpu.stats.snapshots - before;
+      if (gpu.floatCompositing && used !== (mixed ? 2 : 0)) fail('offscreen run snapshots or special mode ordering');
+      const a = expected.pixels, b = actual.pixels;
+      let visible = 0, alphaError = 0;
+      for (let i = 0; i < a.length; i += 4) {
+        alphaError = Math.max(alphaError, Math.abs(a[i + 3] - b[i + 3]));
+        for (let c = 0; c < 3; c++) visible = Math.max(visible, Math.abs(a[i + c] * a[i + 3] / 255 - b[i + c] * b[i + 3] / 255));
+      }
+      if (visible > 3 || alphaError > 2) fail('offscreen composition error: visible=' + visible + ', alpha=' + alphaError);
+      if (alpha === 0 && (b[0] !== a[0] || b[1] !== a[1] || b[2] !== a[2] || b[3] !== a[3])) fail('offscreen hidden RGB was erased');
+      result.push('Offscreen composition alpha=' + alpha + ',mixed=' + mixed + ': visible error=' + visible.toFixed(2) + ', alpha error=' + alphaError + ', snapshots=' + used);
+    }
+    const original = gpu.floatCompositing;
+    try {
+      gpu.floatCompositing = false;
+      const expected = target(128), actual = target(128), commands = Array.from({ length: 3 }, () => ({ source: target(128), options: { motion: true, mode: 0 } }));
+      for (const { source, options } of commands) gpu.draw(expected, source, options);
+      gpu.compositeOffscreen(actual, commands);
+      compare('Offscreen without float colour extension', expected, actual);
+    } finally { gpu.floatCompositing = original; }
+  }
+  {
+    const original = target(128);
+    for (const format of ['tlg5', 'tlg6']) {
+      const bytes = encodeTLG(original, format, new Map([['caption', 'worker pixels']]));
+      const storage = { read: async () => bytes, name: `${format}.tlg` };
+      const sync = await loadGraphic(storage), async = await loadGraphicAsync(storage);
+      const raw = encodeTLG(original, format);
+      const reference = format === 'tlg5' ? decodeTLG5CPUReference(raw) : decodeTLG6CPUReference(raw);
+      compare(`${format} Rust vs legacy JS decoder`, reference, sync.image);
+      compare(`${format} worker decode`, sync.image, async.image);
+      if (async.metainfo?.get('caption') !== 'worker pixels') fail('worker TLG metadata');
+      if (!bytes.byteLength) fail('worker detached storage buffer');
+      const gray = await loadGraphicAsync(storage, 0x1fffffff, { gray: true });
+      const syncGray = await loadGraphic(storage, 0x1fffffff, { gray: true });
+      if (!gray.image.gray || firstDifference(gray.image.pixels, syncGray.image.pixels) !== -1) fail('worker grayscale mismatch');
+    }
+    result.push('TLG worker metadata, grayscale and storage ownership preserved');
+  }
+  {
+    // Two literal pixels followed by a three-pixel run, clipped to four pixels.
+    const values = { width: 4, height: 1, compress: 'RL',
+      pixel: new Uint8Array([1, 3, 2, 1, 0, 6, 5, 4, 127, 128, 9, 8, 7, 255]) };
+    const node = { file: {}, offset: 0, has: key => key in values,
+      get: key => key in values ? { toInt: () => values[key], toText: () => values[key], toResource: () => values[key] } : null };
+    const actual = decodeSource(node).pixels;
+    const expected = new Uint8ClampedArray([1, 2, 3, 0, 4, 5, 6, 127, 7, 8, 9, 255, 7, 8, 9, 255]);
+    if (firstDifference(actual, expected) !== -1) fail('PSB direct RL32 decode');
+    const reference = new Uint32Array(4);
+    decodeRL32CPUReference(values.pixel, reference);
+    if (firstDifference(actual, new Uint8Array(reference.buffer)) !== -1) fail('PSB Rust vs legacy RL32');
+    const rl8 = new Uint8Array([1, 3, 4, 128, 5]);
+    if (firstDifference(codecs.decodeRl8(rl8, 5), decodeRL8CPUReference(rl8, 5)) !== -1) fail('PSB Rust vs legacy RL8');
+    result.push('PSB direct RL32 decode: literal/run/alpha/clipped run exact RGBA');
+  }
+  {
+    const file = {};
+    const sourceNode = () => ({ file, offset: 42, path: 'src/test/icon', has: () => false,
+      get: name => name === 'pixel' ? { toResource: () => new Uint8Array([34, 23, 12, 127]) }
+        : ['width', 'height'].includes(name) ? { toInt: () => 1 } : null });
+    const image = decodeSource(sourceNode()), before = gpu.diagnostics();
+    if (!(image instanceof Image) || image.point(0, 0) !== 0x7f0c1722) fail('Motion decoded image or colour mismatch');
+    for (let i = 0; i < 1000; i++) {
+      const cached = decodeSource(sourceNode());
+      if (cached !== image) fail('Motion source identity changed');
+      gpu.texture(cached);
+    }
+    const after = gpu.diagnostics();
+    if (after.textureCount !== before.textureCount + 1 || after.uploads !== before.uploads + 1) fail('Motion source recreated textures');
+    result.push('Motion source: 1000 lookups reuse one Image, one texture and one upload');
+  }
+  {
+    const width = 1024, height = 1025;
+    const pixels = new Uint8ClampedArray(width * height * 4);
+    for (let i = 0; i < pixels.length; i++) pixels[i] = i * 17 + (i >>> 12);
+    const image = new Image(width, height, { pixels });
+    const before = gpu.diagnostics();
+    let yielded = false;
+    requestAnimationFrame(() => { yielded = true; });
+    await gpu.prepareTextures([image, image]);
+    if (!yielded || !image.gpuValid || image.cpuValid || image._pixels !== null)
+      fail('Motion preparation must yield, publish GPU authority and release CPU storage');
+    const prepared = gpu.diagnostics();
+    if (prepared.uploadedBytes - before.uploadedBytes !== pixels.byteLength || prepared.uploads - before.uploads < 2)
+      fail('Motion preparation must split uploads and skip duplicate sources');
+    const copy = image.clone();
+    if (gpu.diagnostics().uploadedBytes !== prepared.uploadedBytes) fail('prepared Motion drawing uploaded source again');
+    if (firstDifference(pixels, copy.pixels) !== -1) fail('prepared Motion pixels changed');
+    result.push('Motion preparation: yields between chunks, uploads each source once, exact RGBA and GPU-only storage');
+  }
+  {
+    const image = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);
+    if (!image.cpuValid || image.gpuValid) fail('initial CPU authority');
+    gpu.texture(image);
+    if (!image.cpuValid || !image.gpuValid) fail('upload must retain CPU authority');
+    let uploads = gpu.stats.uploads, reads = gpu.stats.readbacks;
+    for (let i = 0; i < 8; i++) { void image.pixels; gpu.texture(image); }
+    if (gpu.stats.uploads !== uploads || gpu.stats.readbacks !== reads) fail('read-only access transferred pixels');
+    const texture = image.gpu;
+    image.writablePixels[0] = 99;
+    if (!image.cpuValid || image.gpuValid) fail('CPU write authority');
+    if (image.gpu !== texture) fail('CPU write discarded reusable texture');
+    gpu.texture(image); gpu.texture(image);
+    if (gpu.stats.uploads !== uploads + 1 || !image.cpuValid || !image.gpuValid) fail('CPU write upload count');
+    gpu.fill(image, { left: 0, top: 0, right: 1, bottom: 1 }, [40, 50, 60, 70]);
+    if (image.cpuValid || !image.gpuValid) fail('GPU write authority');
+    if (image._pixels !== null) fail('GPU write retained invalid CPU allocation');
+    for (let i = 0; i < 8; i++) { if (image.pixels[0] !== 40) fail('GPU write bytes'); gpu.texture(image); }
+    if (gpu.stats.readbacks !== reads + 1 || gpu.stats.uploads !== uploads + 1) fail('GPU write readback count');
+    if (!image.cpuValid || !image.gpuValid) fail('readback must retain GPU authority');
+    result.push('authority: repeated reads transfer nothing; writes synchronize the other source exactly once');
+  }
+  // Seed a nonzero atlas location before checking sampling coordinates.
+  const seed = glyph([211, 12, 33], 17);
+  const seedTarget = target(128);
+  drawGpu(seedTarget, [{ image: seed, left: 1, top: 1, opa: 255 }], 0, null);
+  for (const face of [0, 1, 4]) for (const alpha of [0, 128, 255]) {
+    const cpu = target(alpha), gpuTarget = target(alpha), source = glyph([210, 80, 41], 23);
+    const commands = [{ image: source, left: 1, top: 0, opa: 173 }];
+    draw(cpu, commands, face); drawGpu(gpuTarget, commands, face);
+    compare(`face=${face},targetAlpha=${alpha},opacity=173,clipped`, cpu, gpuTarget);
+  }
+  for (const opacity of [0, -117]) {
+    const cpu = target(128), gpuTarget = target(128), source = glyph([71, 122, 230], 31);
+    const commands = [{ image: source, left: 3, top: 2, opa: opacity }];
+    draw(cpu, commands, 0); drawGpu(gpuTarget, commands, 0);
+    compare(`face=0,opacity=${opacity}`, cpu, gpuTarget);
+  }
+  {
+    const cpu = target(128), gpuTarget = target(128);
+    const outline = glyph([14, 14, 14], 59), body = glyph([240, 224, 188], 91);
+    const commands = [
+      { image: outline, left: 3, top: 2, opa: 255 },
+      { image: outline, left: 7, top: 2, opa: 255 },
+      { image: body, left: 3, top: 2, opa: 255 },
+      { image: body, left: 7, top: 2, opa: 255 },
+    ];
+    const before = gpu.diagnostics().draws;
+    draw(cpu, commands, 0, null); drawGpu(gpuTarget, commands, 0, null);
+    compare('separated glyphs + overlapping outline/body order', cpu, gpuTarget);
+    const delta = gpu.diagnostics().draws - before;
+    if (delta !== commands.length) fail(`expected one draw per glyph, got ${delta}`);
+    result.push(`draw submissions=${delta} for ${commands.length} glyphs`);
+  }
+  {
+    const cpu = target(128), gpuTarget = target(128), first = glyph([20, 50, 80], 123), second = glyph([180, 160, 140], 77);
+    const initial = [{ image: first, left: 3, top: 2, opa: 255 }];
+    draw(cpu, initial, 0, null); drawGpu(gpuTarget, initial, 0, null);
+    const cp = cpu.writablePixels, gp = gpuTarget.writablePixels;
+    cp[0] = 97; gp[0] = 97;
+    const edit = [{ image: second, left: 6, top: 3, opa: 173 }];
+    draw(cpu, edit, 0, null); drawGpu(gpuTarget, edit, 0, null);
+    compare('GPU write -> CPU edit -> GPU upload', cpu, gpuTarget);
+  }
+  {
+    const sourceCPU = target(128), sourceGPU = target(128), sourceGlyph = glyph([235, 120, 20], 5);
+    const command = [{ image: sourceGlyph, left: 4, top: 2, opa: 255 }];
+    draw(sourceCPU, command, 0, null); drawGpu(sourceGPU, command, 0, null);
+    const destCPU = target(220), destGPU = target(220);
+    const readsBefore = gpu.diagnostics().readbacks;
+    destCPU.copyRect(2, 1, sourceCPU, { left: 1, top: 0, right: 10, bottom: 8 });
+    destGPU.copyRect(2, 1, sourceGPU, { left: 1, top: 0, right: 10, bottom: 8 });
+    const readsAfter = gpu.diagnostics().readbacks;
+    if (readsAfter !== readsBefore) fail(`GPU-resident copyRect unexpectedly read pixels: ${readsBefore} -> ${readsAfter}`);
+    compare('copyRect from GPU-resident source', destCPU, destGPU);
+    result.push(`copyRect readbacks=0`);
+  }
+  {
+    const cpu = target(128), gpuTarget = target(128), source = target(192), seedGlyph = glyph([90, 20, 170], 44);
+    const seedCommand = [{ image: seedGlyph, left: 3, top: 2, opa: 255 }];
+    draw(cpu, seedCommand, 0, null); drawGpu(gpuTarget, seedCommand, 0, null);
+    const sourceRect = { left: 1, top: 0, right: 10, bottom: 8 };
+    const readsBefore = gpu.diagnostics().readbacks;
+    cpu.copyRect(2, 1, source, sourceRect);
+    gpuTarget.copyRect(2, 1, source, sourceRect);
+    const readsAfter = gpu.diagnostics().readbacks;
+    if (readsAfter !== readsBefore) fail(`GPU-resident destination copyRect unexpectedly read pixels: ${readsBefore} -> ${readsAfter}`);
+    compare('copyRect into GPU-resident destination', cpu, gpuTarget);
+    result.push(`GPU-resident destination copyRect readbacks=0`);
+  }
+  {
+    const font = { face: 'sans-serif', height: 32, flags: 0, angle: 0, prerenderedFont: null };
+    const cpu = new Image(240, 64), gpuTarget = new Image(240, 64);
+    const text = '你好，这是字形缓存。';
+    const canvas = document.createElement('canvas'); canvas.width = 240; canvas.height = 64;
+    const context = canvas.getContext('2d', { willReadFrequently: true }); context.font = '32px "sans-serif", sans-serif';
+    context.fillStyle = 'rgba(245,226,183,1)'; context.fillText(text, 16, 16 + 32 * 0.8);
+    const source = Image.from(context.getImageData(0, 0, 240, 64).data, 240, 64);
+    const node = { image: gpuTarget, clip: null, drawFace: 0, font, holdAlpha: false, markImageModified() {} };
+    const drawText = createTextRenderer(document);
+    const cpuNode = { image: cpu, clip: null, drawFace: 0, holdAlpha: false, markImageModified() {} };
+    const uploadsBefore = gpu.diagnostics().uploadedBytes;
+    const drawsBefore = gpu.diagnostics().draws;
+    drawText(node, 16, 16, text, 0x00f5e2b7, 255, true, 0, 0, 0, 0, 0);
+    clipBlitCPU(cpuNode, source, 0, 0);
+    const firstUpload = gpu.diagnostics().uploadedBytes - uploadsBefore;
+    const firstDraws = gpu.diagnostics().draws - drawsBefore;
+    const afterFirst = gpu.diagnostics().uploadedBytes;
+    drawText(node, 16, 16, text, 0x00f5e2b7, 255, true, 0, 0, 0, 0, 0);
+    const repeatedUpload = gpu.diagnostics().uploadedBytes - afterFirst;
+    clipBlitCPU(cpuNode, source, 0, 0);
+    compareCanvasFont('ordinary browser font path (Chinese line, two draws)', cpu, gpuTarget);
+    result.push(`line draw submissions=${firstDraws}, first upload bytes=${firstUpload}, identical redraw extra upload bytes=${repeatedUpload}`);
+  }
+  {
+    const font = { face: 'sans-serif', height: 32, flags: 0, angle: 0, prerenderedFont: null };
+    const cpu = new Image(240, 64), gpuTarget = new Image(240, 64), text = '你好，这是字形缓存。';
+    const canvas = document.createElement('canvas'); canvas.width = 240; canvas.height = 64;
+    const context = canvas.getContext('2d', { willReadFrequently: true }); context.font = '32px "sans-serif", sans-serif';
+    const measure = context.measureText(text);
+    const makeRun = (color, dx, dy) => {
+      const left = Math.max(0, Math.floor(16 + dx - measure.actualBoundingBoxLeft) - 1);
+      const top = Math.max(0, Math.floor(16 + dy + 32 * 0.8 - measure.actualBoundingBoxAscent) - 1);
+      const right = Math.min(240, Math.ceil(16 + dx + measure.actualBoundingBoxRight) + 1);
+      const bottom = Math.min(64, Math.ceil(16 + dy + 32 * 0.8 + measure.actualBoundingBoxDescent) + 1);
+      const run = document.createElement('canvas'); run.width = right - left; run.height = bottom - top;
+      const ctx = run.getContext('2d', { willReadFrequently: true }); ctx.font = context.font;
+      ctx.fillStyle = `rgba(${color[0]},${color[1]},${color[2]},1)`;
+      ctx.translate(16 + dx - left, 16 + dy - top); ctx.fillText(text, 0, 32 * 0.8);
+      return { image: Image.from(ctx.getImageData(0, 0, run.width, run.height).data, run.width, run.height), left, top };
+    };
+    const cpuNode = { image: cpu, clip: null, drawFace: 0, holdAlpha: false, markImageModified() {} };
+    const shadow = makeRun([18, 18, 18], 1, 2), blurred = blurGlyphImage(shadow.image, 2, 180);
+    const body = makeRun([245, 226, 183], 0, 0);
+    clipBlitCPU(cpuNode, blurred.image, shadow.left + blurred.offsetX, shadow.top + blurred.offsetY);
+    clipBlitCPU(cpuNode, body.image, body.left, body.top);
+    const drawText = createTextRenderer(document), node = { image: gpuTarget, clip: null, drawFace: 0, font, holdAlpha: false, markImageModified() {} };
+    const uploadsBefore = gpu.diagnostics().uploadedBytes, drawsBefore = gpu.diagnostics().draws;
+    drawText(node, 16, 16, text, 0x00f5e2b7, 255, true, 180, 0x00121212, 2, 1, 2);
+    const uploadBytes = gpu.diagnostics().uploadedBytes - uploadsBefore, drawCount = gpu.diagnostics().draws - drawsBefore;
+    // Blur copies RGB from neighbouring low-alpha Canvas texels, amplifying
+    // Canvas's platform-specific unpremultiply rounding; alpha stays exact.
+    compareCanvasFont('ordinary browser font shadow + body', cpu, gpuTarget, 9);
+    result.push(`shadowed line submissions=${drawCount}, first upload bytes=${uploadBytes}`);
+  }
+  {
+    const image = target(128), source = glyph([3, 4, 5], 90);
+    const pixels = image.pixels;
+    image.externallyWritable = true;
+    const readsBefore = gpu.diagnostics().readbacks;
+    drawGpu(image, [{ image: source, left: 2, top: 2, opa: 255 }, { image: source, left: 7, top: 2, opa: 255 }], 0, null);
+    const readsAfter = gpu.diagnostics().readbacks;
+    if (readsAfter - readsBefore !== 2) fail(`external writable text draws used ${readsAfter - readsBefore} readbacks`);
+    if (image.pixels !== pixels) fail('GPU write replaced external writable buffer');
+    result.push('external writable buffer synchronized after each glyph draw');
+  }
+  {
+    const original = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);
+    const before = { ...gpu.stats };
+    const copies = [original.clone(), original.clone(), original.clone()];
+    if (gpu.stats.uploads !== before.uploads + 1 || gpu.stats.readbacks !== before.readbacks) fail('CPU source clones must share one source upload');
+    copies[0].fill({ left: 0, top: 0, right: 1, bottom: 1 }, 0x7f010203);
+    if (original.point(0, 0) !== 0x7f0c1722 || copies[1].point(0, 0) !== 0x7f0c1722) fail('GPU clones share writable storage');
+    const filled = new Image(128, 128), fillUploads = gpu.stats.uploads;
+    filled.fill({ left: 0, top: 0, right: 128, bottom: 128 }, 0x7f010203);
+    if (filled.cpuValid || gpu.stats.uploads !== fillUploads) fail('full fill uploaded discarded CPU pixels');
+    const source = target(128), destination = target(255), uploads = gpu.stats.uploads;
+    gpu.draw(destination, source, { mode: 1, copySourceAlpha: true });
+    if (gpu.stats.uploads !== uploads + 1) fail('full copy uploaded old destination');
+    compare('Full copy discards old CPU target upload', source, destination);
+    const cold = target(255), resident = target(255);
+    gpu.texture(resident);
+    const options = { mode: 1, copySourceAlpha: true, matrix: [1, 1, -1, 1, 4, 0] };
+    gpu.draw(cold, source, options); gpu.draw(resident, source, options);
+    compare('Sheared copy preserves uncovered CPU destination', resident, cold);
+    result.push('CPU clone source uploads once; GPU copies independent; full fill uploads=0');
+  }
+  {
+    const bytes = new Uint8ClampedArray([12, 23, 34, 0, 56, 67, 78, 127, 89, 90, 91, 255, 101, 102, 103, 44]);
+    for (const color of [0, 0x714256ab]) {
+      const cpu = Image.from(bytes, 2, 2), resident = Image.from(bytes, 2, 2);
+      gpu.texture(resident);
+      const grown = cpu.resized(7, 6, color), copied = resident.resized(7, 6, color);
+      const data = grown.pixels, fill = [(color >>> 16) & 255, (color >>> 8) & 255, color & 255, color >>> 24];
+      for (let y = 0; y < 6; y++) for (let x = 0; x < 7; x++) for (let c = 0; c < 4; c++) {
+        const expected = x < 2 && y < 2 ? bytes[(y * 2 + x) * 4 + c] : fill[c];
+        if (data[(y * 7 + x) * 4 + c] !== expected) fail('CPU resized fill strips mismatch');
+      }
+      compare(`CPU/GPU resize fill=${color}`, grown, copied);
+    }
+  }
+  {
+    const image = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);
+    gpu.texture(image);
+    const saved = image.clone(), count = gpu.diagnostics().textureCount;
+    for (let size = 2; size < 24; size++) {
+      if (image.resize(size, size, 0x714256ab) !== image) fail('layer resize changed image identity');
+      if (gpu.diagnostics().textureCount !== count) fail('layer resize retained an old texture');
+    }
+    if (image.point(0, 0) !== 0x7f0c1722 || saved.point(0, 0) !== 0x7f0c1722) fail('resize changed preserved pixels or snapshot');
+    if (image.point(23 - 1, 23 - 1) !== 0x714256ab) fail('resize lost fill colour');
+    result.push('22 layer resizes: stable texture count, preserved snapshot and fill');
+  }
+  {
+    const font = { face: 'sans-serif', height: 32, flags: 0, angle: 0, prerenderedFont: null };
+    const make = () => ({ image: new Image(320, 100), clip: null, drawFace: 0, font, holdAlpha: false, markImageModified() {} });
+    const reused = make(), fresh = make(), warm = make(), drawText = createTextRenderer(document);
+    const args = ['重复', 0xefefff, 255, true, 255, 0x040c, 1, 0, 0];
+    drawText(warm, 16, 16, ...args);
+    drawText(reused, 116, 16, ...args);
+    createTextRenderer(document)(fresh, 116, 16, ...args);
+    compare('cached shadow run moved to a different position', fresh.image, reused.image);
+  }
+  const glError = gpu.gl.getError();
+  if (glError !== gpu.gl.NO_ERROR) fail(`WebGL error: ${glError}`);
+  result.push('WebGL error=0');
+  document.querySelector('#result').textContent = `PASS\n${result.join('\n')}`;
+} catch (error) {
+  document.querySelector('#result').textContent = `FAIL\n${error.stack ?? error}`;
+  console.error(error);
+}
+</script>

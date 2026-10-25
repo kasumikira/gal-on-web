@@ -26,7 +26,7 @@ Go 构建通过 `//go:embed` 内嵌 `web/build`。运行 `pnpm dev`、`go run` �
 
 原生构建默认利用全部可用逻辑 CPU：VM 的 CMake/Ninja、vcpkg 和 libav Make 自动按可用 CPU 数并行；Rust Cargo 和 Go 使用各自默认的 CPU 并行调度。显式设置的 `CMAKE_BUILD_PARALLEL_LEVEL`、`VCPKG_MAX_CONCURRENCY` 等工具环境配置仍受尊重。Vite 保持自身的构建调度，串行阶段不会强制拆分。
 
-native/kirikiri 是唯一 C++ 项目，按原版 core 与 plugins 布局组织。先在当前终端加载已安装 SDK 的官方环境脚本，设置 `VCPKG_ROOT`，并确保 CMake、Ninja、Python、Bison 可用。具体步骤见 [native/kirikiri/README.md](native/kirikiri/README.md)。首次构建不依赖 VS Code 或已有 CMake 缓存。
+native/kirikiri 是 TJS2 与原生插件的 C++ 项目，按原版 core 与 plugins 布局组织。先在当前终端加载已安装 SDK 的官方环境脚本，设置 `VCPKG_ROOT`，并确保 CMake、Ninja、Python、Bison 可用。具体步骤见 [native/kirikiri/README.md](native/kirikiri/README.md)。首次构建不依赖 VS Code 或已有 CMake 缓存。
 
 完整构建还需要 Rust stable 和 `wasm32-unknown-unknown` target（`rustup target add wasm32-unknown-unknown`），以及 Go 1.24 或以上。先在 MSYS2 终端加载 SDK 环境并执行 `bash native/libav/build.sh` 构建 WMV 后端，详见 [native/libav/README.md](native/libav/README.md)。再在 PowerShell 中构建其余部分：
 
@@ -59,12 +59,14 @@ WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web
 - internal/library：游戏资源枚举及引擎无关清单。
 - internal/save：SQLite 存档后端（每个存档文件一行为 BLOB）。
 - internal/server：HTTP 清单、Range 读取和静态文件服务。
-- tools：接口索引、开发诊断和现有验证工具。
+- web/tests：引擎回归测试、GPU 原版对照与浏览器视频测试。
+- tools：归档、脚本、音视频与设备调试工具。
+- tests：本地游戏资源和复现存档，不是引擎测试目录。
 - out：构建缓存及已安装依赖。
 
 ## 状态与来源
 
-最近已在浏览器验证开场至标题菜单，尚未完成设置、新游戏及整款游戏验收。具体范围和后续工作见 [验证状态](docs/STATUS.md)。
+当前验证范围及尚未覆盖的边界见 [验证状态](docs/STATUS.md)。测试命令和浏览器入口见 [引擎测试](web/tests/README.md)，开发工具见 [工具说明](tools/README.md)。
 
 原生源码基于 third_party/kirikiroid2 中的 Kirikiroid2/TJS2 参考实现，来源及许可证保存在 native/kirikiri。游戏资源不随源码发布。
 
@@ -73,4 +75,6 @@ WASM 运行时生成到 `web/engine-js/tjs-runtime`，前端统一构建到 `web
 - [运行时架构](docs/VM-DESIGN.md)：JS/WASM 职责、对象生命周期与执行边界。
 - [Native 绑定开发规范](docs/NATIVE-BINDINGS.md)：装饰器、脚本调用、借用、retain/dispose 和异步事件规则。
 - [原生构建](native/kirikiri/README.md)：正式 C++ 项目和工具链。
-- [接口索引](ENGINE-MIGRATION.md)：自动生成的原版接口声明清单。
+- [文档索引](docs/README.md)：当前规范、调查记录与参考清单。
+- [目录组织与后续拆包建议](docs/REPOSITORY-LAYOUT.md)。
+- [接口索引](docs/reference/ENGINE-INTERFACES.md)：自动生成的原版声明清单，不作为实现覆盖率。

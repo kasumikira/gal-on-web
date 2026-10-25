@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Kirikiri GPU 原版对比</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; color: #222; background: #fafafa; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; }
+  .fail { color: #b21e28; } .pass { color: #12623a; }
+  canvas { width: 160px; height: 160px; image-rendering: pixelated; border: 1px solid #888; }
+  #images { display: flex; flex-wrap: wrap; gap: 24px; } #images section { width: 160px; }
+  pre { white-space: pre-wrap; max-height: 260px; overflow: auto; }
+</style>
+<h1>GPU 与原版 Kirikiri 像素对比</h1>
+<p>基准由原版 C++ 源码生成；几何平滑采样的基准是理想双线性（原版 GL 后端用硬件 <code>GL_LINEAR</code>），软件内核 <code>TVPInterpLinTransCopy</code> 的偏差单独列在“档案”列。颜色差异包括 alpha=0 时的隐藏 RGB；容差默认 1，可通过 <code>?tolerance=0</code> 修改。</p>
+<p id="status">运行中…</p>
+<button id="download" disabled>下载 JSON 报告</button>
+<details><summary>覆盖情况与功能检查</summary><pre id="coverage"></pre></details>
+<h2>差异查看</h2><select id="selection"></select><div id="images"></div><pre id="detail"></pre>
+<h2>全部结果</h2>
+<table><thead><tr><th>用例</th><th>结论</th><th>最大 RGB / A 差</th><th>差异像素 / 超容差</th><th>对软件内核的差（档案）</th></tr></thead><tbody id="rows"></tbody></table>
+<script type="module" src="./run.js"></script>
+</html>

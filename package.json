@@ -13,7 +13,8 @@
     "build:js": "vite build",
     "engine:inventory": "node tools/engine-inventory.mjs",
     "build:vm": "node native/kirikiri/build.mjs",
-    "build:codecs": "node native/codecs/build.mjs"
+    "build:codecs": "node native/codecs/build.mjs",
+    "test:engine": "node --test --test-concurrency=1 web/tests/unit/*-check.mjs"
   },
   "dependencies": {
     "fft.js": "4.0.4",

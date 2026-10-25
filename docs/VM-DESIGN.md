@@ -2,9 +2,9 @@
 
 ## 执行与职责
 
-脚本引擎使用一个 WASM 模块，包含原版 TJS2 编译器、解释执行器和内建类型。源码与已有字节码由同一个 tTJS 实例处理；KAGParser、Scripts、scriptsEx、csvParser 和 saveStruct 在该实例内使用原版 Variant 与 dispatch。
+脚本引擎使用一个 WASM 模块，包含原版 TJS2 编译器、解释执行器和内建类型。源码与已有字节码由同一个 tTJS 实例处理；KAGParser、Scripts 及已移植的 native 插件在该实例内使用原版 Variant 与 dispatch。Rect、Pad、MenuItem 是启动时注册的核心类；scriptsEx、csvParser、saveStruct、PSBFile、TextRenderBase、JSON、Expat 和 kirikiroid2 扩展经 Plugins.link 按需注册。
 
-JS 实现图像、渲染、音频、资源 IO 和 PSBFile 等平台及插件接口。XP3 过滤脚本使用独立的 TJS2 实例执行，`xp3-filter.js` 提供 BinaryAccessor 字节读写桥接。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
+JS 实现图像、渲染、音频、资源 IO、Motion 及 PSB 媒体读取；脚本 PSBFile 和只读容器位于 C++。XP3 过滤脚本使用独立的 TJS2 实例执行，`xp3-filter.js` 提供 BinaryAccessor 字节读写桥接。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
 
 ## 初始化配置
 
@@ -50,7 +50,7 @@ WASM 通过 JSPI 等待 JS 宿主操作，宿主也能调用脚本。正常调�
 
 ## 源码与构建
 
-C++ 项目为 `native/kirikiri`。`core/tjs2` 保存语言核心，`core/base` 保存 KAGParser、ScriptMgnIntf 与平台声明，`core/utils` 保存原版工具，`plugins` 保存 scriptsEx、csvParser 和 saveStruct；`runtime.cpp`、`runtime-api.cpp`、`runtime-host.cpp`、`runtime-platform.cpp` 提供运行时状态、导出 API、宿主绑定和平台接入。
+C++ 项目为 `native/kirikiri`。`core/tjs2` 保存语言核心，`core/base` 保存 KAGParser、ScriptMgnIntf 与平台声明，`core/utils` 保存原版工具，`core/plugin` 保存注册器与 ncbind，`plugins` 保存按需加载的原生插件；`runtime.cpp`、`runtime-api.cpp`、`runtime-host.cpp`、`runtime-platform.cpp` 提供运行时状态、导出 API、宿主绑定和平台接入。
 
 `pnpm build:vm` 生成一个 WASM 运行时及其 JS 加载器；`pnpm build:js` 从 `web/index.html` 打包游戏页面到 `web/build`，同目录的 `main.js` 通过 ES import 加载引擎代码。Go 构建通过 `//go:embed` 把 `web/build` 编入二进制，运行时不再读取该目录。构建缓存位于 `out/kirikiri`，依赖位于 `out/vcpkg_installed`。工具链见 [原生项目说明](../native/kirikiri/README.md)。
 

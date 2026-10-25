@@ -221,8 +221,8 @@ function onBrowserResize() {
 ```powershell
 pnpm build:vm # 仅 C++ / WASM 改动需要
 pnpm build:js
-node tools/dev/vm-check.mjs
-node tools/dev/error-check.mjs
+node web/tests/unit/vm-check.mjs
+node web/tests/unit/error-check.mjs
 ```
 
 图像、Motion、转场或输入改动再运行相应已有检查，并实际打开游戏检查画面和交互。没有 JS error 不等于渲染正确；定向检查和标题成功不代表整款游戏通过。
