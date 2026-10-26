@@ -19,9 +19,14 @@ struct Runtime : iTJSConsoleOutput
         int borrow = 0;
         int owner = 0;
     };
-    std::map<int, Value> values;
-    // Ordered handles preserve the original release order across reentry.
-    std::unordered_map<int, std::set<int>> valuesByOwner;
+    // Handles are dense and never enumerated by order, so a node-based hash
+    // beats a tree here: every value is inserted and removed once per call.
+    std::unordered_map<int, Value> values;
+    // IDs inside each vector ascend by creation order, which is the order the
+    // owner's values are released in (see releaseOwnerValues). Handles are
+    // allocated monotonically, so appending keeps that order and moving a
+    // value between owners inserts in place.
+    std::unordered_map<int, std::vector<int>> valuesByOwner;
     std::map<int, std::vector<int>> borrows;
     struct Owner
     {
@@ -59,7 +64,9 @@ struct Runtime : iTJSConsoleOutput
     int borrowValue(int borrow, const tTJSVariant &v);
     void endBorrow(int id);
     void release(int id);
-    std::map<int, Value>::node_type extractValue(int id);
+    std::unordered_map<int, Value>::node_type extractValue(int id);
+    void addOwnerValue(int owner, int id);
+    void removeOwnerValue(int owner, int id);
     int ownerReference(int id);
     void bindOwner(int id, int owner);
     int retainForOwner(int id, int owner);

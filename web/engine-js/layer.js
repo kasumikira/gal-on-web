@@ -1,5 +1,5 @@
 // tTJSNI_BaseLayer / tTJSNC_Layer (LayerIntf.cpp): layer state and TJS bindings.
-import { nativeClass, nativeMethod, nativeProperty, nativeMembers, nativeGlobals, nativeConstructor, nativeOwner, nativeDictionary, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
+import { nativeClass, nativeMethod, nativeProperty, nativeMembers, nativeGlobals, nativeConstructor, nativeOwner, nativeDictionary, callScript, retainScriptValue, disposeScriptValue, invalidateScriptValue, attachLayerFields, registerLayerFields } from '#krkr/native';
 import { Image, toActualColor, clamp255, copy9Patch, flipImage } from './bitmap.js';
 import { FontState, createFontInstance, attachFontClass, createTextRenderer } from './font.js';
 import { setAbsoluteOrderMode, joinLayer, setLayerOrder, isAncestorOrSelf, isNodeEnabled } from './layer-tree.js';
@@ -1099,7 +1099,7 @@ export function createLayerClass(document, {
     get font() {
       const node = this.node;
       // TVPCreateFontObject: a Font native instance bound to this layer.
-      return node.fontObject ??= createFontInstance(node);
+      return node.fontObject ??= createFontInstance(node, this);
     }
     @nativeProperty
     get name() {
@@ -1208,6 +1208,10 @@ export function createLayerClass(document, {
       node.window.modalLayers = node.window.modalLayers.filter(modal => modal !== node && !isAncestorOrSelf(node, modal));
       node.window.layers = node.window.layers.filter(layer => layer !== owner);
     }
+    if (node.fontObject) {
+      try { await invalidateScriptValue(node.fontObject); }
+      finally { await disposeScriptValue(node.fontObject); node.fontObject = null; }
+    }
     if (node.actionOwner) await disposeScriptValue(node.actionOwner);
     node.image = node.province = null;
     node.actionOwner = null;
@@ -1274,5 +1278,7 @@ export function createLayerClass(document, {
     document,
     bitmapClass: Bitmap
   });
+  registerLayerFields(Layer);
+  Layer.attachState = state => attachLayerFields(state, state.node);
   return Layer;
 }

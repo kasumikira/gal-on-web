@@ -13,33 +13,53 @@
 #include "tjsNative.h"
 #include "tjsError.h"
 #include "tjsGlobalStringMap.h"
+#include "tjsHashSearch.h"
 #include "tjsDebug.h"
 
 namespace TJS {
     //---------------------------------------------------------------------------
     // NativeClass registration
     //---------------------------------------------------------------------------
+    // Lookups run once per cross-bridge call, so the key must not allocate.
+    // A name view points at the interned buffer owned by NativeClassNames;
+    // copying a ttstr only copies the reference-counted pointer, so growing
+    // that vector cannot invalidate a view.
+    struct NativeClassNameView {
+        const tjs_char *text;
+        bool operator==(const NativeClassNameView &other) const {
+            return !TJS_strcmp(text, other.text);
+        }
+    };
+
+    template <>
+    class tTJSHashFunc<NativeClassNameView> {
+    public:
+        static tjs_uint32 Make(const NativeClassNameView &key) {
+            return tTJSHashFunc<tjs_char *>::Make(key.text);
+        }
+    };
+
     static std::vector<ttstr> NativeClassNames;
+    static tTJSHashTable<NativeClassNameView, tjs_int32> NativeClassIndex;
 
     //---------------------------------------------------------------------------
     tjs_int32 TJSRegisterNativeClass(const tjs_char *name) {
-        for(tjs_uint i = 0; i < NativeClassNames.size(); i++) {
-            if(NativeClassNames[i] == name)
-                return i;
-        }
+        if(const tjs_int32 *found =
+               NativeClassIndex.Find(NativeClassNameView{ name }))
+            return *found;
 
         NativeClassNames.push_back(TJSMapGlobalStringMap(name));
-
-        return (tjs_int32)(NativeClassNames.size() - 1);
+        const tjs_int32 id = (tjs_int32)(NativeClassNames.size() - 1);
+        NativeClassIndex.Add(NativeClassNameView{ NativeClassNames.back().c_str() },
+                             id);
+        return id;
     }
 
     //---------------------------------------------------------------------------
     tjs_int32 TJSFindNativeClassID(const tjs_char *name) {
-        for(tjs_uint i = 0; i < NativeClassNames.size(); i++) {
-            if(NativeClassNames[i] == name)
-                return i;
-        }
-
+        if(const tjs_int32 *found =
+               NativeClassIndex.Find(NativeClassNameView{ name }))
+            return *found;
         return -1;
     }
 

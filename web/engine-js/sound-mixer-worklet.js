@@ -1,7 +1,13 @@
 import { mixSample } from './sound-master.js';
 
 class WaveMixerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ended = false;
+    this.port.onmessage = ({ data }) => { if (data.type === 'dispose') this.ended = true; };
+  }
   process(inputs, outputs) {
+    if (this.ended) return false;
     const output = outputs[0];
     const accumulated = inputs[0] ?? [];
     const contribution = inputs[1] ?? [];

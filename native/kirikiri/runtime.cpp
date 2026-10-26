@@ -16,6 +16,32 @@ void Runtime::Print(const tjs_char *message)
 void Runtime::ExceptionPrint(const tjs_char *message)
 { Print(message); }
 
+// Owner values are released smallest handle first, which is creation order.
+// A value created during that release has a larger handle and is appended, so
+// the drain loop still reaches it; a value moved in by bindOwner can be older
+// than the current tail and is inserted in place.
+void Runtime::addOwnerValue(int owner, int id)
+{
+    auto &held = valuesByOwner[owner];
+    if (!held.empty() && held.back() > id)
+        held.insert(std::upper_bound(held.begin(), held.end(), id), id);
+    else
+        held.push_back(id);
+}
+
+void Runtime::removeOwnerValue(int owner, int id)
+{
+    auto index = valuesByOwner.find(owner);
+    if (index == valuesByOwner.end())
+        return;
+    auto &held = index->second;
+    auto found = std::lower_bound(held.begin(), held.end(), id);
+    if (found != held.end() && *found == id)
+        held.erase(found);
+    if (held.empty())
+        valuesByOwner.erase(index);
+}
+
 int Runtime::keep(const tTJSVariant &v, int parent, int owner)
 {
     // A reentrant API call may complete after its input borrow has ended.
@@ -24,7 +50,7 @@ int Runtime::keep(const tTJSVariant &v, int parent, int owner)
     const int borrow = source != values.end() && source->second.borrow > 0 ? source->second.borrow : 0;
     const int id = next++;
     values.emplace(id, Value{v, borrow, owner});
-    valuesByOwner[owner].insert(id);
+    addOwnerValue(owner, id);
     if (borrow)
         borrows.at(borrow).push_back(id);
     return id;
@@ -89,14 +115,11 @@ void Runtime::release(int id)
     }
 }
 
-std::map<int, Runtime::Value>::node_type Runtime::extractValue(int id)
+std::unordered_map<int, Runtime::Value>::node_type Runtime::extractValue(int id)
 {
     auto held = values.extract(id);
-    if (!held.empty()) {
-        auto index = valuesByOwner.find(held.mapped().owner);
-        index->second.erase(id);
-        if (index->second.empty()) valuesByOwner.erase(index);
-    }
+    if (!held.empty())
+        removeOwnerValue(held.mapped().owner, id);
     return held;
 }
 
@@ -122,11 +145,9 @@ void Runtime::bindOwner(int id, int owner)
     if (value->second.owner && value->second.owner != reference)
         throw eTJSError(TJS_W("TJS reference already belongs to another native owner"));
     if (value->second.owner != reference) {
-        auto index = valuesByOwner.find(value->second.owner);
-        index->second.erase(id);
-        if (index->second.empty()) valuesByOwner.erase(index);
+        removeOwnerValue(value->second.owner, id);
         value->second.owner = reference;
-        valuesByOwner[reference].insert(id);
+        addOwnerValue(reference, id);
     }
 }
 
@@ -147,7 +168,7 @@ void Runtime::releaseOwnerValues(iTJSDispatch2 *owner)
         auto index = valuesByOwner.find(reference);
         if (index == valuesByOwner.end())
             break;
-        auto held = extractValue(*index->second.begin());
+        auto held = extractValue(index->second.front());
         try
         {
             held.mapped().value.Clear();
@@ -191,7 +212,7 @@ void Runtime::shutdown()
     // the script globals used by their finalize callbacks.
     {
         std::vector<std::pair<int, tTJSVariant>> windows;
-        const int classId = TJSRegisterNativeClass(TJS_W("Window"));
+        static const int classId = TJSRegisterNativeClass(TJS_W("Window"));
         for (const auto &[owner, info] : owners) {
             iTJSNativeInstance *instance = nullptr;
             if (TJS_SUCCEEDED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classId, &instance)) && instance)
@@ -213,7 +234,7 @@ void Runtime::shutdown()
         auto index = valuesByOwner.find(0);
         if (index == valuesByOwner.end())
             break;
-        auto held = extractValue(*index->second.begin());
+        auto held = extractValue(index->second.front());
         held.mapped().value.Clear();
     }
     engine->Shutdown();

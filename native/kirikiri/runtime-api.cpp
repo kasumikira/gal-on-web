@@ -76,11 +76,13 @@ extern "C"
             tTJSVariant result(array, array);
             array->Release();
             int index = 0;
+            // Hoisted out of the loop: the scan used to run once per owner.
+            static const auto kagParserClass = TJSRegisterNativeClass(TJS_W("KAGParser"));
             for (const auto &[owner, identity] : r->owners)
             {
                 iTJSNativeInstance *instance = nullptr;
                 if (TJS_SUCCEEDED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
-                                                               TJSRegisterNativeClass(TJS_W("KAGParser")), &instance)))
+                                                               kagParserClass, &instance)))
                 {
                     auto *parser = static_cast<tTJSNI_KAGParser *>(instance);
                     auto *dic = TJSCreateDictionaryObject();

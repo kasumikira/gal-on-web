@@ -424,6 +424,14 @@ export class LoopSource {
     count = Math.trunc(count);
     if (this.ended || count <= 0) return this.empty();
     const output = this.channels.map(() => new Float32Array(count));
+    const written = this.readInto(output, count);
+    return output.map(channel => channel.subarray(0, written));
+  }
+
+  // AudioWorklet supplies its output buffers directly; keep read() for callers
+  // that need an owned sample block.
+  readInto(output, count) {
+    if (this.ended || count <= 0) return 0;
     let written = 0;
     while (written < count && !this.ended) {
       if (this.crossfade) {
@@ -511,6 +519,6 @@ export class LoopSource {
       written += one;
       this.giveUp = 0;
     }
-    return output.map(channel => channel.subarray(0, written));
+    return written;
   }
 }

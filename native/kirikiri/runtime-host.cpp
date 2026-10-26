@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <emscripten/emscripten.h>
 #include <stdexcept>
+#include <array>
+#include <memory>
+#include <limits>
 
 // clang-format off
 // Dual-mode host entry under WebAssembly.Suspending: a non-thenable host
@@ -271,7 +274,13 @@ class HostInstance : public tTJSNativeInstance
     int owner = 0, initialize, stateHandle = 0, classId, reference = 0;
 
 public:
-    HostInstance(Runtime *r, int initialize, int classId) : r(r), initialize(initialize ? host_retain(r, initialize) : 0), classId(classId) { r->alive++; }
+    // Shared with the JS renderer through the Layer field API; no JS mirror.
+    // left, top, imageLeft, imageTop, opacity, visible.
+    std::unique_ptr<std::array<double, 6>> layer;
+    HostInstance(Runtime *r, int initialize, int classId, bool isLayer) : r(r), initialize(initialize ? host_retain(r, initialize) : 0), classId(classId) {
+        if (isLayer) layer = std::make_unique<std::array<double, 6>>(std::array<double, 6>{0, 0, 0, 0, 255, 0});
+        r->alive++;
+    }
     void attach(iTJSDispatch2 *value, int state = 0)
     {
         owner = (int)(uintptr_t)value;
@@ -343,13 +352,46 @@ public:
             std::rethrow_exception(failure);
     }
 };
+static double &layerField(Runtime *r, int reference, int classId, int field)
+{
+    auto classes = r->nativeInstances.find(classId);
+    if (classes == r->nativeInstances.end()) throw std::runtime_error("Layer native instance not found");
+    auto instance = classes->second.find(reference);
+    if (instance == classes->second.end() || !instance->second->state() || !instance->second->layer)
+        throw std::runtime_error("Layer native instance not found");
+    return instance->second->layer->at(field);
+}
+
+// Keep the existing setter (including paint notification and primary-layer
+// checks), but a script property read no longer enters the host bridge.
+class LayerProperty : public HostProperty
+{
+    int classId, field;
+public:
+    LayerProperty(Runtime *r, int callback, int classId, int field)
+        : HostProperty(r, callback), classId(classId), field(field) {}
+    tjs_error PropGet(tjs_uint32, const tjs_char *name, tjs_uint32 *, tTJSVariant *result, iTJSDispatch2 *owner) override
+    {
+        if (name) return TJS_E_MEMBERNOTFOUND;
+        if (!owner) return TJS_E_NATIVECLASSCRASH;
+        iTJSNativeInstance *instance = nullptr;
+        if (TJS_FAILED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classId, &instance)) || !instance)
+            return TJS_E_NATIVECLASSCRASH;
+        auto *host = static_cast<HostInstance *>(instance);
+        if (!host->state() || !host->layer) return TJS_E_NATIVECLASSCRASH;
+        if (result) *result = static_cast<tjs_int64>(host->layer->at(field));
+        return TJS_S_OK;
+    }
+};
+
 class HostClass : public tTJSNativeClass
 {
     Runtime *r;
     int initialize;
+    bool isLayer;
 
 protected:
-    iTJSNativeInstance *CreateNativeInstance() override { return new HostInstance(r, initialize, _ClassID); }
+    iTJSNativeInstance *CreateNativeInstance() override { return new HostInstance(r, initialize, _ClassID, isLayer); }
 
 public:
     ~HostClass() override
@@ -368,7 +410,7 @@ public:
             TJS_eTJSError(TJS_E_NATIVECLASSCRASH);
         static_cast<HostInstance *>(instance)->attach(owner, stateHandle);
     }
-    HostClass(Runtime *r, const tjs_char *name, int initialize) : tTJSNativeClass(name), r(r), initialize(initialize)
+    HostClass(Runtime *r, const tjs_char *name, int initialize) : tTJSNativeClass(name), r(r), initialize(initialize), isLayer(!TJS_strcmp(name, TJS_W("Layer")))
     {
         SetClassID(TJSRegisterNativeClass(name));
         if (!TJS_strcmp(name, TJS_W("Window"))) TVPRegisterWindowMenu(this);
@@ -400,15 +442,35 @@ public:
 
 extern "C"
 {
-    EMSCRIPTEN_KEEPALIVE int tjs_native_state(Runtime *r, int id, const tjs_char *name, int handle)
+    EMSCRIPTEN_KEEPALIVE double tjs_layer_field(Runtime *r, int reference, int classId, int field, int write, double value)
+    {
+        double result = 0;
+        if (!checked(r, [&] {
+            auto &slot = layerField(r, reference, classId, field);
+            if (write) slot = value;
+            result = slot;
+            return 1;
+        })) return std::numeric_limits<double>::quiet_NaN();
+        return result;
+    }
+    // Class id for a name already registered by tjs_class_create. Lookup only:
+    // registering here would turn a misspelled name into a silent empty class.
+    EMSCRIPTEN_KEEPALIVE int tjs_class_id(Runtime *r, const tjs_char *name)
+    {
+        return TJSFindNativeClassID(name);
+    }
+    // JS caches the class id per VM, so this call carries no string. `id` is the
+    // instance, `classId` selects the native slot.
+    EMSCRIPTEN_KEEPALIVE int tjs_native_state(Runtime *r, int id, int classId, int handle)
     {
         return checked(r, [&]
                        {
+        if(classId<0)return -1;
         auto value=r->copy(id);
         auto *owner=value.AsObjectNoAddRef();
         if(!r->owners.contains(owner))return -1;
         iTJSNativeInstance *instance=nullptr;
-        if(TJS_FAILED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE,TJSRegisterNativeClass(name),&instance)))return -1;
+        if(TJS_FAILED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE,classId,&instance)))return -1;
         auto *host=dynamic_cast<HostInstance *>(instance);
         if(!host)return -1;
         if(handle)host->setState(handle);
@@ -420,7 +482,7 @@ extern "C"
         return checked(r, [&]
                        {
         auto *array=TJSCreateArrayObject();tTJSVariant result(array,array);array->Release();int index=0;
-        const auto classId=TJSRegisterNativeClass(name);
+        const auto classId=TJSFindNativeClassID(name);
         const auto found=r->nativeInstances.find(classId);
         if(found!=r->nativeInstances.end())for(const auto &[identity,host]:found->second){
             if(host->state()){tTJSVariant value(host->state());success(array->PropSetByNum(TJS_MEMBERENSURE,index++,&value,array));}
@@ -430,7 +492,10 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE int tjs_object_create_host(Runtime *r, int kind, int hostHandle)
     {
         return checked(r, [&]
-                       {iTJSDispatch2 *object=kind==1?TJSCreateArrayObject():kind==2?TJSCreateDictionaryObject():new tTJSCustomObject();auto *instance=new HostDataInstance(r,hostHandle);instance->attach(object);iTJSNativeInstance *native=instance;const auto status=object->NativeInstanceSupport(TJS_NIS_REGISTER,TJSRegisterNativeClass(TJS_W("GalWebHostData")),&native);if(TJS_FAILED(status)){delete instance;object->Release();success(status);}int id=r->keep(tTJSVariant(object,object));object->Release();return id; });
+                       {
+        // The name is a literal: resolve it once instead of once per object.
+        static const tjs_int32 hostDataClass = TJSRegisterNativeClass(TJS_W("GalWebHostData"));
+        iTJSDispatch2 *object=kind==1?TJSCreateArrayObject():kind==2?TJSCreateDictionaryObject():new tTJSCustomObject();auto *instance=new HostDataInstance(r,hostHandle);instance->attach(object);iTJSNativeInstance *native=instance;const auto status=object->NativeInstanceSupport(TJS_NIS_REGISTER,hostDataClass,&native);if(TJS_FAILED(status)){delete instance;object->Release();success(status);}int id=r->keep(tTJSVariant(object,object));object->Release();return id; });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_class_create(Runtime *r, const tjs_char *name, int initialize)
     {
@@ -457,5 +522,12 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE int tjs_class_register_member(Runtime *r, int id, const tjs_char *name, int callback, int property)
     {
         return checked(r, [&]
-                       {auto *c=dynamic_cast<HostClass *>(r->value(id).AsObjectNoAddRef());if(!c)throw std::runtime_error("not a host class");iTJSDispatch2 *m=property?(iTJSDispatch2 *)new HostProperty(r,callback):(iTJSDispatch2 *)new HostMethod(r,callback);c->RegisterNCM(name,m,c->GetClassName().c_str(),property?nitProperty:nitMethod);return r->keep(tTJSVariant()); });
+                       {
+        auto *c=dynamic_cast<HostClass *>(r->value(id).AsObjectNoAddRef());
+        if(!c)throw std::runtime_error("not a host class");
+        iTJSDispatch2 *m = property >= 2
+            ? static_cast<iTJSDispatch2 *>(new LayerProperty(r, callback, TJSFindNativeClassID(c->GetClassName().c_str()), property - 2))
+            : property ? static_cast<iTJSDispatch2 *>(new HostProperty(r,callback)) : static_cast<iTJSDispatch2 *>(new HostMethod(r,callback));
+        c->RegisterNCM(name,m,c->GetClassName().c_str(),property?nitProperty:nitMethod);
+        return r->keep(tTJSVariant()); });
     }}

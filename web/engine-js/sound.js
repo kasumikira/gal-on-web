@@ -7,7 +7,7 @@ import { parseLoopInformation, convertLoopInformation } from './sound-loop.js';
 import { probeAudioFormat } from './sound-format.js';
 import { createMixStage } from './sound-master.js';
 // WaveIntf.cpp / WaveImpl.cpp / WaveLoopManager.cpp.  The TJS state machine is
-// kept in JS; decoded PCM is transported by one AudioWorklet per playback so
+// kept in JS; decoded PCM is transported by one AudioWorklet per loaded buffer so
 // loop links, crossfades, labels, flags and pause/seek behave like the
 // reference implementation.  Web Audio provides the output graph (gain, pan,
 // 3D panner and destination) and the audio clock.
@@ -206,7 +206,13 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     state.bufferPlaying = false;
     state.sourceStarted = false;
     state.transport = 'none';
-    if (wasPlaying && masterContext) rebuildMaster(masterContext);
+    if (wasPlaying) disconnectMaster(state);
+  };
+  const releaseWorklet = state => {
+    if (!state.workletSource) return;
+    state.workletSource.port.postMessage({ type: 'dispose' });
+    state.workletSource.disconnect();
+    state.workletSource = null;
   };
   // A PhaseVocoder is claimed from StartPlay until Clear/Invalidate; Stop does
   // not release it in WaveLoopManager/PhaseVocoderFilter.
@@ -221,6 +227,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   // so `looping = true; open(...)` is valid.
   const clear = state => {
     stopPlay(state);
+    releaseWorklet(state);
     releaseFilterClaims(state);
     state.buffer = null;
     state.frequency = 0;
@@ -356,7 +363,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
         paused: false, pan: 0, posX: 0, posY: 0, posZ: 0,
         filters: nativeOwnedArray(owner), flags: new Int32Array(16), useVisBuffer: false,
         filterSnapshot: null,
-        buffer: null, sampleData: null, source: undefined, gain: undefined, panner: undefined,
+        buffer: null, sampleData: null, source: undefined, workletSource: null, gain: undefined, panner: undefined,
         panNodes: null, panInputs: null, inputGain: undefined, codecGain: 1, activeFilters: [],
         transport: 'none', bufferPlaying: false, sourceStarted: false,
         startedAt: 0, playStart: 0, fallbackLoopStart: undefined, fallbackLoopEnd: undefined,
@@ -493,6 +500,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       if (state.fadeTimer) { clearInterval(state.fadeTimer); state.fadeTimer = null; }
       state.fading = false;
       stopPlay(state);
+      releaseWorklet(state);
       releaseFilterClaims(state);
       state.buffer = null;
       state.sampleData = null;
@@ -612,6 +620,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     state.fadeTimer = null;
     state.fading = false;
     stopPlay(state);
+    releaseWorklet(state);
     releaseFilterClaims(state);
     state.buffer = null;
     state.loopInfo = { links: [], labels: [] };
@@ -629,6 +638,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       state.fadeTimer = null;
       state.fading = false;
       stopPlay(state);
+      releaseWorklet(state);
       releaseFilterClaims(state);
     }
   };
@@ -652,7 +662,8 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     workletModule = null;
     workletContext = null;
     for (const stage of masterStages) {
-      try { stage.disconnect(); } catch {}
+      stage.mixStage.port.postMessage({ type: 'dispose' });
+      try { stage.mixStage.disconnect(); } catch {}
     }
     masterStages = [];
     masterContext = null;
@@ -661,42 +672,39 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     if (failure) throw failure;
   };
 
-  // Rebuild the ordered mix chain whenever a stream starts or stops. Each
-  // AudioWorklet stage mixes one stream into the accumulated PCM. When the
-  // mixer worklet is unavailable, streams retain Web Audio's direct float sum.
-  function rebuildMaster(context) {
-    if (masterContext && masterContext !== context) {
-      for (const stage of masterStages) {
-        try { stage.disconnect(); } catch {}
-      }
-      masterStages = [];
-    }
+  // Extend/splice the ordered mix chain without rebuilding unrelated stages.
+  // Connect replacement edges before removing the old edge, so a short sound
+  // cannot temporarily disconnect every already-playing stream.
+  function connectMaster(state, context) {
     masterContext = context;
-    const active = [...buffers].filter(state => state.gain);
-    for (const state of active) {
-      try { state.gain.disconnect(); } catch {}
-    }
-    for (const stage of masterStages) {
-      try { stage.disconnect(); } catch {}
-    }
-    masterStages = [];
-    if (!active.length) return;
-
     const canMix = mixerContext === context && !!mixerModule && !mixerUnavailable &&
       typeof AudioWorkletNode === 'function';
     if (canMix) {
-      let output = active[0].gain;
-      for (const state of active.slice(1)) {
-        const stage = createMixStage(context);
-        output.connect(stage, 0, 0);
-        state.gain.connect(stage, 0, 1);
-        masterStages.push(stage);
-        output = stage;
+      const previous = masterStages.at(-1)?.mixStage;
+      const stage = state.mixStage = createMixStage(context);
+      state.gain.connect(stage, 0, 1);
+      stage.connect(context.destination);
+      if (previous) {
+        previous.connect(stage, 0, 0);
+        previous.disconnect(context.destination);
       }
-      output.connect(context.destination);
-    } else {
-      for (const state of active) state.gain.connect(context.destination);
+      masterStages.push(state);
+    } else state.gain.connect(context.destination);
+  }
+  function disconnectMaster(state) {
+    const index = masterStages.indexOf(state);
+    if (index < 0) return;
+    const stage = state.mixStage;
+    const previous = masterStages[index - 1]?.mixStage;
+    const next = masterStages[index + 1]?.mixStage;
+    if (previous) {
+      previous.connect(next ?? masterContext.destination, 0, 0);
+      previous.disconnect(stage);
     }
+    stage.port.postMessage({ type: 'dispose' });
+    stage.disconnect();
+    masterStages.splice(index, 1);
+    state.mixStage = null;
   }
 
   // Build the Web Audio output graph.  Volume is a GainNode; pan is the
@@ -793,31 +801,42 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     const loopInfo = convertLoopInformation(state.loopInfo, ratio);
     const startSample = Math.max(0, Math.min(state.buffer.length,
       Math.trunc(state.position * state.decodedRate / 1000)));
-    const canWorklet = !workletUnavailable && !!context.audioWorklet &&
+    const needsWorklet = filters.length || loopInfo.links.length || loopInfo.labels.length;
+    // Plain tracks already have native looping, seek and pause support. They
+    // do not need a second PCM copy or a JS callback per render quantum.
+    const canWorklet = needsWorklet && !workletUnavailable && !!context.audioWorklet &&
       typeof AudioWorkletNode !== 'undefined' && workletContext === context && !!workletModule;
     if (filters.length && !canWorklet) throw new Error('PhaseVocoder requires AudioWorklet support');
+    const generation = state.playGeneration = (state.playGeneration ?? 0) + 1;
     let source;
     if (canWorklet) {
-      source = new AudioWorkletNode(context, 'krkr-wave', {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [channels],
-        processorOptions: {
-          channels: Array.from({ length: channels }, (_, channel) => state.buffer.getChannelData(channel)),
-          sampleRate: state.decodedRate,
-          position: startSample,
-          looping: state.looping,
-          links: loopInfo.links,
-          labels: loopInfo.labels,
-          flags: Array.from(state.flags),
-          frequency: state.frequency,
-          paused: state.paused,
-          filters: filters.map(filterConfig),
-        },
-      });
+      const options = {
+        generation,
+        sampleRate: state.decodedRate,
+        position: startSample,
+        looping: state.looping,
+        links: loopInfo.links,
+        labels: loopInfo.labels,
+        flags: Array.from(state.flags),
+        frequency: state.frequency,
+        paused: state.paused,
+        filters: filters.map(filterConfig),
+      };
+      source = state.workletSource;
+      if (!source) {
+        source = state.workletSource = new AudioWorkletNode(context, 'krkr-wave', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [channels],
+        });
+        // AudioBuffer owns its PCM: copy once on the main thread, then transfer
+        // ownership instead of cloning a whole track on the audio render thread.
+        const pcm = Array.from({ length: channels }, (_, channel) => state.buffer.getChannelData(channel).slice());
+        source.port.postMessage({ type: 'load', channels: pcm, options }, pcm.map(channel => channel.buffer));
+      } else source.port.postMessage({ type: 'restart', options });
       state.transport = 'worklet';
       source.port.onmessage = ({ data }) => {
-        if (state.source !== source) return;
+        if (state.source !== source || data.generation !== generation) return;
         if (data.type === 'position') {
           if (!state.paused && state.decodedRate > 0) {
             state.position = Math.min(state.buffer.duration * 1000, data.value / state.decodedRate * 1000);
@@ -827,7 +846,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
         } else if (data.type === 'flags') {
           for (let index = 0; index < 16; index++) state.flags[index] = data.values?.[index] ?? 0;
         } else if (data.type === 'ended') {
-          finishEnded(state, source);
+          finishEnded(state, source, generation);
         }
       };
       source.onprocessorerror = error => report(`WaveSoundBuffer worklet failed: ${error?.message ?? error}`);
@@ -872,7 +891,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     state.startedAt = context.currentTime;
     state.playStart = state.position;
     buffers.add(state);
-    rebuildMaster(context);
+    connectMaster(state, context);
     filters.forEach((filter, index) => { filter.sound = state; filter.index = index; });
     state.activeFilters = filters;
     if (!canWorklet && !state.paused) {
@@ -880,11 +899,11 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     }
   }
 
-  function finishEnded(state, source) {
+  function finishEnded(state, source, generation) {
     const context = getAudioContext();
     const latency = Math.max(0, ((context.outputLatency ?? context.baseLatency ?? 0) * 1000));
     setTimeout(() => {
-      if (state.source !== source) return;
+      if (state.source !== source || state.playGeneration !== generation) return;
       stopPlay(state);
       state.position = 0;
       setStatus(state, 'stop');

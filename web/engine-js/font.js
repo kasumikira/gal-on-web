@@ -136,10 +136,10 @@ export function attachFontClass(fontClass, layerClass) {
   LayerNativeClass = layerClass;
 }
 
-export function createFontInstance(layerNode) {
+export function createFontInstance(layerNode, owner) {
   // TVPCreateFontObject: a Font native instance bound to a layer node.
   if (!LayerFontClass) throw new Error('TJS Font class is not registered');
-  return createNativeInstance(LayerFontClass, { layer: layerNode });
+  return createNativeInstance(LayerFontClass, { layer: layerNode }, owner);
 }
 
 const PRERENDERED_HEADER = new TextEncoder().encode('TVP pre-rendered font\x1a');
@@ -259,6 +259,36 @@ function prerenderedGlyphVariant(cache, font, glyph, color, aa, blurWidth, blurL
     blurGlyphImage(prerenderedGlyphImage(font, glyph, color, aa), blurWidth, blurLevel));
 }
 
+const TEXT_METRICS_CACHE_BYTES = 1024 * 1024;
+const textMeasurements = new WeakMap();
+function browserTextMetrics(document, font, text) {
+  let measurement = textMeasurements.get(document);
+  if (!measurement) {
+    const cache = new LRUCache({ max: 1024, maxSize: TEXT_METRICS_CACHE_BYTES,
+      sizeCalculation: (value, key) => key.length * 2 + 128 });
+    measurement = { context: document.createElement('canvas').getContext('2d'), cache };
+    textMeasurements.set(document, measurement);
+    // Measurements made with a fallback font must not survive web-font loading.
+    document.fonts?.addEventListener('loadingdone', () => cache.clear());
+  }
+  const cssFont = `${font?.flags & 0x0200 ? 'bold ' : ''}${font?.flags & 0x0100 ? 'italic ' : ''}${Math.abs(font?.height ?? 0) | 0}px "${String(font?.face ?? '').replace(/"/g, '')}", sans-serif`;
+  const key = JSON.stringify([cssFont, text]);
+  let metrics = measurement.cache.get(key);
+  if (metrics) return metrics;
+  const context = measurement.context;
+  // Rejected CSS must retain a fresh canvas's default, not the previous font.
+  context.font = '10px sans-serif';
+  context.font = cssFont;
+  const measured = context.measureText(text);
+  metrics = { width: measured.width,
+    actualBoundingBoxLeft: measured.actualBoundingBoxLeft,
+    actualBoundingBoxRight: measured.actualBoundingBoxRight,
+    actualBoundingBoxAscent: measured.actualBoundingBoxAscent,
+    actualBoundingBoxDescent: measured.actualBoundingBoxDescent };
+  measurement.cache.set(key, metrics);
+  return metrics;
+}
+
 // LayerBitmapImpl::ApplyFont derives these offsets from the rasterizer ascent.
 // Canvas does not expose the native rasterizer's ascent, so use its measured
 // glyph ascent when available and retain the same integer/trigonometric rules.
@@ -266,13 +296,8 @@ export function getFontAscentOffsets(document, font) {
   const size = Math.abs(font?.height ?? 0) | 0;
   let ascent = Math.trunc(size * 0.8);
   if (document?.createElement) {
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    if (context) {
-      context.font = `${font?.flags & 0x0200 ? 'bold ' : ''}${font?.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font?.face ?? '').replace(/"/g, '')}", sans-serif`;
-      const metrics = context.measureText('Mg');
-      if (Number.isFinite(metrics.actualBoundingBoxAscent)) ascent = Math.trunc(metrics.actualBoundingBoxAscent);
-    }
+    const metrics = browserTextMetrics(document, font, 'Mg');
+    if (Number.isFinite(metrics.actualBoundingBoxAscent)) ascent = Math.trunc(metrics.actualBoundingBoxAscent);
   }
   const angle = (font?.angle || 0) * Math.PI / 1800;
   return {
@@ -534,29 +559,18 @@ export function createFontClass(document, { storage, Rect } = {}) {
     return faces[0] ?? 'sans-serif';
   };
   const defaultFaceName = browserDefaultFace();
-  const measure = (font, text) => {
+  const measureWidth = (font, text) => {
     if (font?.prerenderedFont) {
       let width = 0;
-      let context;
       for (const character of text) {
         const glyph = font.prerenderedFont.glyphs.get(character.charCodeAt(0));
         if (glyph) width += glyph.inc;
-        else {
-          if (!context) {
-            const canvas = document.createElement('canvas');
-            context = canvas.getContext('2d');
-            context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${Math.abs(font.height) | 0}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
-          }
-          width += Math.ceil(context.measureText(character).width);
-        }
+        else width += Math.ceil(browserTextMetrics(document, font, character).width);
       }
-      return { width, height: Math.abs(font.height) };
+      return width;
     }
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${Math.abs(font.height) | 0}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
-    const metrics = context.measureText(text);
-    return { width: Math.ceil(metrics.width), height: Math.abs(font.height) };
+    const metrics = browserTextMetrics(document, font, text);
+    return Math.ceil(metrics.width);
   };
   // The Font instance follows its owning layer's font state when attached.
   const fontOf = state => {
@@ -577,12 +591,13 @@ export function createFontClass(document, { storage, Rect } = {}) {
     @nativeMethod getTextWidth(...args) {
       if (!arguments.length) throw new Error('TJS Font.getTextWidth requires text');
       const state = this;
-      return measure(state.layer ? state.layer.font : state.font ?? new FontState(), String(args[0])).width;
+      return measureWidth(state.layer ? state.layer.font : state.font ?? new FontState(), String(args[0]));
     }
     @nativeMethod getTextHeight(...args) {
       if (!arguments.length) throw new Error('TJS Font.getTextHeight requires text');
-      const state = this;
-      return measure(state.layer ? state.layer.font : state.font ?? new FontState(), String(args[0])).height;
+      const state = this, font = state.layer ? state.layer.font : state.font ?? new FontState();
+      String(args[0]);
+      return Math.abs(font.height);
     }
 
     @nativeProperty get height() { return fontOf(this).height; }
@@ -610,20 +625,18 @@ export function createFontClass(document, { storage, Rect } = {}) {
     @nativeProperty get faceIsFileName() { return Number(fontOf(this).faceIsFileName); }
     @nativeProperty set faceIsFileName(value) { fontOf(this).faceIsFileName = !!truth(value); }
 
-    @nativeMethod getEscWidthX(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthX requires text'); const f = fontOf(this); return measure(f, String(args[0])).width * Math.cos(f.angle * Math.PI / 1800); }
-    @nativeMethod getEscWidthY(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthY requires text'); const f = fontOf(this); return measure(f, String(args[0])).width * -Math.sin(f.angle * Math.PI / 1800); }
-    @nativeMethod getEscHeightX(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightX requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.sin(f.angle * Math.PI / 1800); }
-    @nativeMethod getEscHeightY(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightY requires text'); const f = fontOf(this); return measure(f, String(args[0])).height * Math.cos(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscWidthX(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthX requires text'); const f = fontOf(this); return measureWidth(f, String(args[0])) * Math.cos(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscWidthY(...args) { if (!args.length) throw new Error('TJS Font.getEscWidthY requires text'); const f = fontOf(this); return measureWidth(f, String(args[0])) * -Math.sin(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscHeightX(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightX requires text'); const f = fontOf(this); String(args[0]); return Math.abs(f.height) * Math.sin(f.angle * Math.PI / 1800); }
+    @nativeMethod getEscHeightY(...args) { if (!args.length) throw new Error('TJS Font.getEscHeightY requires text'); const f = fontOf(this); String(args[0]); return Math.abs(f.height) * Math.cos(f.angle * Math.PI / 1800); }
     @nativeMethod async getGlyphDrawRect(...args) {
       if (arguments.length < 1) throw new Error('TJS Font.getGlyphDrawRect requires text');
       const font = fontOf(this), text = String(args[0]);
       if (!text.length) return constructNative(this, Rect, 0, 0, 0, 0);
       const size = Math.abs(font.height) | 0;
-      let left = 0, top = -Math.trunc(size * 0.8), right = measure(font, text).width, bottom = size - Math.trunc(size * 0.8);
+      let left = 0, top = -Math.trunc(size * 0.8), right = measureWidth(font, text), bottom = size - Math.trunc(size * 0.8);
       if (document?.createElement) {
-        const canvas = document.createElement('canvas'), context = canvas.getContext('2d');
-        context.font = `${font.flags & 0x0200 ? 'bold ' : ''}${font.flags & 0x0100 ? 'italic ' : ''}${size}px "${String(font.face).replace(/"/g, '')}", sans-serif`;
-        const metrics = context.measureText(text);
+        const metrics = browserTextMetrics(document, font, text);
         if (Number.isFinite(metrics.actualBoundingBoxLeft)) left = -Math.ceil(metrics.actualBoundingBoxLeft);
         if (Number.isFinite(metrics.actualBoundingBoxAscent)) top = -Math.ceil(metrics.actualBoundingBoxAscent);
         if (Number.isFinite(metrics.actualBoundingBoxRight)) right = Math.ceil(metrics.actualBoundingBoxRight);
@@ -631,7 +644,7 @@ export function createFontClass(document, { storage, Rect } = {}) {
       }
       // Canvas exposes no portable underline/strikeout metrics; retain the
       // native text extent convention by extending to the advance width.
-      if (font.flags & (0x0400 | 0x0800)) right = Math.max(right, measure(font, text).width);
+      if (font.flags & (0x0400 | 0x0800)) right = Math.max(right, measureWidth(font, text));
       return constructNative(this, Rect, left, top, right, bottom);
     }
     @nativeMethod async mapPrerenderedFont(...args) {

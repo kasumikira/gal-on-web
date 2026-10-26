@@ -11,10 +11,10 @@ const reported = new Set();
 export class NativeInstance {
   constructor(nativeClass, state) { this.nativeClass = nativeClass; this.state = state; }
 }
-export function createNativeInstance(nativeClass, state) {
+export function createNativeInstance(nativeClass, state, owner) {
   const instance = new NativeInstance(nativeClass, state);
   nativeClass.instances.set(instance, state);
-  return instance;
+  return owner === undefined ? instance : bindingOf(owner).vm.retain(instance, owner);
 }
 export function reportUnimplemented(name) {
   if (reported.has(name)) return;
@@ -103,6 +103,16 @@ export function windowObjects(window, value, operation) {
   return bindingOf(window).vm.windowObjects(nativeReference(window), value, operation);
 }
 
+// Layer scalar storage lives in native. Node accessors and TJS properties use
+// the same fields; this is not a cache of script properties or ownership.
+export const LAYER_FIELDS = ['left', 'top', 'imageLeft', 'imageTop', 'opacity', 'visible'];
+export function registerLayerFields(klass) {
+  for (const [field, name] of LAYER_FIELDS.entries()) klass.members.get(name).layerField = field;
+}
+export function attachLayerFields(owner, node) {
+  return bindingOf(owner).vm.attachLayerFields(owner, node);
+}
+
 export function writeScript(object, name, value) {
   return bindingOf(object).vm.set(nativeReference(object), name, value);
 }
@@ -156,6 +166,7 @@ function attachNativeState(klass, owner, state, vm, handle) {
   bindings.set(state, info);
   handle ??= vm.storeHost(state);
   if (vm.nativeState(klass, owner, handle) < 1) throw new Error(`TJS ${klass.nativeName} native instance not found`);
+  klass.attachState?.(state);
   for (const [name, member] of klass.members) {
     if (name in state && !member?.[kNativeMember]?.virtual) continue;
     if (typeof member === 'function' && !isNativeClass(member)) {
@@ -307,7 +318,8 @@ function registerNativeMember(klass, name, member, interop, id, forceStatic = fa
         : member.apply(klass.state(receiver), args),
     );
     interop.withString(name, pointer => interop.decode(
-      interop.module._tjs_class_register_member(interop.runtime, id, pointer, callback, Number(property)),
+      interop.module._tjs_class_register_member(interop.runtime, id, pointer, callback,
+        property && member.layerField !== undefined ? 2 + member.layerField : Number(property)),
     ));
   } else interop.setEncoded(id, name, member);
 }

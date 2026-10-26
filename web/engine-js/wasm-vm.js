@@ -8,6 +8,7 @@ import {
   isNativeProperty,
   bindScriptReference,
   scriptBinding,
+  LAYER_FIELDS,
 } from "#krkr/native";
 
 // Classes the interpreter owns; host globals must not shadow them.
@@ -77,6 +78,10 @@ class Members extends Map {
 export class TJSInterop {
   constructor(wasmURL) {
     this.host = new TJSRuntime(wasmURL);
+    // Native class name -> class id, resolved once per VM. The id is a
+    // process-wide constant of the class, not of any instance, so caching it
+    // does not cache validity, context or references.
+    this.classIds = new WeakMap();
   }
   get module() {
     return this.host.module;
@@ -414,12 +419,51 @@ export class TJSInterop {
     const result = this.module._tjs_host_bind(this.runtime, this.storeHost(owner), id, this.host.identity(owner));
     if (!result) this.fail();
   }
+  attachLayerFields(owner, node) {
+    const reference = scriptBinding(owner).id;
+    const classId = this.classId(this.global.Layer);
+    for (const [field, name] of LAYER_FIELDS.entries()) {
+      const access = (write, value = 0) => {
+        const result = this.module._tjs_layer_field(this.runtime, reference, classId, field, write, value);
+        if (Number.isNaN(result)) this.fail();
+        return name === 'visible' ? Boolean(result) : result;
+      };
+      access(1, Number(node[name]));
+      Object.defineProperty(node, name, {
+        enumerable: true, configurable: true,
+        get: () => access(0),
+        set: value => { access(1, Number(value)); },
+      });
+    }
+  }
+  // Resolves the native class slot once per class and VM; every member call
+  // reuses it instead of encoding the class name again.
+  classId(klass) {
+    let id = this.classIds.get(klass);
+    if (id === undefined) {
+      id = this.withString(klass.nativeName, name =>
+        this.module._tjs_class_id(this.runtime, name));
+      // Only a resolved slot is a class constant. A miss means "not registered
+      // yet", which a later registration can flip: caching it would pin the
+      // class at -1 for the rest of the VM's life, and every instance created
+      // after it does register would fail with "native instance not found".
+      if (id >= 0) this.classIds.set(klass, id);
+    }
+    return id;
+  }
   // Returns the host state handle; -1 means the owner has no such native
   // instance, 0 means the instance carries no state (or a VM error, which
   // throws through the standard error channel only for checked exports).
   nativeState(klass, owner, handle = 0) {
-    return this.withReference(owner, id => this.withString(klass.nativeName, name =>
-      this.module._tjs_native_state(this.runtime, id, name, handle)));
+    // GETINSTANCE only reads native slots: it cannot enter script or suspend.
+    // Pass an existing opaque handle; C++ still resolves and validates it.
+    const classId = this.classId(klass);
+    // An unknown class has no instance anywhere, which is what -1 reports. The
+    // name form used to register the class as a side effect of the query.
+    if (classId < 0) return -1;
+    const binding = scriptBinding(owner);
+    if (!handle && binding) return this.module._tjs_native_state(this.runtime, binding.id, classId, 0);
+    return this.withReference(owner, id => this.module._tjs_native_state(this.runtime, id, classId, handle));
   }
   kagParsers() {
     return this.readArray(this.module._tjs_kag_parsers(this.runtime)).map(value => {

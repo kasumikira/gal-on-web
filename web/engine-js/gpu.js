@@ -605,6 +605,10 @@ class GlyphAtlas {
   }
 }
 
+// Uniform cache slot kinds. Each cached name always uses one GL type, so the
+// kind doubles as the "was this ever set" flag on the entry.
+const UNIFORM_INT = 1, UNIFORM_FLOAT2 = 2, UNIFORM_FLOAT4 = 3, UNIFORM_MATRIX3 = 4;
+
 class GPUDevice {
   constructor(document, textBlendShader) {
     this.canvas = new OffscreenCanvas(1, 1);
@@ -662,23 +666,93 @@ class GPUDevice {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     return program;
   }
-  uniform(name, type, ...values) {
-    let uniform = this.uniforms.get(name);
-    if (!uniform) {
-      uniform = { location: this.gl.getUniformLocation(this.activeProgram, name), values: null };
-      this.uniforms.set(name, uniform);
+  // Uniform locations belong to the program that was active when they were
+  // queried; setup() swaps this.uniforms to the matching program's table.
+  // Every entry remembers the value it last pushed, so a repeated uniform is
+  // one comparison instead of a WebGL round trip. The typed setters exist so
+  // the hot path never goes through gl[type](...): a dynamic property lookup
+  // plus a rest-argument array for each uniform of each draw.
+  uniformEntry(name) {
+    let entry = this.uniforms.get(name);
+    if (entry === undefined) {
+      entry = { location: this.gl.getUniformLocation(this.activeProgram, name),
+        kind: 0, a: 0, b: 0, c: 0, d: 0, matrix: null };
+      this.uniforms.set(name, entry);
     }
-    if (uniform.location === null) return;
-    const previous = uniform.values;
-    const matrix = type === 'uniformMatrix3fv';
-    if (previous) {
-      const current = matrix ? values[1] : values;
-      let same = current.length === previous.length;
-      for (let i = 0; same && i < current.length; i++) same = current[i] === previous[i];
+    return entry;
+  }
+  set1i(name, value) {
+    const entry = this.uniformEntry(name);
+    if (entry.location === null || entry.kind === UNIFORM_INT && entry.a === value) return;
+    entry.kind = UNIFORM_INT;
+    entry.a = value;
+    this.gl.uniform1i(entry.location, value);
+  }
+  set2f(name, x, y) {
+    const entry = this.uniformEntry(name);
+    if (entry.location === null || entry.kind === UNIFORM_FLOAT2 && entry.a === x && entry.b === y) return;
+    entry.kind = UNIFORM_FLOAT2;
+    entry.a = x; entry.b = y;
+    this.gl.uniform2f(entry.location, x, y);
+  }
+  set4f(name, x, y, z, w) {
+    const entry = this.uniformEntry(name);
+    if (entry.location === null
+      || entry.kind === UNIFORM_FLOAT4 && entry.a === x && entry.b === y && entry.c === z && entry.d === w) return;
+    entry.kind = UNIFORM_FLOAT4;
+    entry.a = x; entry.b = y; entry.c = z; entry.d = w;
+    this.gl.uniform4f(entry.location, x, y, z, w);
+  }
+  // mat2d affine [a b c d e f] as a column-major mat3, the layout the shaders
+  // expect. The matrix lives in a per-entry Float32Array, so a changed
+  // transform reuses that allocation instead of building a new array.
+  // The cache holds what the GPU received, and the GPU receives float32: the
+  // incoming doubles are rounded the same way before the comparison, otherwise
+  // an input like 1/3 never equals its stored float32 copy and every draw
+  // re-uploads the matrix. Two doubles that round to one float32 are the same
+  // uniform value, so dropping the second upload is exact, not approximate.
+  setAffine(name, a, b, c, d, e, f) {
+    const entry = this.uniformEntry(name);
+    if (entry.location === null) return;
+    a = Math.fround(a); b = Math.fround(b); c = Math.fround(c);
+    d = Math.fround(d); e = Math.fround(e); f = Math.fround(f);
+    const matrix = entry.matrix ??= new Float32Array(9);
+    if (entry.kind === UNIFORM_MATRIX3
+      && matrix[0] === a && matrix[1] === b && matrix[3] === c
+      && matrix[4] === d && matrix[6] === e && matrix[7] === f) return;
+    entry.kind = UNIFORM_MATRIX3;
+    matrix[0] = a; matrix[1] = b; matrix[2] = 0;
+    matrix[3] = c; matrix[4] = d; matrix[5] = 0;
+    matrix[6] = e; matrix[7] = f; matrix[8] = 1;
+    this.gl.uniformMatrix3fv(entry.location, false, matrix);
+  }
+  setMatrix3(name, values) {
+    const entry = this.uniformEntry(name);
+    if (entry.location === null) return;
+    const matrix = entry.matrix ??= new Float32Array(9);
+    if (entry.kind === UNIFORM_MATRIX3) {
+      let same = true;
+      for (let i = 0; i < 9; i++) if (matrix[i] !== Math.fround(values[i])) { same = false; break; }
       if (same) return;
     }
-    this.gl[type](uniform.location, ...values);
-    uniform.values = matrix ? Array.from(values[1]) : values;
+    entry.kind = UNIFORM_MATRIX3;
+    for (let i = 0; i < 9; i++) matrix[i] = values[i];
+    this.gl.uniformMatrix3fv(entry.location, false, matrix);
+  }
+  // Generic form kept for the call sites that use it: the common types route
+  // to the typed setters above, everything else still caches its location but
+  // keeps the call-by-name dispatch.
+  uniform(name, type, ...values) {
+    switch (type) {
+      case 'uniform1i': this.set1i(name, values[0]); return;
+      case 'uniform2f': this.set2f(name, values[0], values[1]); return;
+      case 'uniform4f': this.set4f(name, values[0], values[1], values[2], values[3]); return;
+      case 'uniformMatrix3fv': this.setMatrix3(name, values[1]); return;
+      default: break;
+    }
+    const entry = this.uniformEntry(name);
+    if (entry.location === null) return;
+    this.gl[type](entry.location, ...values);
   }
   create(width, height, gray = false, halfFloat = false) {
     const gl = this.gl;
@@ -852,7 +926,7 @@ class GPUDevice {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-    this.uniform(uniform, 'uniform1i', unit);
+    this.set1i(uniform, unit);
   }
   setup(target, source, rect, matrix, clip, destination, program = this.program) {
     const gl = this.gl;
@@ -870,13 +944,13 @@ class GPUDevice {
     this.bind(destination, 3, 'ruleTexture');
     gl.activeTexture(gl.TEXTURE4);
     gl.bindTexture(gl.TEXTURE_2D, this.tables);
-    this.uniform('tableTexture', 'uniform1i', 4);
-    this.uniform('sourceSize', 'uniform2f', source.width, source.height);
-    this.uniform('smoothSampling', 'uniform1i', 0);
-    this.uniform('explicitCoverage', 'uniform1i', 0);
-    this.uniform('targetSize', 'uniform2f', target.width, target.height);
-    this.uniform('sourceRect', 'uniform4f', rect.left, rect.top, rect.right, rect.bottom);
-    this.uniform('transform', 'uniformMatrix3fv', false, [matrix[0], matrix[1], 0, matrix[2], matrix[3], 0, matrix[4], matrix[5], 1]);
+    this.set1i('tableTexture', 4);
+    this.set2f('sourceSize', source.width, source.height);
+    this.set1i('smoothSampling', 0);
+    this.set1i('explicitCoverage', 0);
+    this.set2f('targetSize', target.width, target.height);
+    this.set4f('sourceRect', rect.left, rect.top, rect.right, rect.bottom);
+    this.setAffine('transform', matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]);
   }
   draw(targetImage, sourceImage, options = {}) {
     const {
@@ -1009,20 +1083,16 @@ class GPUDevice {
     if (!inverse) return;
     this.setup(target, sourceImage === targetImage ? destination : source, clip, [1,0,0,1,0,0], clip, destination,
       windowComposite ? this.windowProgram : motion && mode === 0 && !maskOnly ? this.compositeProgram : this.program);
-    this.uniform('explicitCoverage', 'uniform1i', 1);
-    this.uniform('smoothSampling', 'uniform1i', smooth ? 1 : 0);
-    this.uniform('inverseTransform', 'uniformMatrix3fv', false, [
-      inverse[0], inverse[1], 0,
-      inverse[2], inverse[3], 0,
-      inverse[4], inverse[5], 1
-    ]);
-    this.uniform('sampleRect', 'uniform4f', sourceRect.left, sourceRect.top, sourceRect.right, sourceRect.bottom);
-    this.uniform('sampleBounds', 'uniform4f', sampleBounds.left, sampleBounds.top, sampleBounds.right, sampleBounds.bottom);
-    this.uniform('operation', 'uniform1i', maskOnly ? 6 : motion ? 1 : 0);
-    this.uniform('mode', 'uniform1i', mode);
-    this.uniform('opacity', 'uniform1i', opacity);
-    this.uniform('opaque', 'uniform1i', opaque ? 1 : 0);
-    this.uniform('policy', 'uniform1i', Number(holdAlpha) | Number(destinationAlpha)<<1 | Number(additiveDestination)<<2 | Number(copySourceAlpha)<<3 | Number(ignoreSourceAlpha)<<4);
+    this.set1i('explicitCoverage', 1);
+    this.set1i('smoothSampling', smooth ? 1 : 0);
+    this.setAffine('inverseTransform', inverse[0], inverse[1], inverse[2], inverse[3], inverse[4], inverse[5]);
+    this.set4f('sampleRect', sourceRect.left, sourceRect.top, sourceRect.right, sourceRect.bottom);
+    this.set4f('sampleBounds', sampleBounds.left, sampleBounds.top, sampleBounds.right, sampleBounds.bottom);
+    this.set1i('operation', maskOnly ? 6 : motion ? 1 : 0);
+    this.set1i('mode', mode);
+    this.set1i('opacity', opacity);
+    this.set1i('opaque', opaque ? 1 : 0);
+    this.set1i('policy', Number(holdAlpha) | Number(destinationAlpha)<<1 | Number(additiveDestination)<<2 | Number(copySourceAlpha)<<3 | Number(ignoreSourceAlpha)<<4);
     const gl = this.gl;
     if (windowComposite) {
       gl.enable(gl.BLEND);
@@ -1062,7 +1132,7 @@ class GPUDevice {
       const rect = this.clip(image), identity = [1, 0, 0, 1, 0, 0];
       const convert = (output, input, resolve) => {
         this.setup(output, input, rect, identity, rect, input, this.premultipliedProgram);
-        this.uniform('resolveComposite', 'uniform1i', Number(resolve));
+        this.set1i('resolveComposite', Number(resolve));
         this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
         this.stats.draws++;
       };
