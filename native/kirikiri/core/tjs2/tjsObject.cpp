@@ -1299,7 +1299,7 @@ namespace TJS {
 
         tTJSSymbolData *data = Find(membername, hint);
         if(!data) {
-            if(CallMissing) {
+            if(CallMissing && !(flag & TJS_IGNOREMISSING)) {
                 // call 'missing' method
                 tTJSVariant value;
                 if(CallGetMissing(membername, value))

@@ -12,13 +12,18 @@
 #ifndef tjsArrayH
 #define tjsArrayH
 
-#include <deque>
+#include <boost/container/deque.hpp>
 #include "tjs.h"
 #include "tjsNative.h"
 
 // note: this TJS class cannot be inherited
 
 namespace TJS {
+    // Small TJS arrays dominate; keep deque reference stability without libc++'s
+    // 4 KiB minimum block allocation for a handful of variants.
+    using tTJSArrayItems = boost::container::deque<tTJSVariant,
+        std::allocator<tTJSVariant>,
+        boost::container::deque_options<boost::container::block_size<16>>::type>;
     //---------------------------------------------------------------------------
     // tTJSStringAppender
     //---------------------------------------------------------------------------
@@ -91,8 +96,8 @@ namespace TJS {
         typedef tTJSNativeInstance inherited;
 
     public:
-        typedef std::deque<tTJSVariant>::iterator tArrayItemIterator;
-        std::deque<tTJSVariant> Items;
+        typedef tTJSArrayItems::iterator tArrayItemIterator;
+        tTJSArrayItems Items;
 
         tTJSArrayNI();
 
@@ -103,7 +108,7 @@ namespace TJS {
 
     private:
         struct tDictionaryEnumCallback : public tTJSDispatch {
-            std::deque<tTJSVariant> *Items{};
+            tTJSArrayItems *Items{};
 
             tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
                                tjs_uint32 *hint, tTJSVariant *result,

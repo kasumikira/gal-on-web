@@ -1,6 +1,7 @@
 import { TJSInterop } from './wasm-vm.js';
 import { createDebugClass } from './debug.js';
 import { createSystem } from './system.js';
+import { LRUCache } from 'lru-cache';
 
 // Port of cpp/core/base/XP3Archive.cpp: index chunks and segmented streams.
 const signature = [88, 80, 51, 13, 10, 32, 10, 26, 139, 103, 1];
@@ -87,27 +88,132 @@ export class XP3Archive {
       yield this.names[i];
     }
   }
+  async #decodeSegment(entry, segment, offset, filterStream) {
+    let bytes = await this.source.read(segment.start, segment.storedSize);
+    if (segment.encoding === 1) bytes = await inflate(bytes, segment.size);
+    if (filterStream) bytes = await this.filter.apply(filterStream, entry.hash, offset, bytes);
+    if (bytes.length !== segment.size) throw new Error('XP3 segment size mismatch');
+    return bytes;
+  }
+  async #readEntry(entry, filterStream) {
+    const single = entry.segments.length === 1;
+    let result = single ? null : new Uint8Array(entry.size);
+    let offset = 0;
+    for (const segment of entry.segments) {
+      const bytes = await this.#decodeSegment(entry, segment, offset, filterStream);
+      if (single) result = bytes;
+      else result.set(bytes, offset);
+      offset += bytes.length;
+    }
+    if (offset !== entry.size) throw new Error('XP3 segment size mismatch');
+    return result;
+  }
   async read(name) {
+    const stream = await this.openEntryStream(name);
+    try {
+      return await stream.read(0, stream.size);
+    } finally {
+      await stream.close();
+    }
+  }
+  // Seekable entry stream. Plain segments use source ranges directly. A
+  // complete-read content filter materializes the entry once; other decoded
+  // segments use an 8 MiB LRU plus at most one oversized decoded segment.
+  async openEntryStream(name) {
     const entry = this.entries.get(name.replaceAll('\\', '/').toLowerCase());
     if (!entry) throw new Error(`XP3 storage not found: ${name}`);
-    const stream = this.filter ? await this.filter.open(entry.name, this.name, entry.size) : null;
-    try {
-      const single = entry.segments.length === 1;
-      let result = single ? null : new Uint8Array(entry.size);
-      let offset = 0;
-      for (const segment of entry.segments) {
-        let bytes = await this.source.read(segment.start, segment.storedSize);
-        if (segment.encoding === 1) bytes = await inflate(bytes, segment.size);
-        if (stream) bytes = await this.filter.apply(stream, entry.hash, offset, bytes);
-        if (single) result = bytes;
-        else result.set(bytes, offset);
-        offset += bytes.length;
+    const starts = [];
+    let total = 0;
+    for (const segment of entry.segments) { starts.push(total); total += segment.size; }
+    if (total !== entry.size) throw new Error('XP3 segment size mismatch');
+    const archive = this;
+    const decoding = new Map(); // segment index -> in-flight decode
+    const CACHE_LIMIT = 8 * 1024 * 1024;
+    const cache = new LRUCache({ maxSize: CACHE_LIMIT, sizeCalculation: bytes => Math.max(1, bytes.length) });
+    let oversizedSegment = null, closed = false;
+    const filterSession = archive.filter ? await archive.filter.open(entry.name, archive.name, entry.size) : null;
+    const filterStream = filterSession?.stream ?? null;
+    const segmentAt = index => {
+      if (oversizedSegment?.index === index) return Promise.resolve(oversizedSegment.bytes);
+      if (oversizedSegment) oversizedSegment = null;
+      const cached = cache.get(index);
+      if (cached) return Promise.resolve(cached);
+      let pending = decoding.get(index);
+      if (pending) return pending;
+      pending = archive.#decodeSegment(entry, entry.segments[index], starts[index], filterStream).then(bytes => {
+        if (bytes.length > CACHE_LIMIT) {
+          cache.clear();
+          oversizedSegment = { index, bytes };
+          return bytes;
+        }
+        cache.set(index, bytes);
+        return bytes;
+      }).finally(() => { decoding.delete(index); });
+      decoding.set(index, pending);
+      return pending;
+    };
+    if (filterSession?.mode === 1) {
+      let completeBytes;
+      try {
+        completeBytes = await this.#readEntry(entry, filterStream);
+      } finally {
+        if (filterStream) await archive.filter.close(filterStream);
       }
-      if (offset !== entry.size) throw new Error('XP3 segment size mismatch');
-      return result;
-    } finally {
-      if (stream) await this.filter.close(stream);
+      return {
+        size: entry.size,
+        name: entry.name,
+        async read(offset, length) {
+          if (closed) throw new Error('XP3 entry stream is closed');
+          offset = Math.max(0, Math.min(offset, entry.size));
+          length = Math.max(0, Math.min(length, entry.size - offset));
+          return completeBytes.slice(offset, offset + length);
+        },
+        async close() {
+          if (closed) return;
+          closed = true;
+          completeBytes = null;
+        },
+      };
     }
+    return {
+      size: entry.size,
+      name: entry.name,
+      async read(offset, length) {
+        if (closed) throw new Error('XP3 entry stream is closed');
+        offset = Math.max(0, Math.min(offset, entry.size));
+        length = Math.max(0, Math.min(length, entry.size - offset));
+        if (length === 0) return new Uint8Array(0);
+        let index = 0;
+        while (index + 1 < starts.length && starts[index + 1] <= offset) index++;
+        const result = new Uint8Array(length);
+        let written = 0, at = offset;
+        while (written < length) {
+          if (index >= entry.segments.length) throw new Error('XP3 segment size mismatch');
+          const segment = entry.segments[index];
+          const within = at - starts[index];
+          const take = Math.min(length - written, segment.size - within);
+          let bytes;
+          if (!filterStream && segment.encoding === 0 && segment.storedSize === segment.size) {
+            bytes = await archive.source.read(segment.start + within, take);
+            if (bytes.length !== take) throw new Error('Truncated XP3 segment range');
+          } else {
+            bytes = (await segmentAt(index)).subarray(within, within + take);
+          }
+          result.set(bytes, written);
+          written += take; at += take;
+          if (within + take === segment.size) index++;
+        }
+        return result;
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        cache.clear();
+        oversizedSegment = null;
+        decoding.clear();
+        if (filterStream) await archive.filter.close(filterStream);
+      },
+    };
   }
 }
 
@@ -133,7 +239,10 @@ export async function createXP3Filter(storage, wasmURL, message) {
   }
   return {
     open(name, archiveName, size) {
-      return vm.enqueue(() => vm.callMember(service, 'open', undefined, [name, archiveName, size]));
+      return vm.enqueue(async () => {
+        const stream = await vm.callMember(service, 'open', undefined, [name, archiveName, size]);
+        return { stream, mode: await vm.get(stream, 'mode') };
+      });
     },
     apply(stream, hash, offset, bytes) {
       // Independent archive reads serialize only their calls into this VM.

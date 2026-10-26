@@ -52,7 +52,7 @@ set_target_properties(tjs-runtime PROPERTIES SUFFIX ".js")
 target_link_options(tjs-runtime PRIVATE --no-entry -fwasm-exceptions -g2 --emit-symbol-map
   "-sMODULARIZE=1" "-sEXPORT_ES6=1" "-sENVIRONMENT=node,web"
   "-sALLOW_MEMORY_GROWTH=1" "-sJSPI=1"
-  "-sJSPI_IMPORTS=['__asyncjs__host_call']"
-  "-sJSPI_EXPORTS=['tjs_execute_source','tjs_execute_bytecode','tjs_object_get','tjs_object_set','tjs_object_call','tjs_object_clone','tjs_object_construct','tjs_object_invalidate','tjs_runtime_shutdown','tjs_runtime_destroy','tjs_value_release_async','tjs_runtime_collect','tjs_borrow_end','tjs_window_objects','tjs_plugins']"
+  "-sJSPI_IMPORTS=['host_call']"
+  "-sJSPI_EXPORTS=['tjs_execute_source','tjs_execute_bytecode','tjs_object_get','tjs_object_get_raw','tjs_object_set','tjs_object_call','tjs_object_clone','tjs_object_construct','tjs_object_invalidate','tjs_runtime_shutdown','tjs_runtime_destroy','tjs_value_release_async','tjs_runtime_collect','tjs_borrow_end','tjs_window_objects','tjs_plugins']"
   "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['stringToUTF16','UTF16ToString','HEAPU8','HEAPU32']")

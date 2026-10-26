@@ -3451,7 +3451,7 @@ function _fd_write(fd, iov, iovcnt, pnum) {
 
 var Asyncify = {
   instrumentWasmImports(imports) {
-    var importPattern = /^(__asyncjs__host_call|invoke_.*|__asyncjs__.*)$/;
+    var importPattern = /^(host_call|invoke_.*|__asyncjs__.*)$/;
     for (let [x, original] of Object.entries(imports)) {
       if (typeof original === "function") {
         let isAsyncifyImport = original.isAsync || importPattern.test(x);
@@ -3463,7 +3463,7 @@ var Asyncify = {
     }
   },
   instrumentWasmExports(exports) {
-    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_collect|tjs_borrow_end|tjs_window_objects|tjs_plugins|main|__main_argc_argv)$/;
+    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_get_raw|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_collect|tjs_borrow_end|tjs_window_objects|tjs_plugins|main|__main_argc_argv)$/;
     Asyncify.asyncExports = new Set;
     var ret = {};
     for (let [x, original] of Object.entries(exports)) {
@@ -3593,28 +3593,33 @@ function host_owner(id) {
 
 host_owner.sig = "ii";
 
-function __asyncjs__host_call(runtime, callback, operation, receiver, count, args, borrow) {
-  return Asyncify.handleAsync(async () => {
+function host_call(runtime, callback, operation, receiver, count, args, borrow) {
+  try {
     const ids = Array.from(HEAPU32.subarray(args >>> 2, (args >>> 2) + count));
+    let result;
     try {
-      let result;
-      try {
-        result = Module.hostDispatch(runtime, callback, operation, receiver, ids);
-      } catch (error) {
-        result = Promise.reject(error);
-      }
+      result = Module.hostDispatch(runtime, callback, operation, receiver, ids);
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    if (!(result && typeof result.then === "function")) return result;
+    const settled = ((async () => {
       const completed = await Promise.allSettled([ result, Module._tjs_borrow_end(runtime, borrow) ]);
       for (const item of completed) if (item.status === "rejected") throw item.reason;
       if (completed[1].value !== 1) throw new Error(Module.UTF16ToString(Module._tjs_runtime_error(runtime)) || "Failed to release TJS borrowed values");
       return completed[0].value;
-    } catch (error) {
+    }))();
+    return settled.catch(error => {
       Module.hostError(runtime, String(error.message ?? error));
       return 0;
-    }
-  });
+    });
+  } catch (error) {
+    Module.hostError(runtime, String(error.message ?? error));
+    return 0;
+  }
 }
 
-__asyncjs__host_call.sig = "iiiiiiii";
+host_call.sig = "iiiiiiii";
 
 function host_readonly_get(runtime, callback, name) {
   try {
@@ -3628,9 +3633,11 @@ function host_readonly_get(runtime, callback, name) {
 host_readonly_get.sig = "iiii";
 
 // Imports from the Wasm binary.
-var _tjs_runtime_create, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_value_borrow, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_value_is_null_context, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_is_object, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_collect, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_count, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_deserialize, _malloc, _free, ___trap, memory, __indirect_function_table, wasmMemory;
+var _tjs_memory_allocated_bytes, _tjs_memory_free_bytes, _tjs_runtime_create, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_kind, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_collect, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_get_stored, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_deserialize, _malloc, _free, ___trap, memory, __indirect_function_table, wasmMemory;
 
 function assignWasmExports(wasmExports) {
+  _tjs_memory_allocated_bytes = Module["_tjs_memory_allocated_bytes"] = wasmExports["tjs_memory_allocated_bytes"];
+  _tjs_memory_free_bytes = Module["_tjs_memory_free_bytes"] = wasmExports["tjs_memory_free_bytes"];
   _tjs_runtime_create = Module["_tjs_runtime_create"] = wasmExports["tjs_runtime_create"];
   _tjs_plugins = Module["_tjs_plugins"] = wasmExports["tjs_plugins"];
   _tjs_kag_parsers = Module["_tjs_kag_parsers"] = wasmExports["tjs_kag_parsers"];
@@ -3653,21 +3660,19 @@ function assignWasmExports(wasmExports) {
   _tjs_value_bind_owner = Module["_tjs_value_bind_owner"] = wasmExports["tjs_value_bind_owner"];
   _tjs_value_pin = Module["_tjs_value_pin"] = wasmExports["tjs_value_pin"];
   _tjs_value_release = Module["_tjs_value_release"] = wasmExports["tjs_value_release"];
-  _tjs_value_borrow = Module["_tjs_value_borrow"] = wasmExports["tjs_value_borrow"];
   _tjs_borrow_end = Module["_tjs_borrow_end"] = wasmExports["tjs_borrow_end"];
   _tjs_host_bind = Module["_tjs_host_bind"] = wasmExports["tjs_host_bind"];
   _tjs_host_reference = Module["_tjs_host_reference"] = wasmExports["tjs_host_reference"];
   _tjs_value_bind = Module["_tjs_value_bind"] = wasmExports["tjs_value_bind"];
   _tjs_value_context = Module["_tjs_value_context"] = wasmExports["tjs_value_context"];
   _tjs_value_equal = Module["_tjs_value_equal"] = wasmExports["tjs_value_equal"];
-  _tjs_value_is_null_context = Module["_tjs_value_is_null_context"] = wasmExports["tjs_value_is_null_context"];
   _tjs_native_owner = Module["_tjs_native_owner"] = wasmExports["tjs_native_owner"];
   _tjs_window_objects = Module["_tjs_window_objects"] = wasmExports["tjs_window_objects"];
   _tjs_value_type = Module["_tjs_value_type"] = wasmExports["tjs_value_type"];
   _tjs_value_convert = Module["_tjs_value_convert"] = wasmExports["tjs_value_convert"];
   _tjs_value_as_real = Module["_tjs_value_as_real"] = wasmExports["tjs_value_as_real"];
   _tjs_value_as_string = Module["_tjs_value_as_string"] = wasmExports["tjs_value_as_string"];
-  _tjs_value_is_object = Module["_tjs_value_is_object"] = wasmExports["tjs_value_is_object"];
+  _tjs_value_kind = Module["_tjs_value_kind"] = wasmExports["tjs_value_kind"];
   _tjs_object_is_instance_of = Module["_tjs_object_is_instance_of"] = wasmExports["tjs_object_is_instance_of"];
   _tjs_object_is_valid = Module["_tjs_object_is_valid"] = wasmExports["tjs_object_is_valid"];
   _tjs_object_create = Module["_tjs_object_create"] = wasmExports["tjs_object_create"];
@@ -3687,9 +3692,9 @@ function assignWasmExports(wasmExports) {
   _tjs_object_delete = Module["_tjs_object_delete"] = wasmExports["tjs_object_delete"];
   _tjs_object_class_names = Module["_tjs_object_class_names"] = wasmExports["tjs_object_class_names"];
   _tjs_object_set_missing = Module["_tjs_object_set_missing"] = wasmExports["tjs_object_set_missing"];
-  _tjs_object_count = Module["_tjs_object_count"] = wasmExports["tjs_object_count"];
   _tjs_object_construct = Module["_tjs_object_construct"] = wasmExports["tjs_object_construct"];
   _tjs_object_get_raw = Module["_tjs_object_get_raw"] = wasmExports["tjs_object_get_raw"];
+  _tjs_object_get_stored = Module["_tjs_object_get_stored"] = wasmExports["tjs_object_get_stored"];
   _tjs_object_set_raw = Module["_tjs_object_set_raw"] = wasmExports["tjs_object_set_raw"];
   _tjs_value_release_async = Module["_tjs_value_release_async"] = wasmExports["tjs_value_release_async"];
   _tjs_object_get_by_num_raw = Module["_tjs_object_get_by_num_raw"] = wasmExports["tjs_object_get_by_num_raw"];
@@ -3712,7 +3717,6 @@ function assignWasmExports(wasmExports) {
 }
 
 var wasmImports = {
-  /** @export */ __asyncjs__host_call,
   /** @export */ __syscall_openat: ___syscall_openat,
   /** @export */ _abort_js: __abort_js,
   /** @export */ _gmtime_js: __gmtime_js,
@@ -3730,6 +3734,7 @@ var wasmImports = {
   /** @export */ fd_read: _fd_read,
   /** @export */ fd_seek: _fd_seek,
   /** @export */ fd_write: _fd_write,
+  /** @export */ host_call,
   /** @export */ host_owner,
   /** @export */ host_readonly_get,
   /** @export */ host_release,

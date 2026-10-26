@@ -249,6 +249,9 @@ private:
     ttstr CurPage; // Current Page Name
     tjs_int TagLine; // line number of previous tag
 
+    tjs_int PrefetchScannedLine = 0; // lookahead: first line not yet scanned for hints
+    std::vector<ttstr> PrefetchSeen; // storage names already sent as prefetch hints
+
     tTVPKAGDebugLevel DebugLevel; // debugging log level
     bool ProcessSpecialTags; // whether to process special tags
     bool IgnoreCR; // CR is not interpreted as [r] tag when this is
@@ -334,6 +337,8 @@ public:
 
 private:
     iTJSDispatch2 *_GetNextTag();
+
+    void PrefetchAhead();
     // taglist accumulator helpers (libkrkr2.so sub_561F3C @0x561F3C)
     void TagListClearItems(); // clear TagList (qword_1AB3C08 clear)
     void TagListAddName(const ttstr &name); // Array.add (qword_1AB3C18)

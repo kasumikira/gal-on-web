@@ -32,6 +32,70 @@ const release = id => vm.module._tjs_value_release(vm.runtime, id);
 const sum = await vm.source('var __a = 40 + 2; return __a;', 'sum');
 check('script success returns value', sum === 42, sum);
 
+// Raw membership must distinguish an existing void value from a missing key,
+// without retaining the queried value as a new JS shadow.
+const dictionary = await vm.source('return %["empty" => void, "object" => %[]];', 'membership');
+const array = await vm.source('return [void, 3];', 'membership');
+try {
+  check('member set preserves chaining', dictionary.members.set('value', 7) === dictionary.members);
+  check('void member exists', dictionary.members.has('empty'));
+  check('missing member does not exist', !dictionary.members.has('missing'));
+  const count = vm.module._tjs_runtime_handle_count(vm.runtime);
+  for (let i = 0; i < 100; i++) dictionary.members.has('object');
+  check('membership does not allocate handles', vm.module._tjs_runtime_handle_count(vm.runtime) === count);
+  check('array void index exists', array.members.has('0'));
+  check('array negative index exists', array.members.has('-1'));
+  check('array out-of-range index is absent', !array.members.has('2') && !array.members.has('-3'));
+} finally {
+  await vm.dispose(dictionary);
+  await vm.dispose(array);
+}
+
+let missingCalls = 0;
+vm.registerGlobal('membershipMissingProbe', () => { missingCalls++; });
+const missingObject = await vm.source(`
+  class MembershipMissing {
+    function missing(mode, name, value) { membershipMissingProbe(); return false; }
+  }
+  return new MembershipMissing();
+`, 'membership-missing');
+try {
+  vm.setMissingHandler(missingObject);
+  check('membership does not execute missing', !missingObject.members.has('absent') && missingCalls === 0);
+} finally { await vm.dispose(missingObject); }
+
+let rawReadCalls = 0;
+vm.registerGlobal('rawReadProbe', async () => {
+  await Promise.resolve();
+  rawReadCalls++;
+  return 42;
+});
+vm.registerGlobal('rawReadReject', async () => { throw new Error('raw-read-rejection'); });
+const rawObject = await vm.source(`
+  class RawReadProbe {
+    property guarded { getter() { throw "getter must not run"; } }
+    function missing(mode, name, value) {
+      if (name == "dynamic") { *value = rawReadProbe(); return true; }
+      if (name == "failed") rawReadReject();
+      return false;
+    }
+  }
+  return new RawReadProbe();
+`, 'raw-read-missing');
+try {
+  vm.setMissingHandler(rawObject);
+  check('stored reads do not execute missing', rawObject.members.get('dynamic') === undefined && rawReadCalls === 0);
+  check('raw read awaits missing host callback', await vm.rawGet(rawObject, 'dynamic') === 42 && rawReadCalls === 1);
+  const typed = await vm.getTyped(rawObject, 'dynamic', true);
+  check('typed raw read awaits missing', typed.value === 42 && typed.text === '42' && rawReadCalls === 2);
+  check('raw missing member returns void', await vm.rawGet(rawObject, 'absent') === undefined);
+  const property = await vm.rawGet(rawObject, 'guarded');
+  check('raw read preserves property object', property !== undefined);
+  await vm.dispose(property);
+  await expectThrow('raw read propagates host rejection', () => vm.rawGet(rawObject, 'failed'), /raw-read-rejection/);
+  check('raw read remains usable after rejection', await vm.rawGet(rawObject, 'dynamic') === 42);
+} finally { await vm.dispose(rawObject); }
+
 // --- C++ origin: script error -> checked() -> 0 + error slot ---
 await expectThrow(
   'script error propagates message',
@@ -93,14 +157,6 @@ const before = vm.module._tjs_runtime_handle_count(vm.runtime);
 for (let i = 0; i < 10; i++) await vm.source('failingFn();', 'leak' + i).catch(() => {});
 const after = vm.module._tjs_runtime_handle_count(vm.runtime);
 check('failing calls do not leak handles', before === after, `${before} -> ${after}`);
-
-// --- withBorrow still rejects async blocks ---
-try {
-  await vm.withBorrow(dict, async () => {});
-  check('withBorrow rejects async block', false, 'no throw');
-} catch (error) {
-  check('withBorrow rejects async block', error instanceof TypeError, error?.message);
-}
 
 // Owner indices preserve handle order, including values added by a destructor.
 vm.registerGlobal('IndexOwner', defineNativeClass('IndexOwner'));

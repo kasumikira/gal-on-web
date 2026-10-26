@@ -97,6 +97,8 @@ await script(target).onClick(x, y);
 
 脚本属性可能执行 getter，不能将代理当作普通 JS 数据对象使用。赋值用 `writeScript`，让调用方能等待 setter。Array/Dictionary 的同步视图是绑定 API，不是本地数据副本；原始成员访问也不等于正常属性访问，不用它绕过 getter 或异步契约。
 
+同步视图的 `members.get/has` 只查询已存储成员，不执行 getter 或 `missing()`；缺失读取返回 `undefined`。该契约由 native 的 stored-member 查询落实，JS 不记录成员状态。绑定内部的 `vm.rawGet` 则保留原版 `PropGet(TJS_IGNOREPROP)` 语义：忽略 getter，但仍可执行 `missing()`，因此必须 await。`readScript(..., { ignoreProperty: true })` 和相同选项的 `readScriptTyped` 也可挂起，遵循原有事件队列和嵌套等待规则。`TJS_IGNOREMISSING` 仅用于 native 同步视图查询，不改变普通 TJS 属性读取。
+
 Array 影子的 `.length` 通过原版 `TJSGetArrayElementCount` 查询实际元素数，不执行可覆盖的 `count` getter。需要脚本可见的 `count` 属性语义时，仍使用 `await readScript(array, 'count')`。
 
 Native 参数需要原版类型转换时，使用 `#krkr/values` 的 `string`、`number`、`integer`、`truth`。不要对脚本影子使用 JS `String(value)` 或模板插值来实现 TJS 字符串转换：JS 会尝试调用代理的 `toString/valueOf`，既不符合原版 Variant 转换，也可能启动未等待的脚本调用。
@@ -155,18 +157,6 @@ async refresh(target) {
 
 retain 保存独立的原版 Variant，不延长原参数的借用，也不复制脚本对象。每次 retain 都要有对应的 dispose；不要释放调用方拥有的原参数。普通 JS 值不需要这套机制。
 
-### 显式借用块
-
-运行时接口提供 `vm.withBorrow(value, callback)`：
-
-```js
-await vm.withBorrow(value, borrowed => {
-  inspectSynchronously(borrowed);
-});
-```
-
-callback 必须同步返回，不能为 async，不能返回 Promise，也不能启动未等待的脚本调用。外层 await 等待借用结束时可能执行的终结过程，不让块内引用自动跨 await。业务模块优先使用自动参数借用和 `retainScriptValue`，不为调用此接口自行获取底层 VM。
-
 ### 延长、结果和常驻
 
 - 有限异步任务：`retainScriptValue` 加 `try/finally`，finally 中 await `disposeScriptValue`。
@@ -210,7 +200,7 @@ function onBrowserResize() {
 
 禁止的路径是：启动脚本 B 后未等待就让外层 A 恢复；或者 A 挂起时独立事件直接启动 C。即使在同一 JS 线程，也会交错恢复，破坏原版执行栈/寄存器池的顺序。`retain` 只解决对象存活，不能解决执行交错。
 
-目前 `host_call` 使用 `EM_ASYNC_JS`，同步宿主结果也经过 Promise 路径；不要根据函数是否声明 async 判断是否能挂起。JSPI 支持挂起不代表 TJS VM 支持独立调用交错执行。绑定层现有借用清理与异步结果的顺序仍需专项核对，不能以本规范代替实现验证。
+`host_call` 是经 `WebAssembly.Suspending` 包装的双模式导入：宿主返回非 Promise 时同步继续、不挂起，借用由 C++ 侧 `invoke()` 在同一栈上结束；返回 Promise 时挂起并在导入内结束借用后才恢复调用方。JSPI 支持挂起不代表 TJS VM 支持独立调用交错执行。绑定层借用清理与异步结果的顺序仍需专项核对，不能以本规范代替实现验证。
 
 ## 5. 清理与验证
 

@@ -2,7 +2,7 @@ import { createRuntime } from './engine-js/runtime.js';
 import wasmURL from './engine-js/tjs-runtime/tjs-runtime.wasm?url';
 
 const status = document.getElementById('status');
-const GAME_RANGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const GAME_RANGE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 let runtime;
 let sampler;
 

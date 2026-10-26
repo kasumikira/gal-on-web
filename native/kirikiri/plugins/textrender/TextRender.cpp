@@ -932,7 +932,7 @@ public:
                 TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
                 (iTJSNativeInstance **)&ni);
         // 保留原始 accessor idiom；元素实际全部经 dispatch 写入。
-        std::deque<tTJSVariant> *items = &ni->Items;
+        tTJSArrayItems *items = &ni->Items;
         (void)items;
         if(!count)
             count = _renderCount - start;
@@ -1021,7 +1021,7 @@ public:
         arr.GetDispatch()->NativeInstanceSupport(
                 TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
                 (iTJSNativeInstance **)&ni);
-        std::deque<tTJSVariant> *items = &ni->Items;
+        tTJSArrayItems *items = &ni->Items;
         (void)items;
         for(size_t i = 0; i < ruby.size(); ++i) {
             ncbDictionaryAccessor rd;

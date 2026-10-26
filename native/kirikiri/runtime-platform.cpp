@@ -75,17 +75,21 @@ ttstr TVPGetMessageByLocale(const std::string &key)
 
 class MemoryInput : public tTJSBinaryStream
 {
-    std::vector<unsigned char> storage;
+    tTJSVariant octet;
     const unsigned char *data;
     size_t size, position = 0;
 
 public:
     MemoryInput(const unsigned char *data, size_t size) : data(data), size(size) {}
-    explicit MemoryInput(std::vector<unsigned char> bytes, tjs_uint64 offset = 0)
-        : storage(std::move(bytes)), data(storage.data()), size(storage.size()) {
-        if (offset > size) throw eTJSError(TJS_W("TJS stream seek outside input"));
-        data += offset;
-        size -= offset;
+    // Holds the host-read Octet alive directly, so the wasm heap keeps one
+    // copy of every storage read instead of two.
+    MemoryInput(tTJSVariant bytes, tjs_uint64 offset = 0) : octet(std::move(bytes))
+    {
+        const auto *held = octet.AsOctetNoAddRef();
+        if (offset > held->GetLength())
+            throw eTJSError(TJS_W("TJS stream seek outside input"));
+        data = held->GetData() + offset;
+        size = held->GetLength() - offset;
     }
     tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override
     {
@@ -132,10 +136,9 @@ static tTJSBinaryStream *readBinary(const ttstr &name, const ttstr &mode)
     tTJSVariant filename(RequiredStorage(name)), options(mode), result;
     tTJSVariant *args[] = {&filename, &options};
     invoke(activeRuntime, activeRuntime->storage, 6, nullptr, &result, 2, args);
-    const auto *bytes = result.AsOctetNoAddRef();
     tjs_uint64 offset = 0;
     binaryWriteOffset(mode, offset);
-    return new MemoryInput(std::vector<unsigned char>(bytes->GetData(), bytes->GetData() + bytes->GetLength()), offset);
+    return new MemoryInput(std::move(result), offset);
 }
 
 class BinaryWriteStream final : public tTJSBinaryStream

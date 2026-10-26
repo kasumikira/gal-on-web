@@ -25,6 +25,8 @@ namespace TJS {
 #define TJS_MEMBERMUSTEXIST                                                    \
     0x00000400 // member *must* exist ( for Dictionary/Array )
 #define TJS_IGNOREPROP 0x00000800 // ignore property invoking
+// Binding-only stored-member queries; ordinary PropGet keeps missing() semantics.
+#define TJS_IGNOREMISSING 0x00200000
 #define TJS_HIDDENMEMBER 0x00001000 // member is hidden
 #define TJS_STATICMEMBER                                                       \
     0x00010000 // member is not registered to the

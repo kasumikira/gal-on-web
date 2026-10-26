@@ -9,10 +9,14 @@
 #include <stdexcept>
 
 // clang-format off
-EM_ASYNC_JS(int, host_call, (Runtime * runtime, int callback, int operation, int receiver, int count, const int *args, int borrow), {
-    const ids = Array.from(HEAPU32.subarray(args >>> 2, (args >>> 2) + count));
+// Dual-mode host entry under WebAssembly.Suspending: a non-thenable host
+// result returns without suspending and invoke() ends the borrow on the same
+// stack; a thenable result suspends the import and ends the borrow from JS
+// before the caller resumes.
+EM_JS(int, host_call, (Runtime * runtime, int callback, int operation, int receiver, int count, const int *args, int borrow), {
     try
     {
+        const ids = Array.from(HEAPU32.subarray(args >>> 2, (args >>> 2) + count));
         let result;
         try
         {
@@ -22,15 +26,22 @@ EM_ASYNC_JS(int, host_call, (Runtime * runtime, int callback, int operation, int
         {
             result = Promise.reject(error);
         }
+        if (!(result && typeof result.then === 'function'))
+            return result;
         // Closing starts at synchronous return. Await both paths so a throw
         // cannot leave native cleanup running after the caller has unwound.
-        const completed = await Promise.allSettled([ result, Module._tjs_borrow_end(runtime, borrow) ]);
-        for (const item of completed)
-            if (item.status === 'rejected')
-                throw item.reason;
-        if (completed[1].value !== 1)
-            throw new Error(Module.UTF16ToString(Module._tjs_runtime_error(runtime)) || 'Failed to release TJS borrowed values');
-        return completed[0].value;
+        const settled = (async () => {
+            const completed = await Promise.allSettled([ result, Module._tjs_borrow_end(runtime, borrow) ]);
+            for (const item of completed)
+                if (item.status === 'rejected')
+                    throw item.reason;
+            if (completed[1].value !== 1)
+                throw new Error(Module.UTF16ToString(Module._tjs_runtime_error(runtime)) || 'Failed to release TJS borrowed values');
+            return completed[0].value;
+        })();
+        return settled.catch(error =>
+        { Module.hostError(runtime,String(error.message??error));return 0;
+        });
     }
     catch (error)
     { Module.hostError(runtime,String(error.message??error));return 0;

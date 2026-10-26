@@ -734,6 +734,10 @@ class GPUDevice {
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
       image.gpuValid = true;
+      // Uploaded pixels are now owned by the resident texture. CoW aliases
+      // share this storage, so retaining its CPU shadow doubles cache memory.
+      // External writable views must retain their original backing array.
+      if (!image.externallyWritable) image.markGPUWritten();
     }
     image.gpu = entry;
     return entry;

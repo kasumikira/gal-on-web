@@ -1672,7 +1672,6 @@ tjs_error tTJSArrayObject::DeleteMemberByNum(tjs_uint32 flag, tjs_int num,
     if(num < 0 || (tjs_uint)num >= ni->Items.size())
         return TJS_E_MEMBERNOTFOUND;
     CheckObjectClosureRemove(ni->Items[num]);
-    std::deque<tTJSVariant>::iterator i;
     ni->Items.erase(ni->Items.begin() + num);
     return TJS_S_OK;
 }

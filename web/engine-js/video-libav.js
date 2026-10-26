@@ -1,12 +1,43 @@
 // Unified libav demuxer. Browser codecs use WebCodecs; WMV3/WMA2 use FFmpeg.
 import backendUrl from './codecs/libav/libav-krkr-wmv.wasm.mjs?url';
 import wasmUrl from './codecs/libav/libav-krkr-wmv.wasm.wasm?url';
-import { createWebDecoder, createPacketReader } from './video-webcodecs.js';
+import { createWebDecoder, createPacketReader, webCodecsCanDecode } from './video-webcodecs.js';
 import { createDemuxer } from './video-demux.js';
-const INPUT_FILE = '/input';
+// Block reader devices key their buffers by FS basename (node.name), so the
+// demuxer input name must stay a bare relative name; a leading slash would
+// desync mkblockreaderdev's registration from the read callback's lookup and
+// spin EAGAIN forever.
+const INPUT_FILE = 'input';
 const FPS_FALLBACK = 30;
 const ASF_HEADER = [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0, 0xaa, 0, 0x62, 0xce, 0x6c];
 const AVFMT_FLAG_NOFILLIN = 0x10, AVFMT_FLAG_NOPARSE = 0x20;
+
+// Demuxers read in small AVIO blocks; without read-ahead every block miss
+// would cost one range request. One window ahead, discarded on seek.
+const READAHEAD_BYTES = 1 << 20;
+function createReadAheadStream(stream) {
+  let window = null; // { start, bytes }
+  return {
+    size: stream.size,
+    async read(offset, length) {
+      if (!(window && offset >= window.start && offset + length <= window.start + window.bytes.length)) {
+        const requestLength = Math.max(0, Math.min(Math.max(length, READAHEAD_BYTES), stream.size - offset));
+        const bytes = await stream.read(offset, requestLength);
+        window = { start: offset, bytes };
+      }
+      const at = offset - window.start;
+      return window.bytes.slice(at, at + length);
+    },
+    close: () => stream.close(),
+  };
+}
+function createByteStream(bytes) {
+  return {
+    size: bytes.length,
+    read: async (offset, length) => bytes.slice(offset, offset + length),
+    close: async () => {},
+  };
+}
 
 let libavModulePromise;
 async function createLibAV() {
@@ -74,7 +105,7 @@ function checkResult(libav, result, operation) {
   }
 }
 
-async function createSource(libav, fmtCtx, videoStream, audioStream, duration, videoDecoder, webDecoder) {
+async function createSource(libav, fmtCtx, videoStream, audioStream, duration, videoDecoder, webDecoder, audioSoftware) {
   const info = {
     fps: FPS_FALLBACK,
     duration,
@@ -100,6 +131,25 @@ async function createSource(libav, fmtCtx, videoStream, audioStream, duration, v
 
   const freeDecoder = async decoder => {
     if (decoder) await libav.ff_free_decoder(decoder[1], decoder[2], decoder[3]);
+  };
+  const nativeChannels = frame => {
+    const count = audioCodec.channels, samples = frame.nb_samples;
+    const deinterleave = (source, scale) => {
+      const planes = [];
+      for (let channel = 0; channel < count; channel++) {
+        const plane = new Float32Array(samples);
+        for (let i = 0; i < samples; i++) plane[i] = source[i * count + channel] * scale;
+        planes.push(plane);
+      }
+      return planes;
+    };
+    switch (frame.format) {
+      case libav.AV_SAMPLE_FMT_FLTP: return frame.data;
+      case libav.AV_SAMPLE_FMT_S16P: return frame.data.map(plane => Float32Array.from(plane, v => v / 32768));
+      case libav.AV_SAMPLE_FMT_FLT: return deinterleave(frame.data, 1);
+      case libav.AV_SAMPLE_FMT_S16: return deinterleave(frame.data, 1 / 32768);
+      default: throw new Error(`Unsupported native audio sample format ${frame.format}`);
+    }
   };
   const convertVideoFrame = async frame => {
     // Decode output stays in WASM until the final packed RGBA copyout.
@@ -212,7 +262,8 @@ async function createSource(libav, fmtCtx, videoStream, audioStream, duration, v
     if (!audioStream) return null;
     if (!audioDecoder) {
       audioCodec = await libav.ff_copyout_codecpar(audioStream.codecpar);
-      audioNative = await libav.avcodec_get_name(audioStream.codec_id) === 'wmav2';
+      audioNative = audioSoftware
+        || await libav.avcodec_get_name(audioStream.codec_id) === 'wmav2';
       audioDecoder = audioNative ? await openDecoder(libav, audioStream) : await createWebDecoder(libav, audioStream, false);
       demux.add(audioStream); audioReader = demux.reader(audioStream);
     }
@@ -239,9 +290,9 @@ async function createSource(libav, fmtCtx, videoStream, audioStream, duration, v
       audioFrames = await libav.ff_decode_multi(audioDecoder[1], audioDecoder[2], audioDecoder[3], packet ? [packet] : [], { fin: !packet });
     }
     const frame = audioFrames.shift();
-    // FFmpeg's WMA1/2 decoder emits planar float PCM (wmadec.c).
-    if (frame.format !== libav.AV_SAMPLE_FMT_FLTP) throw new Error('Unexpected WMA2 PCM format');
-    const channels = frame.data;
+    // Native decoders pick their own sample formats (wmadec/aac: planar
+    // float); anything the software fallback produces converts to planar f32.
+    const channels = nativeChannels(frame);
     const at = timestamp(frame, audioStream) ?? decodedSamples / audioCodec.sample_rate;
     decodedSamples += frame.nb_samples;
     return { channels, sampleRate: audioCodec.sample_rate, timestamp: at };
@@ -277,14 +328,24 @@ async function createSource(libav, fmtCtx, videoStream, audioStream, duration, v
   };
 }
 
-export async function probeLibavVideo(bytes) {
+// source: async () => seekable byte stream ({ size, read, close }), or a
+// Uint8Array wrapped as one. Streams stay on the JS side; the demuxer reads
+// them through a fixed-size block reader device.
+export async function probeLibavVideo(source) {
+  const openStream = typeof source === 'function' ? source : async () => createByteStream(new Uint8Array(source));
+  const stream = createReadAheadStream(await openStream());
   const libav = await createLibAV();
   let fmtCtx = 0;
   let videoDecoder = null;
   let webDecoder = null;
-  let source = null;
+  let sourceObject = null;
   try {
-    await libav.writeFile(INPUT_FILE, new Uint8Array(bytes));
+    await libav.mkblockreaderdev(INPUT_FILE, stream.size);
+    libav.onblockread = (name, pos, len) => {
+      stream.read(pos, len)
+        .then(data => libav.ff_block_reader_dev_send(name, pos, data))
+        .catch(ex => libav.ff_block_reader_dev_send(name, pos, null, { error: ex }));
+    };
     const opened = await libav.ff_init_demuxer_file(INPUT_FILE);
     fmtCtx = opened[0];
     const streams = opened[1];
@@ -293,11 +354,12 @@ export async function probeLibavVideo(bytes) {
     if (!videoStream) throw new Error('Video storage has no video stream');
     if (await libav.avcodec_get_name(videoStream.codec_id) === 'wmv3') {
       videoDecoder = await openDecoder(libav, videoStream);
-    } else {
+    } else if (await webCodecsCanDecode(libav, videoStream, true)) {
       let reorderDelay = 0;
       // After probing codec parameters, preserve ASF's complete codec packets
       // and DTS clock. The H.264 parser otherwise drops DTS after seeking.
-      if (ASF_HEADER.every((value, i) => bytes[i] === value)) {
+      const header = await stream.read(0, ASF_HEADER.length);
+      if (ASF_HEADER.every((value, i) => header[i] === value)) {
         const flags = await libav.AVFormatContext_flags(fmtCtx);
         await libav.AVFormatContext_flags_s(fmtCtx, flags | AVFMT_FLAG_NOPARSE | AVFMT_FLAG_NOFILLIN);
         if (await libav.avcodec_get_name(videoStream.codec_id) === 'h264') {
@@ -305,7 +367,20 @@ export async function probeLibavVideo(bytes) {
         }
       }
       webDecoder = await createWebDecoder(libav, videoStream, true, reorderDelay);
+    } else {
+      // WebCodecs fallback: FFmpeg software decode. The container keeps its
+      // normal parsing — the NOPARSE/DTS clock above only serves the WebCodecs
+      // presentation path.
+      const name = await libav.avcodec_get_name(videoStream.codec_id);
+      if (!await libav.avcodec_find_decoder(videoStream.codec_id))
+        throw new Error(`No decoder for ${name}: WebCodecs is unavailable and the libav build carries no software decoder`);
+      videoDecoder = await openDecoder(libav, videoStream);
     }
+    // Audio plan: WMA2 always decodes natively; other codecs prefer WebCodecs
+    // and fall back to software decode when the browser has none.
+    let audioSoftware = false;
+    if (audioStream && await libav.avcodec_get_name(audioStream.codec_id) !== 'wmav2'
+        && !await webCodecsCanDecode(libav, audioStream, false)) audioSoftware = true;
     let duration = libav.i64tof64(await libav.AVFormatContext_duration(fmtCtx), await libav.AVFormatContext_durationhi(fmtCtx)) / 1e6;
     if (!(duration > 0)) {
       // Live-recorded WebM may omit duration. Measure packet bounds once.
@@ -322,13 +397,13 @@ export async function probeLibavVideo(bytes) {
       const ret = await libav.av_seek_frame(fmtCtx, videoStream.index, 0, 0, libav.AVSEEK_FLAG_BACKWARD);
       if (ret < 0) throw new Error(`Video seek failed: ${ret}`);
     }
-    source = await createSource(libav, fmtCtx, videoStream, audioStream, duration, videoDecoder, webDecoder);
+    sourceObject = await createSource(libav, fmtCtx, videoStream, audioStream, duration, videoDecoder, webDecoder, audioSoftware);
     fmtCtx = 0;
     videoDecoder = null;
 
     const samples = [];
     for (let i = 0; i < 8; i++) {
-      const frame = await source.next();
+      const frame = await sourceObject.next();
       if (!frame) break;
       if (frame.timestamp !== null) samples.push(frame.timestamp);
       frame.close();
@@ -339,14 +414,23 @@ export async function probeLibavVideo(bytes) {
     if (!(rateNum > 0) && samples.length > 1 && samples.at(-1) > samples[0]) {
       fps = (samples.length - 1) / (samples.at(-1) - samples[0]);
     }
-    source.info.fps = fps;
-    source.info.numberOfFrame = Math.max(1, Math.round(duration * fps));
-    await source.seek(0);
-    source.info.source = source;
-    return source.info;
+    sourceObject.info.fps = fps;
+    sourceObject.info.numberOfFrame = Math.max(1, Math.round(duration * fps));
+    await sourceObject.seek(0);
+    sourceObject.info.source = sourceObject;
+    // The block reader must stay alive for the demuxer's lifetime; close the
+    // backing stream exactly when the demuxer goes away.
+    const innerDispose = sourceObject.dispose.bind(sourceObject);
+    sourceObject.dispose = async () => {
+      try { await innerDispose(); }
+      finally { libav.onblockread = null; await stream.close().catch(() => {}); }
+    };
+    return sourceObject.info;
   } catch (error) {
-    if (source) await source.dispose();
+    if (sourceObject) await sourceObject.dispose();
     else {
+      libav.onblockread = null;
+      await stream.close().catch(() => {});
       webDecoder?.dispose();
       if (videoDecoder) await libav.ff_free_decoder(videoDecoder[1], videoDecoder[2], videoDecoder[3]);
       if (fmtCtx) await libav.avformat_close_input_js(fmtCtx);

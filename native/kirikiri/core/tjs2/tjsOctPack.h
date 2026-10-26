@@ -10,11 +10,11 @@
 #ifndef tjsOctPackH
 #define tjsOctPackH
 
-#include <deque>
+#include "tjsArray.h"
 
 namespace TJS {
     extern tjs_error TJSOctetPack(tTJSVariant **args, tjs_int numargs,
-                                  const std::deque<tTJSVariant> &items,
+                                  const tTJSArrayItems &items,
                                   tTJSVariant *result);
 
     extern tjs_error TJSOctetUnpack(const tTJSVariantOctet *target,

@@ -313,8 +313,9 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       const target = String(name);
       // Open (VideoOvlImpl.cpp 132) closes first, then throws when no decoder
       // can be built; the exception propagates so the caller can fall back.
-      const bytes = await storage.read(target);
-      s.info = await probeLibavVideo(bytes);
+      // The source stays a seekable stream; only what the demuxer asks for is
+      // ever fetched from storage.
+      s.info = await probeLibavVideo(() => storage.openStream(target));
       const player = s.player = new Player(s.info, getAudioContext, view);
       players.add(player);
       player.onUpdate = (frame, render) => pushFrame(s, frame, render);

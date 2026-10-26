@@ -8,11 +8,27 @@ const DECODE_QUEUE_LIMIT = 8;
 const annexB = data => data?.[0] === 0 && data[1] === 0 &&
   (data[2] === 1 || (data[2] === 0 && data[3] === 1));
 
+// Capability probe shared with the software-decode fallback: the API may be
+// missing entirely (older browsers) or reject this specific configuration.
+export async function webCodecsCanDecode(libav, stream, video) {
+  const Decoder = video ? globalThis.VideoDecoder : globalThis.AudioDecoder;
+  if (typeof Decoder !== 'function') return false;
+  try {
+    const config = await (video ? videoStreamToConfig : audioStreamToConfig)(libav, stream);
+    return (await Decoder.isConfigSupported(config)).supported;
+  } catch {
+    return false;
+  }
+}
+
 export async function createWebDecoder(libav, stream, video, reorderDelay = 0) {
+  const Decoder = video ? globalThis.VideoDecoder : globalThis.AudioDecoder;
+  if (typeof Decoder !== 'function')
+    throw Object.assign(new Error('WebCodecs API is unavailable'), { webCodecsUnavailable: true });
   const config = await (video ? videoStreamToConfig : audioStreamToConfig)(libav, stream);
-  const Decoder = video ? VideoDecoder : AudioDecoder;
   const support = await Decoder.isConfigSupported(config);
-  if (!support.supported) throw new Error(`WebCodecs cannot decode ${config.codec}`);
+  if (!support.supported)
+    throw Object.assign(new Error(`WebCodecs cannot decode ${config.codec}`), { webCodecsUnavailable: true });
   const codec = await libav.ff_copyout_codecpar(stream.codecpar);
   // ASF can carry SPS/PPS only in extradata. Annex B decoding has no
   // description, so send those parameter sets in-band at random access points.

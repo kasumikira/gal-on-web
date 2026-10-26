@@ -1,5 +1,6 @@
 import { defineNativeClass } from '#krkr/native';
 import { XP3Archive } from './xp3.js';
+const PREFETCH_MAX_BYTES = 8 * 1024 * 1024;
 // StorageIntf.cpp TVPParseStorageName: a name with a "<media>://" prefix
 // belongs to the media registered for that prefix; the media receives the
 // normalized local name only ("domain/path", without the prefix).
@@ -32,6 +33,10 @@ export class Storages {
     // Storage media contributed by plugins (StorageIntf.cpp
     // TVPRegisterStorageMedia), keyed by their "scheme://" prefix.
     this.mediaTable = new Map();
+    // Speculative prefetch state (KAG tag lookahead hints).
+    this.prefetchDone = new Set();
+    this.prefetchQueue = [];
+    this.prefetchActive = 0;
   }
   async initialize() {
     for (const entry of await this.gameStorage.list()) {
@@ -157,12 +162,77 @@ export class Storages {
     return this.readPlaced(path);
   }
   async readPlaced(path) {
+    const stream = await this.#openPlacedStream(path);
+    try {
+      return await stream.read(0, stream.size);
+    } finally {
+      await stream.close();
+    }
+  }
+  // Seekable byte stream over one placed storage entry: loose files and
+  // XP3-backed entries read ranges incrementally (video and other large media
+  // must not load whole files); backends without a stream surface fall back to
+  // one whole read wrapped as a stream.
+  async openStream(name) {
+    const path = await this.getPlacedPath(name);
+    if (!path) throw new Error(`Storage not found: ${name}`);
+    return this.#openPlacedStream(path);
+  }
+  async #openPlacedStream(path) {
     const found = this.findMedia(path);
-    if (found) return found.media.read(found.local);
-    const sharp = path.indexOf('>');
-    if (sharp>=0) return (await this.archive(path.slice(0,sharp))).read(path.slice(sharp+1));
+    if (found) {
+      if (typeof found.media.openStream === 'function') return found.media.openStream(found.local);
+      return staticStream(await found.media.read(found.local));
+    }
     const file = this.files.get(path);
-    return (file.saved ? this.saveStorage : this.gameStorage).read(file.path, 0, file.size);
+    if (file) {
+      const backend = file.saved ? this.saveStorage : this.gameStorage;
+      return {
+        size: file.size,
+        read: (offset, length) => backend.read(file.path, offset, length),
+        close: async () => {},
+      };
+    }
+    const sharp = path.indexOf('>');
+    if (sharp >= 0) {
+      const archive = await this.archive(path.slice(0, sharp));
+      if (archive.openEntryStream) return archive.openEntryStream(path.slice(sharp + 1));
+      return staticStream(await archive.read(path.slice(sharp + 1)));
+    }
+    throw new Error(`Storage not found: ${path}`);
+  }
+  // Speculative warm-up from KAG tag lookahead: resolve the name and pull the
+  // bytes into the bounded range cache before the conductor asks for them.
+  // Best-effort by contract — misses are normal and nothing here may throw
+  // or block the caller.
+  prefetch(name) {
+    const key = String(name);
+    if (this.prefetchDone.has(key)) return;
+    if (this.prefetchDone.size >= 512) this.prefetchDone.clear();
+    this.prefetchDone.add(key);
+    this.prefetchQueue.push(key);
+    this.pumpPrefetch();
+  }
+  pumpPrefetch() {
+    while (this.prefetchActive < 3 && this.prefetchQueue.length > 0) {
+      const name = this.prefetchQueue.shift();
+      this.prefetchActive++;
+      this.getPlacedPath(name)
+        .then(async path => {
+          if (!path || this.findMedia(path)) return;
+          const sharp = path.indexOf('>');
+          let size;
+          if (sharp >= 0) {
+            const archive = await this.archive(path.slice(0, sharp));
+            size = archive.entries.get(path.slice(sharp + 1))?.size;
+          } else {
+            size = this.files.get(path)?.size;
+          }
+          if (size <= PREFETCH_MAX_BYTES) return this.readPlaced(path);
+        })
+        .catch(() => {})
+        .finally(() => { this.prefetchActive--; this.pumpPrefetch(); });
+    }
   }
   listDirectory(path) {
     if (path.includes('>') || this.findMedia(path)) throw new Error('Local directory required');
@@ -219,6 +289,10 @@ export class Storages {
   }
 }
 
+
+function staticStream(bytes) {
+  return { size: bytes.length, read: async (offset, length) => bytes.slice(offset, offset + length), close: async () => {} };
+}
 
 export function createTJS2Storage(storage) {
   const methods = {

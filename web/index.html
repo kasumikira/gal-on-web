@@ -7,9 +7,34 @@
 html,body{margin:0;width:100%;height:100%;background:#000;color:#fff}
 body{display:flex;align-items:center;justify-content:center;overflow:hidden}
 #status{font:16px sans-serif;white-space:pre-wrap;padding:24px}
+#fullscreen-btn{position:fixed;left:12px;bottom:12px;z-index:9999;box-sizing:border-box;width:44px;height:44px;padding:10px;border:0;border-radius:50%;background:rgba(255,255,255,.15);color:#fff;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+#fullscreen-btn svg{display:block;width:24px;height:24px}
 </style>
 <body>
 <p id="status">正在启动游戏…</p>
+<button id="fullscreen-btn" type="button" aria-label="进入全屏" hidden>
+<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+<path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+</svg>
+</button>
+<script>
+// 移动端左下角全屏入口，仅在非全屏时显示；进入全屏后靠系统手势退出。
+// iPadOS 的 UA 是 Macintosh，靠触点数补充识别；iPhone Safari 不支持页面全屏 API，按钮保持隐藏。
+(() => {
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile|Silk/i.test(navigator.userAgent)
+    || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+  const root = document.documentElement;
+  if (!isMobile || !(root.requestFullscreen || root.webkitRequestFullscreen)) return;
+  const button = document.getElementById('fullscreen-btn');
+  const fullscreenElement = () => document.fullscreenElement ?? document.webkitFullscreenElement;
+  const refresh = () => { button.hidden = Boolean(fullscreenElement()); };
+  button.addEventListener('click', () =>
+    Promise.resolve((root.requestFullscreen ?? root.webkitRequestFullscreen).call(root)).catch(() => {}));
+  document.addEventListener('fullscreenchange', refresh);
+  document.addEventListener('webkitfullscreenchange', refresh);
+  refresh();
+})();
+</script>
 <script type="module" src="/main.js"></script>
 </body>
 </html>

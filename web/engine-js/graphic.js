@@ -6,7 +6,7 @@ import { gpuBtoa } from './plugins/gpu-btoa.js';
 
 // TVPGraphicCacheSystemLimit: the browser platform's maximum decoded-image
 // cache size. System.graphicCacheLimit can lower it but never raise it.
-export const GRAPHIC_CACHE_LIMIT = 128 * 1024 * 1024;
+export const GRAPHIC_CACHE_LIMIT = 64 * 1024 * 1024;
 const GRAPHIC_EXTENSIONS = ['.tlg', '.png', '.jpg', '.jpeg', '.bmp', '.webp'];
 
 function alphaColorMat(image, color) {
@@ -92,6 +92,22 @@ export function createGraphicLoader(storage) {
   };
   return {
     load,
+    diagnostics() {
+      const storages = new Map();
+      for (const value of cache.values()) for (const image of [value.image, value.province]) {
+        if (image) storages.set(image._storage, (storages.get(image._storage) ?? 0) + 1);
+      }
+      let cpuBytes = 0, gpuBytes = 0, exclusiveGPUBytes = 0;
+      for (const [storage, owners] of storages) {
+        cpuBytes += storage.pixels?.byteLength ?? 0;
+        const entry = storage.gpu;
+        const bytes = entry ? entry.width * entry.height * entry.bytesPerPixel : 0;
+        gpuBytes += bytes;
+        if (storage.refs === owners) exclusiveGPUBytes += bytes;
+      }
+      return { entries: cache.size, budgetBytes: limit, accountedBytes: cache.calculatedSize,
+        cpuBytes, gpuBytes, exclusiveGPUBytes, sharedGPUBytes: gpuBytes - exclusiveGPUBytes };
+    },
     clear() { cache.clear(); },
     // TVPSetGraphicCacheLimit: 0 disables the cache, -1 means the system
     // limit, and any other value is clamped to it (SystemIntf.cpp 358-368).

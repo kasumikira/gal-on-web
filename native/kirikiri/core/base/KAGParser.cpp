@@ -17,6 +17,8 @@
 
 #include "tjsDebug.h"
 
+#include "runtime.h"
+
 #include <algorithm>
 #include <cctype>
 #include <string>
@@ -1305,6 +1307,8 @@ void tTJSNI_KAGParser::Rewind() {
     CurPos = 0;
     CurLineStr = Lines[0].Start;
     LineBufferUsing = false;
+    PrefetchScannedLine = 0;
+    PrefetchSeen.clear();
     BreakConditionAndMacro();
 }
 
@@ -2666,7 +2670,98 @@ parse_start:
 }
 
 //---------------------------------------------------------------------------
-iTJSDispatch2 *tTJSNI_KAGParser::GetNextTag() { return _GetNextTag(); }
+// KAG lookahead prefetch: scans upcoming scenario lines for attr="name.ext"
+// tokens and forwards them to the host storage as speculative reads. Hints
+// only — parsing semantics, cursor state and error reporting stay untouched.
+static const tjs_int TVPKAGPrefetchLookaheadLines = 48;
+static const size_t TVPKAGPrefetchSeenLimit = 512;
+
+static void KAGPrefetchHint(const ttstr &name)
+{
+    if (!activeRuntime || !activeRuntime->storage)
+        return;
+    try
+    {
+        tTJSVariant argument(name);
+        tTJSVariant *args[] = {&argument};
+        invoke(activeRuntime, activeRuntime->storage, 20, nullptr, nullptr, 1, args);
+    }
+    catch (...)
+    {
+        // A failed hint must never surface in the conductor.
+    }
+}
+
+static void KAGScanLineForPrefetch(const tjs_char *text, tjs_int length, std::vector<ttstr> &out)
+{
+    for (tjs_int i = 1; i < length; i++)
+    {
+        const tjs_char quote = text[i];
+        if (quote != TJS_W('"') && quote != TJS_W('\''))
+            continue;
+        tjs_int j = i - 1;
+        while (j >= 0 && (text[j] == TJS_W(' ') || text[j] == TJS_W('\t')))
+            j--;
+        if (j < 0 || text[j] != TJS_W('='))
+            continue;
+        tjs_int end = i + 1;
+        while (end < length && text[end] != quote)
+            end++;
+        if (end >= length)
+            continue;
+        const tjs_int valueLength = end - i - 1;
+        if (valueLength < 3 || valueLength > 128)
+            continue;
+        bool hasDot = false;
+        for (tjs_int k = i + 1; k < end; k++)
+        {
+            const tjs_char c = text[k];
+            if (c == TJS_W('.'))
+                hasDot = true;
+            else if (c == TJS_W('&') || c == TJS_W(';') || c == TJS_W(' ') || c == TJS_W('\t') ||
+                     c == TJS_W('\r') || c == TJS_W('\n') || c == TJS_W('"') || c == TJS_W('\''))
+            {
+                hasDot = false;
+                break;
+            }
+        }
+        if (hasDot)
+            out.emplace_back(text + i + 1, valueLength);
+        i = end;
+    }
+}
+
+void tTJSNI_KAGParser::PrefetchAhead()
+{
+    if (!Lines || LineCount <= 0)
+        return;
+    const tjs_int windowEnd = std::min<tjs_int>(CurLine + TVPKAGPrefetchLookaheadLines, LineCount);
+    // Labels, call and jumps can move the cursor anywhere; clamp the
+    // watermark so the window around the new position is scanned once.
+    if (PrefetchScannedLine > windowEnd || PrefetchScannedLine < CurLine)
+        PrefetchScannedLine = CurLine;
+    if (PrefetchScannedLine >= windowEnd)
+        return;
+    std::vector<ttstr> found;
+    for (tjs_int i = PrefetchScannedLine; i < windowEnd; i++)
+        KAGScanLineForPrefetch(Lines[i].Start, Lines[i].Length, found);
+    PrefetchScannedLine = windowEnd;
+    for (const ttstr &name : found)
+    {
+        if (std::find(PrefetchSeen.begin(), PrefetchSeen.end(), name) != PrefetchSeen.end())
+            continue;
+        if (PrefetchSeen.size() >= TVPKAGPrefetchSeenLimit)
+            PrefetchSeen.clear();
+        PrefetchSeen.push_back(name);
+        KAGPrefetchHint(name);
+    }
+}
+//---------------------------------------------------------------------------
+iTJSDispatch2 *tTJSNI_KAGParser::GetNextTag() {
+    iTJSDispatch2 *tag = _GetNextTag();
+    PrefetchAhead();
+    return tag;
+}
 
 //---------------------------------------------------------------------------
 iTJSDispatch2 *tTJSNI_KAGParser::GetMacroTopNoAddRef() const {

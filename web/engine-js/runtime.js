@@ -121,6 +121,17 @@ export async function createRuntime(options) {
     eventQueue = delivery.catch(() => {});
     return delivery;
   };
+  // Wasm linear memory never returns freed pages to the OS, so the boot-time
+  // peak stays resident; compacting after startup and while the page is hidden
+  // frees dead TJS objects for reuse before later growth.
+  let lastCompact = 0;
+  const compactNativeHeap = () => enqueueEvent(() => vm.collect());
+  const onVisibilityChange = () => {
+    if (!document.hidden || disposePromise || Date.now() - lastCompact < 30000) return;
+    lastCompact = Date.now();
+    compactNativeHeap().catch(inform);
+  };
+  document.addEventListener('visibilitychange', onVisibilityChange);
   const compositor = attachCompositor(global.Window, Layer, document, { enqueueEvent });
   // Window instance hooks: update/resize/add repaint the compositor; input
   // events go through the compositor's dispatcher.
@@ -170,15 +181,32 @@ export async function createRuntime(options) {
   const diagnostics = () => {
       if (disposePromise) throw new Error('Runtime is disposed');
       let layers = 0, pixelBytes = 0;
-      const images = new Set(), nodes = new Set();
+      const images = new Set(), nodes = new Set(), layerTextures = new Map();
       const visit = node => {
         if (!node || node.invalid || nativeOwner(node.owner).invalid || nodes.has(node)) return;
         nodes.add(node);
         layers++;
-        for (const image of [node.image, node.province]) if (image && !images.has(image)) {
-          images.add(image);
-          // Count CPU storage without forcing a GPU readback.
-          pixelBytes += image._pixels?.byteLength ?? 0;
+        let visible = true;
+        for (let ancestor = node; ancestor; ancestor = ancestor.parent) {
+          if (!ancestor.visible || !ancestor.opacity) { visible = false; break; }
+        }
+        for (const image of [node.image, node.province]) if (image) {
+          const storage = image._storage;
+          if (!images.has(storage)) {
+            images.add(storage);
+            pixelBytes += storage.pixels?.byteLength ?? 0;
+          }
+          const entry = storage.gpu;
+          if (entry) {
+            let texture = layerTextures.get(storage);
+            if (!texture) {
+              texture = { bytes: entry.width * entry.height * entry.bytesPerPixel,
+                width: image.width, height: image.height, visible: false, names: [] };
+              layerTextures.set(storage, texture);
+            }
+            texture.visible ||= visible;
+            texture.names.push(node.name);
+          }
         }
         for (const child of node.children) visit(child);
       };
@@ -217,7 +245,20 @@ export async function createRuntime(options) {
           src: srcNode ? imageInfo(srcNode.image) : null,
         });
       }
-      return { pendingEvents, layers, pixelBytes, rendering: compositor.diagnostics(), conductors, graphics };
+      const textures = [...layerTextures.values()];
+      return { pendingEvents, layers, pixelBytes, rendering: compositor.diagnostics(), conductors, graphics,
+        memory: {
+          wasm: { capacityBytes: vm.module.HEAPU8.byteLength,
+            allocatedBytes: vm.module._tjs_memory_allocated_bytes(),
+            allocatorFreeBytes: vm.module._tjs_memory_free_bytes() },
+          graphicCache: graphicCache.diagnostics(),
+          layerTextures: {
+            visibleBytes: textures.filter(t => t.visible).reduce((sum, t) => sum + t.bytes, 0),
+            hiddenBytes: textures.filter(t => !t.visible).reduce((sum, t) => sum + t.bytes, 0),
+            largestHidden: textures.filter(t => !t.visible).sort((a, b) => b.bytes - a.bytes).slice(0, 12),
+          },
+        },
+      };
   };
   let startPromise, disposePromise;
   const start = () => {
@@ -231,6 +272,11 @@ export async function createRuntime(options) {
           const result = await vm.source(`Scripts.execStorage(${JSON.stringify(path)});`, path);
           await disposeScriptValue(result);
         }
+        // Startup compiled every script; compact once the boot peak has
+        // passed. The queue opens in the finally below, so this runs after
+        // startup-script events have drained.
+        lastCompact = Date.now();
+        compactNativeHeap().catch(inform);
       } catch (error) {
         acceptingEvents = false;
         throw error;
@@ -259,6 +305,7 @@ export async function createRuntime(options) {
         for (const resource of resources) await resource.finalize?.();
         await vm.dispose();
       } finally {
+        document.removeEventListener('visibilitychange', onVisibilityChange);
         await storage.finalize();
         await storage.extractionFilter?.finalize();
         // Drop decoded images (and their resident GPU textures) before the

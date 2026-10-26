@@ -11,6 +11,7 @@
 #include "tjsDictionary.h"
 #include "tjsObject.h"
 #include <algorithm>
+#include <malloc.h>
 #include <emscripten/emscripten.h>
 #include <spdlog/sinks/stdout_sinks.h>
 #include <spdlog/spdlog.h>
@@ -33,6 +34,9 @@ public:
 
 extern "C"
 {
+    // dlmalloc accounting, distinct from the grow-only WASM memory capacity.
+    EMSCRIPTEN_KEEPALIVE double tjs_memory_allocated_bytes() { return mallinfo().uordblks; }
+    EMSCRIPTEN_KEEPALIVE double tjs_memory_free_bytes() { return mallinfo().fordblks; }
     EMSCRIPTEN_KEEPALIVE Runtime *tjs_runtime_create()
     {
         if (!spdlog::get("tjs2"))
@@ -161,11 +165,6 @@ extern "C"
         return checked(r, [&]
                        { r->release(id); return 1; }, false);
     }
-    EMSCRIPTEN_KEEPALIVE int tjs_value_borrow(Runtime *r, int id)
-    {
-        return checked(r, [&]
-                       {tTJSVariant value=r->value(id);return r->borrowValue(r->beginBorrow(),value); });
-    }
     EMSCRIPTEN_KEEPALIVE int tjs_borrow_end(Runtime *r, int id)
     {
         return checked(r, [&]
@@ -197,11 +196,6 @@ extern "C"
     {
         return checked(r, [&]
                        {auto left=r->value(a).AsObjectClosureNoAddRef();auto right=r->value(b).AsObjectClosureNoAddRef();return 1+(left.Object==right.Object&&(!context||left.ObjThis==right.ObjThis)); });
-    }
-    EMSCRIPTEN_KEEPALIVE int tjs_value_is_null_context(Runtime *r, int id)
-    {
-        return checked(r, [&]
-                       { return 1 + !r->value(id).AsObjectThisNoAddRef(); });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_native_owner(Runtime *r, int id)
     {
@@ -266,10 +260,19 @@ extern "C"
         r->text = ttstr(r->value(id)).c_str();
         return r->text.c_str();
     }
-    EMSCRIPTEN_KEEPALIVE int tjs_value_is_object(Runtime *r, int id)
+    // Single classification query for shadow decoding: IsInstanceOf walks the
+    // class chain, so probing Array/Dictionary/Function from JS cost three
+    // bridge calls with string allocations per decoded object.
+    // 0 = primitive or null, 1 = Array, 2 = Dictionary, 3 = Function, 4 = other object.
+    EMSCRIPTEN_KEEPALIVE int tjs_value_kind(Runtime *r, int id)
     {
         auto value = r->copy(id);
-        return value.Type() == tvtObject && value.AsObjectNoAddRef();
+        if (value.Type() != tvtObject || !value.AsObjectNoAddRef()) return 0;
+        const auto closure = value.AsObjectClosureNoAddRef();
+        if (closure.IsInstanceOf(0, nullptr, nullptr, TJS_W("Array"), nullptr) == TJS_S_TRUE) return 1;
+        if (closure.IsInstanceOf(0, nullptr, nullptr, TJS_W("Dictionary"), nullptr) == TJS_S_TRUE) return 2;
+        if (closure.IsInstanceOf(0, nullptr, nullptr, TJS_W("Function"), nullptr) == TJS_S_TRUE) return 3;
+        return 4;
     }
     EMSCRIPTEN_KEEPALIVE int tjs_object_is_instance_of(Runtime *r, int id, const tjs_char *name)
     {
@@ -355,11 +358,6 @@ extern "C"
         return checked(r, [&]
                        {tTJSVariant name(TJS_W("missing"));success(r->value(id).AsObjectNoAddRef()->ClassInstanceInfo(TJS_CII_SET_MISSING,0,&name));return r->keep(tTJSVariant()); });
     }
-    EMSCRIPTEN_KEEPALIVE int tjs_object_count(Runtime *r, int id)
-    {
-        return checked(r, [&]
-                       {tjs_int count;success(r->value(id).AsObjectClosureNoAddRef().GetCount(&count,nullptr,nullptr,nullptr));return r->keep(tTJSVariant(count)); });
-    }
     EMSCRIPTEN_KEEPALIVE int tjs_object_construct(Runtime *r, int id, int count, const int *args)
     {
         return checked(r, [&]
@@ -369,6 +367,19 @@ extern "C"
     {
         return checked(r, [&]
                        {tTJSVariant value;auto status=r->value(id).AsObjectClosureNoAddRef().PropGet(TJS_IGNOREPROP,name,nullptr,&value,nullptr);if(status==TJS_E_MEMBERNOTFOUND)return r->keep(tTJSVariant());success(status);return r->keep(value,id); });
+    }
+    // Synchronous views query stored members without executing missing().
+    // Existence returns 1/2; reads return an owned value handle, as usual.
+    EMSCRIPTEN_KEEPALIVE int tjs_object_get_stored(Runtime *r, int id, const tjs_char *name, bool existsOnly)
+    {
+        return checked(r, [&] {
+            tTJSVariant value;
+            const auto status = r->value(id).AsObjectClosureNoAddRef().PropGet(
+                TJS_IGNOREPROP | TJS_IGNOREMISSING | TJS_MEMBERMUSTEXIST, name, nullptr, &value, nullptr);
+            if (status == TJS_E_MEMBERNOTFOUND) return existsOnly ? 1 : r->keep(tTJSVariant());
+            success(status);
+            return existsOnly ? 2 : r->keep(value, id);
+        });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_object_set_raw(Runtime *r, int id, const tjs_char *name, int value, int flags) { return tjs_object_set(r, id, name, value, flags); }
     EMSCRIPTEN_KEEPALIVE int tjs_value_release_async(Runtime *r, int id)

@@ -39,14 +39,14 @@ class Members extends Map {
     this.owner = owner;
   }
   get(name) {
-    return this.vm.rawGet(this.owner, String(name));
+    return this.vm.storedGet(this.owner, String(name));
   }
   set(name, value, flags) {
     this.vm.rawSet(this.owner, String(name), value, flags);
     return this;
   }
   has(name) {
-    return this.keysArray().includes(String(name));
+    return this.vm.rawHas(this.owner, String(name));
   }
   keysArray() {
     return this.vm.keys(this.owner);
@@ -107,13 +107,13 @@ export class TJSInterop {
     const root = this.module._tjs_runtime_global(this.runtime);
     try {
       for (const name of INTERPRETER_CLASSES) {
-        const value = this.withString(name, p =>
-          this.decode(this.module._tjs_object_get_raw(this.runtime, root, p)),
+        const value = await this.withString(name, async p =>
+          this.decode(await this.module._tjs_object_get_raw(this.runtime, root, p)),
         );
         try { global[name] = await this.pin(value); }
         finally { await this.dispose(value); }
       }
-      const random = this.rawGet(global.Math, "RandomGenerator");
+      const random = await this.rawGet(global.Math, "RandomGenerator");
       try { this.registerGlobal("RandomGenerator", await this.pin(random)); }
       finally { await this.dispose(random); }
     } finally {
@@ -183,9 +183,12 @@ export class TJSInterop {
         break;
       }
       case 4: {
-        const n = BigInt(m.UTF16ToString(m._tjs_value_as_string(r, id)));
-        value = n <= BigInt(Number.MAX_SAFE_INTEGER) && n >= BigInt(Number.MIN_SAFE_INTEGER)
-          ? Number(n) : n;
+        // Safe-range integers read exactly as doubles; the string round-trip
+        // (wasm ttstr + UTF16 copy + BigInt parse) is only for 64-bit values.
+        const n = m._tjs_value_as_real(r, id);
+        value = Number.isSafeInteger(n)
+          ? n
+          : BigInt(m.UTF16ToString(m._tjs_value_as_string(r, id)));
         break;
       }
       case 5: value = m._tjs_value_as_real(r, id); break;
@@ -248,18 +251,6 @@ export class TJSInterop {
       return await fn(id);
     } finally {
       await this.releaseHandleAsync(id);
-    }
-  }
-  async withBorrow(value, fn) {
-    const id = this.withReference(value, ref => this.module._tjs_value_borrow(this.runtime, ref));
-    if (!id) this.fail();
-    try {
-      const result = fn(this.decode(id));
-      if (result && typeof result.then === "function")
-        throw new TypeError("withBorrow callback must return synchronously; retain values used after await");
-      return result;
-    } finally {
-      if (!await this.module._tjs_borrow_end(this.runtime, id)) this.fail();
     }
   }
   retain(value, owner) {
@@ -329,9 +320,6 @@ export class TJSInterop {
   context(value) {
     return this.withReference(value, id => this.decode(this.module._tjs_value_context(this.runtime, id)));
   }
-  isNullContext(value) {
-    return this.withReference(value, id => this.decodeBoolean(this.module._tjs_value_is_null_context(this.runtime, id)));
-  }
   sameReference(left, right, context = true) {
     return this.withReference(left, a => this.withReference(right, b =>
       this.decodeBoolean(this.module._tjs_value_equal(this.runtime, a, b, Number(context)))));
@@ -346,14 +334,15 @@ export class TJSInterop {
     return result === 2;
   }
   decode(id) {
-    if (!id || this.module._tjs_value_type(this.runtime, id) !== 1 ||
-        !this.module._tjs_value_is_object(this.runtime, id))
-      return this.decodePrimitive(id);
+    // One classification call replaces type+is_object plus three per-shadow
+    // IsInstanceOf probes (each with its own string allocation).
+    if (!id) return this.decodePrimitive(id);
+    const kind = this.module._tjs_value_kind(this.runtime, id);
+    if (kind === 0) return this.decodePrimitive(id);
     const info = { vm: this, id };
     const vm = this;
-    const isType = name => this.withString(name, p => this.module._tjs_object_is_instance_of(this.runtime, id, p));
-    const callable = isType("Function");
-    const target = isType("Array") ? [] : isType("Dictionary") ? new Map() : callable ? function() {} : {};
+    const callable = kind === 3;
+    const target = kind === 1 ? [] : kind === 2 ? new Map() : callable ? function() {} : {};
     const members = new Members(this, null);
     const shadow = new Proxy(target, {
       apply(_target, receiver, args) { return vm.call(shadow, receiver, args); },
@@ -369,7 +358,7 @@ export class TJSInterop {
         if (typeof name === "symbol") return Reflect.get(target, name, receiver);
         if (Array.isArray(target)) {
           if (name === "length" || name === "count") return vm.withReference(shadow, ref => vm.module._tjs_array_count(vm.runtime, ref));
-          if (/^-?\d+$/.test(name)) return vm.rawGet(shadow, name);
+          if (/^-?\d+$/.test(name)) return vm.storedGet(shadow, name);
           if (name in Array.prototype) return Reflect.get(target, name, receiver);
         }
         if (target instanceof Map) {
@@ -434,7 +423,7 @@ export class TJSInterop {
   }
   kagParsers() {
     return this.readArray(this.module._tjs_kag_parsers(this.runtime)).map(value => {
-      try { return { name: 'KAGParser', storage: this.rawGet(value, 'storage'), line: this.rawGet(value, 'line'), text: this.rawGet(value, 'text') }; }
+      try { return { name: 'KAGParser', storage: this.storedGet(value, 'storage'), line: this.storedGet(value, 'line'), text: this.storedGet(value, 'text') }; }
       finally { this.releaseHandle(scriptBinding(value).id); }
     });
   }
@@ -534,15 +523,23 @@ export class TJSInterop {
       }
     });
   }
-  rawGet(value, name) {
+  storedGet(value, name) {
     if (Array.isArray(unwrap(value)) && /^-?\d+$/.test(name))
       return this.withReference(value, id =>
         this.decode(this.module._tjs_object_get_by_num_raw(this.runtime, id, Number(name))));
     return this.withReference(value, (id) =>
       this.withString(name, (p) =>
-        this.decode(this.module._tjs_object_get_raw(this.runtime, id, p)),
+          this.decode(this.module._tjs_object_get_stored(this.runtime, id, p, false)),
       ),
     );
+  }
+  async rawGet(value, name) {
+    return this.withAsyncReference(value, id => this.withString(name, async p =>
+      this.decode(await this.module._tjs_object_get_raw(this.runtime, id, p))));
+  }
+  rawHas(value, name) {
+    return this.withReference(value, id => this.withString(name, p =>
+      this.decodeBoolean(this.module._tjs_object_get_stored(this.runtime, id, p, true))));
   }
   rawSet(value, name, member, flags) {
     return this.withReference(value, (id) =>
@@ -564,11 +561,6 @@ export class TJSInterop {
   setMissingHandler(value) {
     return this.withReference(value, (id) =>
       this.decode(this.module._tjs_object_set_missing(this.runtime, id)),
-    );
-  }
-  objectCount(value) {
-    return this.withReference(value, (id) =>
-      this.decode(this.module._tjs_object_count(this.runtime, id)),
     );
   }
   collection(kind, entries, context) {
@@ -597,12 +589,20 @@ export class TJSInterop {
     const id = await this.withString(name, namePtr => this.module._tjs_plugins(this.runtime, operation, namePtr));
     return operation === 1 ? this.readArray(id) : Boolean(this.decode(id));
   }
+  // Runs the original TJS GC and compact hooks; the promising export lets
+  // finalizers triggered by collection suspend safely.
+  async collect() {
+    if (!this.runtime) return;
+    await this.module._tjs_runtime_collect(this.runtime);
+  }
   readArray(id) {
     if (!id) this.fail();
     try {
       const count = this.module._tjs_array_count(this.runtime, id);
-      return Array.from({ length: count }, (_, index) => this.withString(String(index), name =>
-        this.decode(this.module._tjs_object_get_raw(this.runtime, id, name))));
+      // Numeric index access avoids a JS string + UTF16 malloc + TJS string
+      // lookup per element.
+      return Array.from({ length: count }, (_, index) =>
+        this.decode(this.module._tjs_object_get_by_num_raw(this.runtime, id, index)));
     } finally {
       this.releaseHandle(id);
     }
@@ -610,7 +610,9 @@ export class TJSInterop {
   attachStorage(storage) {
     const backend = createTJS2Storage(storage);
     this.registerGlobal('TJS2Storage', backend.klass);
-    const callback = this.storeHost(async ({ operation, args: [name, value, mode] }) => {
+    // Sync operations must return non-Promise values so the dual-mode
+    // host_call import keeps them off the suspension path.
+    const callback = this.storeHost(({ operation, args: [name, value, mode] }) => {
       switch (operation) {
         case 6: return backend.read(name);
         // Shared JS capabilities used by the native Storages interface.
@@ -620,6 +622,8 @@ export class TJSInterop {
         case 17: storage.addAutoPath(name); return;
         case 18: storage.removeAutoPath(name); return;
         case 19: return storage.getPlacedPath(name);
+        // KAG lookahead hint: fire-and-forget, must return synchronously.
+        case 20: storage.prefetch?.(name); return;
         case 10: return backend.write(name, value);
         default: throw Error('Unknown storage operation: ' + operation);
       }
@@ -688,7 +692,7 @@ export class TJSInterop {
       const result = ignoreProperty
         ? arrayIndex
           ? this.module._tjs_object_get_by_num_raw(this.runtime, id, Number(name))
-          : this.withString(name, p => this.module._tjs_object_get_raw(this.runtime, id, p))
+          : await this.withString(name, p => this.module._tjs_object_get_raw(this.runtime, id, p))
         : await this.withString(name, p => this.module._tjs_object_get(this.runtime, id, p, 0));
       if (!result) this.fail();
       const type = this.module._tjs_value_type(this.runtime, result);

@@ -68,6 +68,7 @@ public:
 class XP3FilterStream final : public tTJSDispatch {
     ttstr FileName;
     tTJSVariant FilterContext;
+    tjs_int Mode = 0;
 public:
     XP3FilterStream(const ttstr &filepath, const ttstr &archivename, tjs_int64 filesize)
         : FileName(filepath) {
@@ -78,10 +79,20 @@ public:
         success(filter.AsObjectClosureNoAddRef().FuncCall(0, nullptr, nullptr, &result, 3, vars, nullptr));
         if(result.Type() == tvtObject) {
             ncbPropAccessor a(result.AsObjectNoAddRef());
-            // Mode 1 requests a complete read. JS already reads the complete file.
-            a.GetValue(0, ncbTypedefs::Tag<tjs_int>());
+            // Mode 1 requires the JS archive layer to materialize and filter
+            // the complete entry before serving random stream reads.
+            Mode = a.GetValue(0, ncbTypedefs::Tag<tjs_int>());
             FilterContext = a.GetValue(1, ncbTypedefs::Tag<tTJSVariant>());
         }
+    }
+    tjs_error PropGet(tjs_uint32 flag, const tjs_char *membername,
+                      tjs_uint32 *hint, tTJSVariant *result,
+                      iTJSDispatch2 *objthis) override {
+        if(membername && !TJS_strcmp(membername, TJS_W("mode"))) {
+            if(result) *result = Mode;
+            return TJS_S_OK;
+        }
+        return tTJSDispatch::PropGet(flag, membername, hint, result, objthis);
     }
     tjs_error FuncCall(tjs_uint32, const tjs_char *membername, tjs_uint32 *,
                        tTJSVariant *result, tjs_int numparams, tTJSVariant **param,
