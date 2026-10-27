@@ -113,8 +113,15 @@ export async function createRuntime(options) {
   const enqueueEvent = (callback, cleanup) => {
     pendingEvents++;
     const delivery = eventQueue.then(async () => {
-      try { return acceptingEvents ? await callback() : undefined; }
-      finally { await cleanup?.(); }
+      try {
+        if (!acceptingEvents) return;
+        await system.maintain();
+        return await callback();
+      }
+      finally {
+        await cleanup?.();
+        if (acceptingEvents) await system.maintain();
+      }
     })
       .finally(() => { pendingEvents--; });
     // The caller reports failures; later events must still be dispatched.
@@ -125,7 +132,7 @@ export async function createRuntime(options) {
   // peak stays resident; compacting after startup and while the page is hidden
   // frees dead TJS objects for reuse before later growth.
   let lastCompact = 0;
-  const compactNativeHeap = () => enqueueEvent(() => vm.collect());
+  const compactNativeHeap = () => enqueueEvent(() => vm.compact(10));
   const onVisibilityChange = () => {
     if (!document.hidden || disposePromise || Date.now() - lastCompact < 30000) return;
     lastCompact = Date.now();
@@ -276,6 +283,7 @@ export async function createRuntime(options) {
         // startup-script events have drained.
         lastCompact = Date.now();
         compactNativeHeap().catch(inform);
+        system.startMaintenance();
       } catch (error) {
         acceptingEvents = false;
         throw error;

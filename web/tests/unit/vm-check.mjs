@@ -63,6 +63,66 @@ try {
     assert.equal(countGetterCalls, 1,
       'native length and serialization do not invoke the overridden getter');
   } finally { await disposeScriptValue(overridden); }
+
+  // Large-object lookups must not cache values, reorder enumeration,
+  // hide full-hash collisions, or bypass script fallback paths.
+  const large = await vm.source(`
+    class HashReadProbe {
+      var reads = 0, misses = 0;
+      property computed { getter() { return ++reads; } }
+      function missing(mode, name, value) {
+        if (!mode) {
+          misses++;
+          if (name == "dynamic") { *value = misses; return true; }
+        }
+        return false;
+      }
+    }
+    return new HashReadProbe();
+  `, 'large-hash-object');
+  const collisionA = 'member_collision_37381', collisionB = 'member_collision_80300';
+  try {
+    // These two names share the complete 32-bit TJS hash, 0xf8c5da2d.
+    vm.rawSet(large, collisionA, 11);
+    vm.rawSet(large, collisionB, 12);
+    for (let i = 0; i < 1600; i++) vm.rawSet(large, `member_${i}`, i);
+    const names = vm.keys(large);
+    for (let i = 0; i < 64; i++) assert.equal(vm.rawHas(large, `absent_${i}`), false);
+    assert.deepEqual(vm.keys(large), names, 'negative lookups preserve enumeration order');
+    vm.rawSet(large, 'new_after_filter', 77);
+    assert.equal(await vm.get(large, 'new_after_filter'), 77, 'new hashes remain visible after filtering starts');
+    assert.equal(await vm.get(large, collisionA), 11);
+    assert.equal(await vm.get(large, collisionB), 12);
+    assert.equal(vm.deleteMember(large, collisionA), true);
+    assert.equal(vm.rawHas(large, collisionA), false, 'colliding hash still requires name comparison');
+    assert.equal(await vm.get(large, collisionB), 12, 'deleting a collision keeps its peer visible');
+    assert.equal(vm.deleteMember(large, collisionB), true);
+    assert.equal(vm.rawHas(large, collisionB), false);
+    vm.rawSet(large, collisionA, 13);
+    assert.equal(await vm.get(large, collisionA), 13, 'insertion remains visible');
+    for (let i = 0; i < 64; i++) assert.equal(vm.rawHas(large, `absent_${i}`), false);
+    vm.setMissingHandler(large);
+    assert.equal(await vm.get(large, 'computed'), 1);
+    assert.equal(await vm.get(large, 'computed'), 2, 'getters still run on every read');
+    assert.equal(await vm.get(large, 'dynamic'), 1);
+    assert.equal(await vm.get(large, 'dynamic'), 2, 'negative lookup still invokes missing');
+    vm.registerGlobal('largeHashScope', large);
+    assert.equal(await vm.source('var hashScopeFallback=91; with(largeHashScope) { return hashScopeFallback; }', 'hash-scope'), 91);
+    for (let i = 0; i < 1550; i++) vm.deleteMember(large, `member_${i}`);
+    assert.equal(await vm.get(large, 'member_1599'), 1599, 'deletion preserves remaining members');
+    for (let i = 0; i < 1550; i++) vm.rawSet(large, `member_${i}`, i + 1);
+    for (let i = 0; i < 64; i++) assert.equal(vm.rawHas(large, `absent_${i}`), false);
+    vm.rehash();
+    assert.equal(await vm.get(large, 'member_1599'), 1599);
+    assert.equal(await vm.get(large, 'member_0'), 1, 'rebuilt table preserves the reinserted value');
+    assert.equal(vm.rawHas(large, 'absent_after_rebuild'), false);
+    assert.equal(await vm.get(large, collisionA), 13);
+    assert.equal(await vm.get(large, 'computed'), 3);
+    const missesBeforeRebuiltRead = await vm.get(large, 'misses');
+    assert.equal(await vm.get(large, 'dynamic'), missesBeforeRebuiltRead + 1);
+  } finally { await vm.dispose(large); }
+
+  console.log('large-object hash maintenance regression passed');
   console.log('passed', cases.length, '/', cases.length, '; division/remainder errors passed');
   console.log('typed member reads passed');
   console.log('attached script receivers passed');

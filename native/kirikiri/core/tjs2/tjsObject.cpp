@@ -551,6 +551,7 @@ namespace TJS {
         }
 
         Count++;
+        AddMemberHash(hash);
 
         return data;
     }
@@ -605,6 +606,7 @@ namespace TJS {
         }
 
         Count++;
+        AddMemberHash(hash);
 
         return data;
     }
@@ -751,6 +753,7 @@ namespace TJS {
             HashSize = _HashSize;
             Symbols = _Symbols;
             Count = orgcount;
+            MemberFilter.reset();
 
             throw;
         }
@@ -764,6 +767,7 @@ namespace TJS {
         HashSize = newhashsize;
         HashMask = newhashmask;
         Count = orgcount;
+        MemberFilter.reset();
     }
 
     //---------------------------------------------------------------------------
@@ -811,6 +815,7 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     void tTJSCustomObject::DeleteAllMembers() {
+        MemberFilter.reset();
         // delete all members
         if(Count <= 10)
             return _DeleteAllMembers();
@@ -991,6 +996,19 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
+    bool tTJSCustomObject::MayHaveMemberHash(tjs_uint32 hash) {
+        if(!MemberFilter) {
+            MemberFilter = std::make_unique<std::bitset<MemberFilterBits>>();
+            for(auto *bucket = Symbols; bucket != Symbols + HashSize; ++bucket) {
+                for(auto *data = bucket; data; data = data->Next) {
+                    if(data->SymFlags & TJS_SYMBOL_USING) AddMemberHash(data->Hash);
+                }
+            }
+        }
+        return MemberFilter->test(hash & (MemberFilterBits - 1)) &&
+            MemberFilter->test((hash >> 13) & (MemberFilterBits - 1));
+    }
+
     tTJSCustomObject::tTJSSymbolData *
     tTJSCustomObject::Find(const tjs_char *name, tjs_uint32 *hint) {
         // searche an element named "name" and return its
@@ -1011,6 +1029,8 @@ namespace TJS {
             tTJSSymbolData *prevd = lv1;
             tTJSSymbolData *d = lv1->Next;
             for(; d; prevd = d, d = d->Next, cnt++) {
+                if(cnt == 3 && Count > MemberFilterThreshold && !MayHaveMemberHash(hash))
+                    break;
                 if(d->Hash == hash && (d->SymFlags & TJS_SYMBOL_USING)) {
                     if(d->NameMatch(name)) {
                         if(cnt > 2) {
@@ -1051,6 +1071,8 @@ namespace TJS {
         tTJSSymbolData *prevd = lv1;
         tTJSSymbolData *d = lv1->Next;
         for(; d; prevd = d, d = d->Next, cnt++) {
+            if(cnt == 3 && Count > MemberFilterThreshold && !MayHaveMemberHash(hash))
+                break;
             if(d->Hash == hash && (d->SymFlags & TJS_SYMBOL_USING)) {
                 if(d->NameMatch(name)) {
                     if(cnt > 2) {
@@ -1369,7 +1391,7 @@ namespace TJS {
             return TJS_E_INVALIDTYPE;
         }
 
-        tTJSSymbolData *data;
+        tTJSSymbolData *data = nullptr;
         if(CallMissing) {
             data = Find(membername, hint);
             if(!data) {
@@ -1379,12 +1401,17 @@ namespace TJS {
             }
         }
 
-        if(flag & TJS_MEMBERENSURE)
-            data = Add(membername,
-                       hint); // create a member when TJS_MEMBERENSURE
-                              // is specified
-        else
-            data = Find(membername, hint);
+        // A successful missing precheck has not called script, so its slot
+        // is still current. A missing callback may mutate the object: keep
+        // the normal lookup/add path when that precheck did not find a slot.
+        if(!data) {
+            if(flag & TJS_MEMBERENSURE)
+                data = Add(membername,
+                           hint); // create a member when TJS_MEMBERENSURE
+                                  // is specified
+            else
+                data = Find(membername, hint);
+        }
 
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
@@ -1463,7 +1490,7 @@ namespace TJS {
             return TJS_E_INVALIDTYPE;
         }
 
-        tTJSSymbolData *data;
+        tTJSSymbolData *data = nullptr;
         if(CallMissing) {
             data = Find((const tjs_char *)(*membername), membername->GetHint());
             if(!data) {
@@ -1473,11 +1500,16 @@ namespace TJS {
             }
         }
 
-        if(flag & TJS_MEMBERENSURE)
-            data = Add(membername); // create a member when
-                                    // TJS_MEMBERENSURE is specified
-        else
-            data = Find((const tjs_char *)(*membername), membername->GetHint());
+        // A successful missing precheck has not called script, so its slot
+        // is still current. A missing callback may mutate the object: keep
+        // the normal lookup/add path when that precheck did not find a slot.
+        if(!data) {
+            if(flag & TJS_MEMBERENSURE)
+                data = Add(membername); // create a member when
+                                        // TJS_MEMBERENSURE is specified
+            else
+                data = Find((const tjs_char *)(*membername), membername->GetHint());
+        }
 
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found

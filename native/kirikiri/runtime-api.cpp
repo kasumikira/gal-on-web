@@ -145,7 +145,7 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE int tjs_value_retain(Runtime *r, int id)
     {
         return checked(r, [&]
-                       { return r->keep(r->value(id)); });
+                       { return r->keep(r->copy(id)); });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_value_retain_for_owner(Runtime *r, int id, int owner)
     {
@@ -297,8 +297,18 @@ extern "C"
     EMSCRIPTEN_KEEPALIVE int tjs_runtime_handle_count(Runtime *r) { return r->values.size(); }
     EMSCRIPTEN_KEEPALIVE int tjs_runtime_instance_count(Runtime *r) { return r->alive; }
     EMSCRIPTEN_KEEPALIVE int tjs_runtime_invalidation_count(Runtime *r) { return r->invalidations; }
-    EMSCRIPTEN_KEEPALIVE void tjs_runtime_collect(Runtime *r) { r->engine->DoGarbageCollection();
-        compactRuntime(); }
+    EMSCRIPTEN_KEEPALIVE void tjs_runtime_rehash(Runtime *) { TJSDoRehash(); }
+    EMSCRIPTEN_KEEPALIVE int tjs_runtime_compact(Runtime *r, int id)
+    {
+        return checked(r, [&] {
+            const auto &value = r->value(id);
+            const tjs_int level = value.Type() == tvtVoid
+                ? TVP_COMPACT_LEVEL_MAX : static_cast<tjs_int>(value.AsInteger());
+            if (level >= TVP_COMPACT_LEVEL_IDLE) r->engine->DoGarbageCollection();
+            compactRuntime(level);
+            return r->keep(tTJSVariant(level));
+        });
+    }
     EMSCRIPTEN_KEEPALIVE int tjs_runtime_shutdown(Runtime *r)
     {
         return checked(r, [&]

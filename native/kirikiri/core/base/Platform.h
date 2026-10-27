@@ -8,7 +8,9 @@ struct tTVPCompactEventCallbackIntf
     virtual void OnCompact(tjs_int level) = 0;
     virtual ~tTVPCompactEventCallbackIntf() = default;
 };
+inline constexpr tjs_int TVP_COMPACT_LEVEL_IDLE = 5;
 inline constexpr tjs_int TVP_COMPACT_LEVEL_DEACTIVATE = 10;
+inline constexpr tjs_int TVP_COMPACT_LEVEL_MAX = 100;
 void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf *callback);
 iTJSTextReadStream *TVPCreateTextStreamForRead(const ttstr &name, const ttstr &mode);
 void TVPExecuteExpression(const ttstr &expression, iTJSDispatch2 *context, tTJSVariant *result);

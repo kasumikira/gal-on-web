@@ -462,12 +462,16 @@ export class TJSInterop {
     return this.readArray(id).map(handle => this.callbacks.get(handle));
   }
   encodeResult(value) {
-    return this.withReference(value, id => this.module._tjs_value_retain(this.runtime, id));
+    // Callback results must outlive the input borrow. Encode once; native
+    // detaches existing script references from their borrowed lifetime.
+    return this.encode(value, true);
   }
-  encode(value) {
+  encode(value, independent = false) {
     const info = scriptBinding(value);
     if (info) {
-      const id = this.module._tjs_value_copy(this.runtime, info.id);
+      const id = independent
+        ? this.module._tjs_value_retain(this.runtime, info.id)
+        : this.module._tjs_value_copy(this.runtime, info.id);
       if (!id) this.decodePrimitive(0);
       return id;
     }
@@ -619,11 +623,13 @@ export class TJSInterop {
     const id = await this.withString(name, namePtr => this.module._tjs_plugins(this.runtime, operation, namePtr));
     return operation === 1 ? this.readArray(id) : Boolean(this.decode(id));
   }
-  // Runs the original TJS GC and compact hooks; the promising export lets
-  // finalizers triggered by collection suspend safely.
-  async collect() {
-    if (!this.runtime) return;
-    await this.module._tjs_runtime_collect(this.runtime);
+  // Only marks tables; their next PropGet performs the original lazy rebuild.
+  rehash() {
+    this.module._tjs_runtime_rehash(this.runtime);
+  }
+  async compact(level) {
+    return this.withAsyncReference(level, async id =>
+      this.decode(await this.module._tjs_runtime_compact(this.runtime, id)));
   }
   readArray(id) {
     if (!id) this.fail();

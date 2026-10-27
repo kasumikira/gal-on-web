@@ -319,9 +319,9 @@ void initializeStorageCallbacks()
         return new BinaryWriteStream(activeRuntime, name, mode);
     };
 }
-void compactRuntime()
+void compactRuntime(tjs_int level)
 {
-    if (compactCallback) compactCallback->OnCompact(TVP_COMPACT_LEVEL_DEACTIVATE);
+    if (compactCallback) compactCallback->OnCompact(level);
 }
 
 extern "C"

@@ -3463,7 +3463,7 @@ var Asyncify = {
     }
   },
   instrumentWasmExports(exports) {
-    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_get_raw|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_collect|tjs_borrow_end|tjs_window_objects|tjs_plugins|tjs_layer_font|main|__main_argc_argv)$/;
+    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_get_raw|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_compact|tjs_borrow_end|tjs_window_objects|tjs_plugins|tjs_layer_font|main|__main_argc_argv)$/;
     Asyncify.asyncExports = new Set;
     var ret = {};
     for (let [x, original] of Object.entries(exports)) {
@@ -3633,7 +3633,7 @@ function host_readonly_get(runtime, callback, name) {
 host_readonly_get.sig = "iiii";
 
 // Imports from the Wasm binary.
-var _tjs_memory_allocated_bytes, _tjs_memory_free_bytes, _tjs_runtime_create, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_kind, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_collect, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_get_stored, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_layer_font, _tjs_class_id, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_deserialize, _malloc, _free, ___trap, memory, __indirect_function_table, wasmMemory;
+var _tjs_memory_allocated_bytes, _tjs_memory_free_bytes, _tjs_runtime_create, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_kind, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_rehash, _tjs_runtime_compact, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_get_stored, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_layer_font, _tjs_class_id, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_deserialize, _malloc, _free, ___trap, memory, __indirect_function_table, wasmMemory;
 
 function assignWasmExports(wasmExports) {
   _tjs_memory_allocated_bytes = Module["_tjs_memory_allocated_bytes"] = wasmExports["tjs_memory_allocated_bytes"];
@@ -3679,7 +3679,8 @@ function assignWasmExports(wasmExports) {
   _tjs_runtime_handle_count = Module["_tjs_runtime_handle_count"] = wasmExports["tjs_runtime_handle_count"];
   _tjs_runtime_instance_count = Module["_tjs_runtime_instance_count"] = wasmExports["tjs_runtime_instance_count"];
   _tjs_runtime_invalidation_count = Module["_tjs_runtime_invalidation_count"] = wasmExports["tjs_runtime_invalidation_count"];
-  _tjs_runtime_collect = Module["_tjs_runtime_collect"] = wasmExports["tjs_runtime_collect"];
+  _tjs_runtime_rehash = Module["_tjs_runtime_rehash"] = wasmExports["tjs_runtime_rehash"];
+  _tjs_runtime_compact = Module["_tjs_runtime_compact"] = wasmExports["tjs_runtime_compact"];
   _tjs_runtime_shutdown = Module["_tjs_runtime_shutdown"] = wasmExports["tjs_runtime_shutdown"];
   _tjs_runtime_global = Module["_tjs_runtime_global"] = wasmExports["tjs_runtime_global"];
   _tjs_execute_source = Module["_tjs_execute_source"] = wasmExports["tjs_execute_source"];

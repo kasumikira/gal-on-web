@@ -138,4 +138,4 @@ static void success(tjs_error code)
 tjs_error invoke(Runtime *, int, int, iTJSDispatch2 *, tTJSVariant *, int, tTJSVariant **);
 extern "C" int host_retain(Runtime *, int);
 void initializeStorageCallbacks();
-void compactRuntime();
+void compactRuntime(tjs_int level);

@@ -6,6 +6,10 @@ import { readScript, disposeScriptValue } from '#krkr/native';
 import { queryKeyState } from './key-state.js';
 const FRAME_INTERVAL_60_MS = 1000 / 60;
 const FRAME_TIME_EPSILON_MS = 1e-6;
+const REHASH_INTERVAL_MS = 1500;
+const COMPACT_INTERVAL_MS = 4000;
+const COMPACT_LEVEL_IDLE = 5;
+const COMPACT_LEVEL_MINIMIZE = 15;
 
 export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
   let title = 'kirikiriz';
@@ -25,6 +29,26 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
   const registeredFonts = new Map();
   let handlers = [], framePending = false, active = true, frameId = null, inFlight = null;
   let lastFrameTimestamp = null, frameTimeRemainder = 0;
+  let lastRehashedTick = 0;
+  let lastCompactedTick = 0, maintenanceStarted = false, maintenanceTimer = null;
+  const cancelMaintenance = () => {
+    if (maintenanceTimer !== null) view.clearTimeout(maintenanceTimer);
+    maintenanceTimer = null;
+  };
+  const scheduleMaintenance = () => {
+    if (!active || !maintenanceStarted || handlers.some(Boolean)) {
+      cancelMaintenance();
+      return;
+    }
+    if (maintenanceTimer !== null) return;
+    const nextTick = Math.min(lastRehashedTick + REHASH_INTERVAL_MS,
+      lastCompactedTick + COMPACT_INTERVAL_MS) + 1;
+    maintenanceTimer = view.setTimeout(() => {
+      maintenanceTimer = null;
+      // Maintenance enters the same serialized queue as all script events.
+      return enqueueEvent(() => {}).catch(inform);
+    }, Math.max(0, nextTick - Math.trunc(performance.now())));
+  };
   // AffineSourceMotion enters this RAF-backed handler loop through
   // mainwindow.onFlipTimerInterval. Only gate callback delivery; scripts still
   // receive the current tick at dispatch, as in TVPDeliverContinuousEvent.
@@ -117,6 +141,7 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
       if (!active) throw new Error('System is disposed');
       if (!arguments.length) throw new Error('System.addContinuousHandler requires a handler');
       if (!handlers.some(value => value && equal(value, handler))) handlers.push(vm.retain(handler));
+      cancelMaintenance();
       schedule();
     },
     async removeContinuousHandler(handler) {
@@ -129,6 +154,7 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
         if (!handlers.some(Boolean)) {
           lastFrameTimestamp = null;
           frameTimeRemainder = 0;
+          scheduleMaintenance();
         }
       }
     },
@@ -230,7 +256,10 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
     toActualColor(value) { return Math.trunc(Number(value)); },
     clearGraphicCache() { graphicCache?.clear(); },
     touchImages() { return {}; },
-    doCompact() {},
+    async doCompact(level) {
+      const compactLevel = await vm.compact(level);
+      if (compactLevel >= COMPACT_LEVEL_MINIMIZE) graphicCache?.clear();
+    },
     dumpHeap() {},
     nullpo() {},
     showVersion() {},
@@ -240,12 +269,33 @@ export function createSystem({ vm, enqueueEvent, storage, graphicCache }) {
   const stop = () => {
     if (!active) return;
     active = false;
+    cancelMaintenance();
     if (frameId !== null) view.cancelAnimationFrame(frameId);
     frameId = null;
     framePending = false;
   };
   return {
     api,
+    startMaintenance() {
+      maintenanceStarted = true;
+      lastCompactedTick = Math.trunc(performance.now());
+      scheduleMaintenance();
+    },
+    // SystemControl::SystemWatchTimerTimer: idle compact before lazy rehash.
+    async maintain() {
+      const tick = Math.trunc(performance.now());
+      if (active && !handlers.some(Boolean)) {
+        if (tick - lastCompactedTick > COMPACT_INTERVAL_MS) {
+          lastCompactedTick = tick;
+          await vm.compact(COMPACT_LEVEL_IDLE);
+        }
+        if (tick > lastRehashedTick + REHASH_INTERVAL_MS) {
+          lastRehashedTick = tick;
+          vm.rehash();
+        }
+      }
+      scheduleMaintenance();
+    },
     stop,
     async finalize() {
       if (inFlight) await inFlight;

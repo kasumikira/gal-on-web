@@ -49,7 +49,7 @@ int Runtime::keep(const tTJSVariant &v, int parent, int owner)
     const auto source = values.find(parent);
     const int borrow = source != values.end() && source->second.borrow > 0 ? source->second.borrow : 0;
     const int id = next++;
-    values.emplace(id, Value{v, borrow, owner});
+    values.try_emplace(id, v, borrow, owner);
     addOwnerValue(owner, id);
     if (borrow)
         borrows.at(borrow).push_back(id);

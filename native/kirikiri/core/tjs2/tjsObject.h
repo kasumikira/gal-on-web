@@ -12,6 +12,8 @@
 #define tjsObjectH
 
 #include <vector>
+#include <bitset>
+#include <memory>
 #include "tjsInterface.h"
 #include "tjsVariant.h"
 #include "tjsUtils.h"
@@ -343,6 +345,18 @@ namespace TJS {
         tjs_int HashMask;
         tjs_int HashSize;
         tTJSSymbolData *Symbols;
+        // A Bloom filter only rejects absent full hashes. Deleted hashes may
+        // remain set: false positives fall through to the original lookup.
+        static constexpr tjs_int MemberFilterThreshold = 128;
+        static constexpr tjs_uint MemberFilterBits = 8192;
+        std::unique_ptr<std::bitset<MemberFilterBits>> MemberFilter;
+        bool MayHaveMemberHash(tjs_uint32 hash);
+        void AddMemberHash(tjs_uint32 hash) {
+            if(MemberFilter) {
+                MemberFilter->set(hash & (MemberFilterBits - 1));
+                MemberFilter->set((hash >> 13) & (MemberFilterBits - 1));
+            }
+        }
         tjs_uint RebuildHashMagic;
         bool IsInvalidated;
         bool IsInvalidating;

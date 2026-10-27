@@ -34,6 +34,50 @@ const release = id => vm.module._tjs_value_release(vm.runtime, id);
 const sum = await vm.source('var __a = 40 + 2; return __a;', 'sum');
 check('script success returns value', sum === 42, sum);
 
+// Results need one independent handle, including references borrowed from the
+// callback input and native owner references (which are not value handles).
+const originalRetain = vm.module._tjs_value_retain;
+const originalCopy = vm.module._tjs_value_copy;
+let resultRetains = 0, resultCopies = 0;
+vm.module._tjs_value_retain = (...args) => { resultRetains++; return originalRetain(...args); };
+vm.module._tjs_value_copy = (...args) => { resultCopies++; return originalCopy(...args); };
+try {
+  const before = vm.module._tjs_runtime_handle_count(vm.runtime);
+  for (const value of [undefined, null, 42, 1.25, 9007199254740993n, 'result'])
+    check(`result encoding preserves ${String(value)}`, vm.decode(vm.encodeResult(value)) === value);
+  check('primitive results need no intermediate copy or retain', resultCopies === 0 && resultRetains === 0);
+  check('primitive result encoding releases its handles', vm.module._tjs_runtime_handle_count(vm.runtime) === before);
+} finally {
+  vm.module._tjs_value_retain = originalRetain;
+  vm.module._tjs_value_copy = originalCopy;
+}
+vm.registerGlobal('returnBorrowedResult', value => value);
+const echoed = await vm.source('return returnBorrowedResult(%["value" => 73]);', 'borrowed-result');
+try { check('returned object survives callback borrow end', await vm.get(echoed, 'value') === 73); }
+finally { await vm.dispose(echoed); }
+check('returned closure preserves its receiver', await vm.source(`
+  class ResultReceiver { var value = 74; function read() { return value; } }
+  var receiver = new ResultReceiver();
+  var read = returnBorrowedResult(receiver.read);
+  return read();
+`, 'closure-result') === 74);
+const ResultOwner = defineNativeClass('ResultOwner', { initialize: () => ({}) });
+vm.registerGlobal('ResultOwner', ResultOwner);
+const resultOwner = await vm.source('return new ResultOwner();', 'owner-result');
+vm.registerGlobal('returnNativeStateResult', () => ResultOwner.state(resultOwner));
+const returnedOwner = await vm.source('return returnNativeStateResult();', 'owner-result');
+try { check('native owner result resolves without an intermediate value handle', vm.sameReference(resultOwner, returnedOwner)); }
+finally { await vm.dispose(returnedOwner); await vm.dispose(resultOwner); }
+let heldResult;
+vm.registerGlobal('returnAsyncResult', async value => {
+  heldResult = vm.retain(value);
+  await Promise.resolve();
+  return heldResult;
+});
+const asyncResult = await vm.source('return returnAsyncResult(%["value" => 75]);', 'async-result');
+try { check('async returned object survives input borrow end', await vm.get(asyncResult, 'value') === 75); }
+finally { await vm.dispose(heldResult); await vm.dispose(asyncResult); }
+
 // Raw membership must distinguish an existing void value from a missing key,
 // without retaining the queried value as a new JS shadow.
 const dictionary = await vm.source('return %["empty" => void, "object" => %[]];', 'membership');
@@ -65,6 +109,34 @@ try {
   vm.setMissingHandler(missingObject);
   check('membership does not execute missing', !missingObject.members.has('absent') && missingCalls === 0);
 } finally { await vm.dispose(missingObject); }
+
+const missingWriteObject = await vm.source(`
+  class MissingWriteCheck {
+    var calls = 0, existing = 1, stored = 0;
+    property guarded { setter(value) { stored = value; } getter() { return stored; } }
+    function missing(mode, name, value) {
+      calls++;
+      if (mode && name == "created") this.created = 99;
+      return false;
+    }
+  }
+  return new MissingWriteCheck();
+`, 'missing-write');
+try {
+  vm.setMissingHandler(missingWriteObject);
+  vm.registerGlobal('missingWriteObject', missingWriteObject);
+  await vm.set(missingWriteObject, 'existing', 2);
+  await vm.source('missingWriteObject.existing = 3;', 'missing-write-direct');
+  check('existing writes bypass missing in both property APIs', await vm.get(missingWriteObject, 'existing') === 3 && await vm.get(missingWriteObject, 'calls') === 0);
+  await vm.set(missingWriteObject, 'guarded', 4);
+  await vm.source('missingWriteObject.guarded = 5;', 'missing-write-setter');
+  check('existing properties still invoke their setters', await vm.get(missingWriteObject, 'stored') === 5);
+  await vm.set(missingWriteObject, 'created', 6);
+  check('write re-finds members created by missing', await vm.get(missingWriteObject, 'created') === 6 && await vm.get(missingWriteObject, 'calls') === 1);
+  vm.deleteMember(missingWriteObject, 'created');
+  await vm.source('missingWriteObject.created = 7;', 'missing-write-direct-create');
+  check('direct write re-finds members created by missing', await vm.get(missingWriteObject, 'created') === 7 && await vm.get(missingWriteObject, 'calls') === 2);
+} finally { await vm.dispose(missingWriteObject); }
 
 let rawReadCalls = 0;
 vm.registerGlobal('rawReadProbe', async () => {
