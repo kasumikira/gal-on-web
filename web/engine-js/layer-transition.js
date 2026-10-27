@@ -23,8 +23,8 @@ export function createLayerTransitions(document, {
   // completed layer tree, not just the node's main image. With children the
   // subtree is flattened; without children only the node's main image is used
   // (LayerIntf.cpp 7925 passes GetWidth() or MainImage->GetWidth() accordingly).
-  function renderTreeImage(node, withchildren, result = null) {
-    const image = node.image;
+  function renderTreeImage(node, withchildren, result = null, ignoreRootTransition = false) {
+    const image = (!ignoreRootTransition && node.transition?.frame) || node.image;
     if (!withchildren) return image ? image.clone() : null;
     const gpu = getGPU();
     const width = node.width, height = node.height;
@@ -42,10 +42,12 @@ export function createLayerTransitions(document, {
       const bottom = Math.min(parentClip.bottom, offsetY + current.top + current.height);
       if (left >= right || top >= bottom) return;
       const opacity = current === node ? 255 : parentOpacity * current.opacity / 255;
-      const img = current.image;
+      const transition = current === node && ignoreRootTransition ? null : current.transition;
+      const img = transition?.frame ?? current.image;
       if (img && img.width && img.height) {
         commands.push({ source: img, options: {
-          matrix: [1, 0, 0, 1, offsetX + current.left + current.imageLeft, offsetY + current.top + current.imageTop],
+          matrix: [1, 0, 0, 1, offsetX + current.left + (transition?.withchildren ? 0 : current.imageLeft),
+            offsetY + current.top + (transition?.withchildren ? 0 : current.imageTop)],
           clip: { left, top, right, bottom },
           mode: 0,
           motion: true,
@@ -53,6 +55,7 @@ export function createLayerTransitions(document, {
           opaque: current.type === ltOpaque,
         } });
       }
+      if (transition?.withchildren) return;
       for (const child of current.children) {
         if (!child.visible) continue;
         paint(child, offsetX + current.left, offsetY + current.top, opacity, { left, top, right, bottom });
@@ -76,24 +79,28 @@ export function createLayerTransitions(document, {
     if (id === undefined) nodeIds.set(node, id = nextNodeId++);
     return id;
   };
-  const snapshotStamp = node => {
+  const snapshotStamp = (node, ignoreRootTransition = false) => {
     let stamp = node.imageRevision >>> 0;
     for (const value of [node.left, node.top, node.width, node.height, node.opacity, node.type, node.imageLeft, node.imageTop]) {
       stamp = (stamp * 31 + (value | 0)) >>> 0;
     }
     stamp = (stamp * 31 + (node.visible ? 1 : 0)) >>> 0;
+    const transition = ignoreRootTransition ? null : node.transition;
+    if (transition) stamp = (stamp * 31 + nodeId(transition) * 31 + transition.revision) >>> 0;
     for (const child of node.children) stamp = (stamp * 31 + snapshotStamp(child) * 31 + nodeId(child)) >>> 0;
     return stamp;
   };
   const snapshots = new WeakMap();
   function transitionSource(node, withchildren) {
     if (!withchildren) return node.image ?? null;
-    const stamp = snapshotStamp(node);
+    const stamp = snapshotStamp(node, true);
     const cached = snapshots.get(node);
     if (cached && cached.stamp === stamp && !hasExternallyWritableImage(node, true)) return cached.image;
     // LayerIntf.cpp reuses CacheBitmap for completion. Repaint that storage
     // instead of allocating a full-sized GPU target on every revision.
-    const image = renderTreeImage(node, withchildren, cached?.image);
+    // Build this transition's inputs from its underlying tree, while keeping
+    // any child transitions visible, just as Complete() does for PiledCopy.
+    const image = renderTreeImage(node, withchildren, cached?.image, true);
     snapshots.set(node, { stamp, image });
     return image;
   }
@@ -184,7 +191,10 @@ export function createLayerTransitions(document, {
     let visible = true;
     for (let walk = node; walk; walk = walk.parent) if (!walk.visible) { visible = false; break; }
     if (!visible) { await stopTransition.call(owner); return; }
-    const phase = Math.min(t.effect.maxPhase, Math.trunc((tick - t.start) * t.effect.maxPhase / t.time));
+    // The reference handlers clamp progress into [0, maxPhase]; a callback
+    // returning a time before the transition start must not push a negative
+    // phase into effect.render (and would skip the phase===0 src1 frame).
+    const phase = Math.max(0, Math.min(t.effect.maxPhase, Math.trunc((tick - t.start) * t.effect.maxPhase / t.time)));
     const src1 = transitionSource(node, t.withchildren);
     const src2 = transitionSource(t.src, t.withchildren);
     const src1Revision = transitionSourceRevision(node, t.withchildren);

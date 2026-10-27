@@ -3,6 +3,7 @@
 // constructed first and these bindings can replace its capability stubs.
 import { NativeProperty, nativeEvent, script, nativeOwner } from '#krkr/native';
 import { number, truth } from '#krkr/values';
+import { focusNeighbor } from './layer-tree.js';
 import { findLayerAt } from './layer-composite.js';
 
 const ownerOf = nativeOwner;
@@ -60,12 +61,10 @@ export function installLayerInput(Layer, {
   }
   async function notifyEnabledState(root) {
     if (!root) return;
-    for (const node of allNodes(root)) {
-      const enabled = nodeEnabled(node);
-      if (node.enabledWork !== enabled) {
-        await invokeMember(node.owner, enabled ? 'onNodeEnabled' : 'onNodeDisabled', []);
-      }
-    }
+    const changed = allNodes(root).map(node => [node, nodeEnabled(node)])
+      .filter(([node, enabled]) => node.enabledWork !== enabled);
+    for (const [node, enabled] of changed)
+      await invokeMember(node.owner, enabled ? 'onNodeEnabled' : 'onNodeDisabled', []);
   }
   function firstFocusable(root, ignoreJoin = false) {
     if (!root) return null;
@@ -76,18 +75,7 @@ export function installLayerInput(Layer, {
     }
     return null;
   }
-  function neighbor(node, direction) {
-    const nodes = allNodes(rootOf(node));
-    let index = nodes.indexOf(node);
-    if (index < 0 || nodes.length < 2) return null;
-    const step = direction < 0 ? -1 : 1;
-    for (let count = 0; count < nodes.length - 1; count++) {
-      index = (index + step + nodes.length) % nodes.length;
-      const candidate = nodes[index];
-      if (nodeFocusable(candidate) && candidate.joinFocusChain !== false) return candidate;
-    }
-    return null;
-  }
+  function neighbor(node, direction) { return focusNeighbor(node, direction); }
 
   async function searchFocusable(node, direction) {
     const candidate = neighbor(node, direction);

@@ -1,5 +1,5 @@
-import { nativeClass, nativeMethod, nativeProperty, createNativeInstance, nativeOwner, constructNative } from '#krkr/native';
-import { number, truth, Closure } from '#krkr/values';
+import { nativeClass, nativeMethod, nativeProperty, constructNative, registerFontFields } from '#krkr/native';
+import { number, truth } from '#krkr/values';
 import { Image, colorBytes } from './bitmap.js';
 import { getGPU, QUAD_VERTEX } from './gpu.js';
 import { blurGlyphGPU } from './gpu-glyph-blur.js';
@@ -128,20 +128,6 @@ export class FontState {
 // Text measurement/drawing through the browser canvas 2D context. The native
 // engine rasterizes via FreeType; the browser font stack replaces it (platform
 // boundary), with the same API surface and extents in pixels.
-let LayerFontClass = null;
-let LayerNativeClass = null;
-
-export function attachFontClass(fontClass, layerClass) {
-  LayerFontClass = fontClass;
-  LayerNativeClass = layerClass;
-}
-
-export function createFontInstance(layerNode, owner) {
-  // TVPCreateFontObject: a Font native instance bound to a layer node.
-  if (!LayerFontClass) throw new Error('TJS Font class is not registered');
-  return createNativeInstance(LayerFontClass, { layer: layerNode }, owner);
-}
-
 const PRERENDERED_HEADER = new TextEncoder().encode('TVP pre-rendered font\x1a');
 const read16 = (bytes, offset) => bytes[offset] | bytes[offset + 1] << 8;
 const read32 = (bytes, offset) => (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
@@ -552,7 +538,7 @@ async function storageBytes(storage, name) {
   return null;
 }
 
-export function createFontClass(document, { storage, Rect } = {}) {
+export function createFontClass(document, { storage, Rect, Layer } = {}) {
   let rasterizer = 0;
   const browserDefaultFace = () => {
     const faces = document?.fonts ? Array.from(document.fonts).map(font => String(font.family || '')).filter(Boolean) : [];
@@ -584,8 +570,7 @@ export function createFontClass(document, { storage, Rect } = {}) {
     @nativeMethod Font(layer) {
       const state = this;
       if (layer !== undefined && layer !== null) {
-        if (!LayerNativeClass) throw new Error('TJS Layer class is not registered');
-        state.layer = LayerNativeClass.state(nativeOwner(layer)).node;
+        state.layer = Layer.state(layer).node;
       }
     }
     @nativeMethod getTextWidth(...args) {
@@ -602,13 +587,13 @@ export function createFontClass(document, { storage, Rect } = {}) {
 
     @nativeProperty get height() { return fontOf(this).height; }
     @nativeProperty set height(value) {
-      let next = Math.trunc(number(value));
+      let next = Math.trunc(number(value)) | 0;
       if (next < 0) next = -next;
       fontOf(this).height = next;
     }
     @nativeProperty get angle() { return fontOf(this).angle; }
     @nativeProperty set angle(value) {
-      let next = Math.trunc(number(value));
+      let next = Math.trunc(number(value)) | 0;
       next %= 3600; if (next < 0) next += 3600;
       fontOf(this).angle = next;
     }
@@ -687,6 +672,7 @@ export function createFontClass(document, { storage, Rect } = {}) {
     @nativeProperty get defaultFaceName() { return defaultFaceName; }
     @nativeProperty set defaultFaceName(value) {}
   }
+  registerFontFields(Font);
   return Font;
 }
 

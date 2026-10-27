@@ -17,9 +17,14 @@ globalThis.registerProcessor = (name, processor) => { registered = { name, proce
 
 await import('../../engine-js/phase-vocoder-worklet.js');
 assert.equal(registered.name, 'krkr-wave');
+function createProcessor({ processorOptions: options }) {
+  const processor = new registered.processor();
+  processor.port.onmessage({ data: { type: 'load', channels: options.channels, options } });
+  return processor;
+}
 
 const channels = [Float32Array.from({ length: 300 }, (_, index) => index / 300)];
-const processor = new registered.processor({
+const processor = createProcessor({
   processorOptions: {
     channels,
     sampleRate: 1000,
@@ -50,7 +55,7 @@ assert.equal(paused[0][0], 0);
 processor.port.onmessage({ data: { type: 'start' } });
 assert.equal(processor.process([], [[new Float32Array(128)]]), true);
 
-const finite = new registered.processor({
+const finite = createProcessor({
   processorOptions: {
     channels, sampleRate: 1000, position: 0, looping: false,
     links: [], labels: [], flags: [], frequency: 1000, paused: false, filters: [],
@@ -58,6 +63,22 @@ const finite = new registered.processor({
 });
 for (let index = 0; index < 4; index++) finite.process([], [[new Float32Array(128)]]);
 assert.ok(finite.port.messages.some(message => message.type === 'ended'));
+const heldPCM = finite.channels;
+finite.port.onmessage({ data: { type: 'restart', options: {
+  sampleRate: 1000, position: 10, looping: false, links: [], labels: [],
+  flags: [], frequency: 1000, paused: false, filters: [], generation: 2,
+} } });
+const restarted = [new Float32Array(128)];
+finite.process([], [restarted]);
+assert.equal(finite.channels, heldPCM, 'restart keeps transferred PCM');
+assert.equal(restarted[0][0], channels[0][10], 'restart resets the source cursor');
+assert.equal(finite.port.messages.at(-1).generation, 2);
+finite.port.onmessage({ data: { type: 'stop' } });
+finite.process([], [restarted]);
+assert.ok(restarted[0].every(value => value === 0), 'stopped transport is silent');
+finite.port.onmessage({ data: { type: 'dispose' } });
+assert.equal(finite.channels, null, 'dispose drops transferred PCM');
+assert.equal(finite.process([], [restarted]), false, 'disposed processor stops running');
 
 // PhaseVocoder chain: the transport feeds the filter, which produces the
 // output block; this catches worklet-side chain wiring errors.
@@ -65,7 +86,7 @@ const longChannels = [
   Float32Array.from({ length: 16384 }, (_, index) => Math.sin(index / 20)),
   Float32Array.from({ length: 16384 }, (_, index) => Math.cos(index / 20)),
 ];
-const filtered = new registered.processor({
+const filtered = createProcessor({
   processorOptions: {
     channels: longChannels, sampleRate: 48000, position: 0, looping: false,
     links: [], labels: [], flags: [], frequency: 48000, paused: false,

@@ -7,9 +7,9 @@
   },
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:go\" \"pnpm dev:vite\"",
-    "dev:go": "go run ./cmd/galweb",
+    "dev:go": "go run ./cmd/galweb -addr 127.0.0.1:8081",
     "build:go": "pnpm build:js && go build -ldflags=\"-s -w\" -o galweb.exe ./cmd/galweb",
-    "dev:vite": "vite --host 127.0.0.1 --port 5173",
+    "dev:vite": "vite --host 0.0.0.0 --port 5173",
     "build:js": "vite build",
     "engine:inventory": "node tools/engine-inventory.mjs",
     "build:vm": "node native/kirikiri/build.mjs",

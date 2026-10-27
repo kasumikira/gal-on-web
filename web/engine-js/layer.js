@@ -1,8 +1,8 @@
 // tTJSNI_BaseLayer / tTJSNC_Layer (LayerIntf.cpp): layer state and TJS bindings.
-import { nativeClass, nativeMethod, nativeProperty, nativeMembers, nativeGlobals, nativeConstructor, nativeOwner, nativeDictionary, callScript, retainScriptValue, disposeScriptValue, invalidateScriptValue, attachLayerFields, registerLayerFields } from '#krkr/native';
+import { nativeClass, nativeMethod, nativeProperty, nativeMembers, nativeGlobals, nativeConstructor, nativeOwner, nativeDictionary, callScript, retainScriptValue, disposeScriptValue, registerLayerFields, registerLayerMethods, nativeLayerFont } from '#krkr/native';
 import { Image, toActualColor, clamp255, copy9Patch, flipImage } from './bitmap.js';
-import { FontState, createFontInstance, attachFontClass, createTextRenderer } from './font.js';
-import { setAbsoluteOrderMode, joinLayer, setLayerOrder, isAncestorOrSelf, isNodeEnabled } from './layer-tree.js';
+import { FontState, createTextRenderer } from './font.js';
+import { setAbsoluteOrderMode, joinLayer, setLayerOrder, detachLayerTree, isAncestorOrSelf, isNodeEnabled, layerOffset } from './layer-tree.js';
 import { createLayerTransitions } from './layer-transition.js';
 import { createLayerDrawing } from './layer-drawing.js';
 import { installLayerInput } from './layer-input.js';
@@ -38,6 +38,8 @@ class Node {
     this.owner = owner;
     this.parent = null;
     this.children = [];
+    this.orderIndex = 0;
+    this.manager = null;
     this.visible = false;
     this.opacity = 255;
     this.left = 0;
@@ -70,7 +72,6 @@ class Node {
     this.joinFocusChain = true;
     this.focusWork = null;
     this.absoluteOrderMode = false;
-    this.orderIndex = 0;
     this.absoluteOrderIndex = 0;
     this.transition = null;
     this.window = null;
@@ -332,6 +333,7 @@ export function createLayerClass(document, {
         }
       }
       // ActionOwner = param[0] (the layer itself in the native form).
+      node.manager ??= {};
       node.actionOwner = retainScriptValue(windowOrOwner, this);
       node.vmGlobal = nativeGlobals(this);
     }
@@ -654,9 +656,7 @@ export function createLayerClass(document, {
       const srcNode = Layer.state(srcOwner) ? instanceOf(srcOwner) : null;
       if (!node.parent || !srcNode) throw new Error('TJS cannot move primary or siblingless layer');
       if (srcNode === node || srcNode.parent !== node.parent) throw new Error('TJS cannot move next to self or non-sibling layer');
-      const siblings = node.parent.children;
-      const from = siblings.indexOf(node),
-        to = siblings.indexOf(srcNode);
+      const from = node.orderIndex, to = srcNode.orderIndex;
       setLayerOrder(node, from < to ? to : to + 1);
       updateTree(node);
     }
@@ -667,9 +667,7 @@ export function createLayerClass(document, {
       const srcNode = Layer.state(srcOwner) ? instanceOf(srcOwner) : null;
       if (!node.parent || !srcNode) throw new Error('TJS cannot move primary or siblingless layer');
       if (srcNode === node || srcNode.parent !== node.parent) throw new Error('TJS cannot move next to self or non-sibling layer');
-      const siblings = node.parent.children;
-      const from = siblings.indexOf(node),
-        to = siblings.indexOf(srcNode);
+      const from = node.orderIndex, to = srcNode.orderIndex;
       setLayerOrder(node, from < to ? to - 1 : to);
       updateTree(node);
     }
@@ -777,27 +775,24 @@ export function createLayerClass(document, {
     set parent(value) {
       const node = this.node;
       const parentOwner = nativeOwner(value);
-      if (node.parent) node.parent.children = node.parent.children.filter(c => c !== node);
       if (parentOwner && Layer.state(parentOwner)) {
         const parentNode = instanceOf(parentOwner);
         joinLayer(node, parentNode);
-      } else node.parent = null;
+      } else joinLayer(node, null);
       updateTree(node);
     }
     @nativeProperty
     get children() {
       const node = this.node;
       const result = [];
-      // Children are enumerated back to front (native GetChildrenArrayObject
-      // lists in reverse Z order: index 0 is the frontmost).
-      for (const child of [...node.children].reverse()) result.push(child.owner);
+      for (const child of node.children) result.push(child.owner);
       return result;
     }
     @nativeProperty
     get order() {
       const node = this.node;
       if (!node.parent) throw new Error('TJS primary layer has no order');
-      return node.parent.children.indexOf(node);
+      return node.orderIndex;
     }
     @nativeProperty
     set order(value) {
@@ -810,7 +805,7 @@ export function createLayerClass(document, {
     get absolute() {
       const node = this.node;
       if (!node.parent) return 0;
-      return node.parent.absoluteOrderMode ? node.absoluteOrderIndex : node.parent.children.indexOf(node);
+      return node.parent.absoluteOrderMode ? node.absoluteOrderIndex : node.orderIndex;
     }
     @nativeProperty
     set absolute(value) {
@@ -851,7 +846,9 @@ export function createLayerClass(document, {
     }
     @nativeProperty
     set opacity(value) {
-      this.node.opacity = Math.max(0, Math.min(255, Math.trunc(number(value))));
+      const opacity = Math.max(0, Math.min(255, Math.trunc(number(value))));
+      if (this.node.isPrimary && opacity !== 255) throw new Error('TJS cannot set primary layer invisible');
+      this.node.opacity = opacity;
       updateTree(this.node);
     }
     @nativeProperty
@@ -966,7 +963,7 @@ export function createLayerClass(document, {
     }
     @nativeProperty
     set holdAlpha(value) {
-      this.node.holdAlpha = Math.trunc(number(value));
+      this.node.holdAlpha = Math.trunc(number(value)) !== 0;
     }
     @nativeProperty
     get clipLeft() {
@@ -1040,11 +1037,13 @@ export function createLayerClass(document, {
     }
     @nativeProperty
     get cursorX() {
-      return this.node.cursorX;
+      const node = this.node;
+      return node.window ? (node.window.mousePosition?.x ?? 0) - layerOffset(node).x : 0;
     }
     @nativeProperty
     get cursorY() {
-      return this.node.cursorY;
+      const node = this.node;
+      return node.window ? (node.window.mousePosition?.y ?? 0) - layerOffset(node).y : 0;
     }
     @nativeProperty
     get hint() {
@@ -1099,7 +1098,7 @@ export function createLayerClass(document, {
     get font() {
       const node = this.node;
       // TVPCreateFontObject: a Font native instance bound to this layer.
-      return node.fontObject ??= createFontInstance(node, this);
+      return nativeLayerFont(this);
     }
     @nativeProperty
     get name() {
@@ -1198,20 +1197,14 @@ export function createLayerClass(document, {
     // LayerManager::NotifyPart clears input references before severing the tree.
     await Layer.input.blurTree(node, node);
     node.window?.releaseCaptureFromTree?.(node);
-    if (node.parent) node.parent.children = node.parent.children.filter(child => child !== node);
-    node.parent = null;
-    for (const child of node.children) child.parent = null;
-    node.children.length = 0;
+    detachLayerTree(node);
     if (node.window) {
       if (node.window.primaryLayer === node) node.window.primaryLayer = null;
       if (node.window.focusedLayer === node) node.window.focusedLayer = null;
       node.window.modalLayers = node.window.modalLayers.filter(modal => modal !== node && !isAncestorOrSelf(node, modal));
       node.window.layers = node.window.layers.filter(layer => layer !== owner);
     }
-    if (node.fontObject) {
-      try { await invalidateScriptValue(node.fontObject); }
-      finally { await disposeScriptValue(node.fontObject); node.fontObject = null; }
-    }
+    await nativeLayerFont(owner, true);
     if (node.actionOwner) await disposeScriptValue(node.actionOwner);
     node.image = node.province = null;
     node.actionOwner = null;
@@ -1249,9 +1242,6 @@ export function createLayerClass(document, {
       return null;
     }
   };
-  // The VM registers the Font class here so layer.font can create instances.
-  Layer.attachFontClass = attachFontClass;
-  Layer.createFontInstance = createFontInstance;
   const drawing = createLayerDrawing({
     getLayer: () => Layer,
     Bitmap,
@@ -1279,6 +1269,7 @@ export function createLayerClass(document, {
     bitmapClass: Bitmap
   });
   registerLayerFields(Layer);
-  Layer.attachState = state => attachLayerFields(state, state.node);
+  // Native adapters convert TJS coordinates before invoking the JS methods.
+  registerLayerMethods(Layer, { setPos: 0, setImagePos: 1 });
   return Layer;
 }

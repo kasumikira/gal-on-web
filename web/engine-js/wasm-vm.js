@@ -8,7 +8,6 @@ import {
   isNativeProperty,
   bindScriptReference,
   scriptBinding,
-  LAYER_FIELDS,
 } from "#krkr/native";
 
 // Classes the interpreter owns; host globals must not shadow them.
@@ -419,22 +418,9 @@ export class TJSInterop {
     const result = this.module._tjs_host_bind(this.runtime, this.storeHost(owner), id, this.host.identity(owner));
     if (!result) this.fail();
   }
-  attachLayerFields(owner, node) {
-    const reference = scriptBinding(owner).id;
-    const classId = this.classId(this.global.Layer);
-    for (const [field, name] of LAYER_FIELDS.entries()) {
-      const access = (write, value = 0) => {
-        const result = this.module._tjs_layer_field(this.runtime, reference, classId, field, write, value);
-        if (Number.isNaN(result)) this.fail();
-        return name === 'visible' ? Boolean(result) : result;
-      };
-      access(1, Number(node[name]));
-      Object.defineProperty(node, name, {
-        enumerable: true, configurable: true,
-        get: () => access(0),
-        set: value => { access(1, Number(value)); },
-      });
-    }
+  async layerFont(owner, invalidate) {
+    return this.withAsyncReference(owner, async id => this.decode(await this.module._tjs_layer_font(
+      this.runtime, id, this.classId(this.global.Layer), Number(invalidate))));
   }
   // Resolves the native class slot once per class and VM; every member call
   // reuses it instead of encoding the class name again.

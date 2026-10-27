@@ -393,13 +393,15 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
         if (state.touchCaptureReleaseMark === id) state.touchCaptureReleaseMark = -1;
       }
     };
-    const shiftOf = e => (e.shiftKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.ctrlKey ? 4 : 0);
+    const shiftOf = e => (e.shiftKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.ctrlKey ? 4 : 0)
+      | ((e.buttons & 1) ? 8 : 0) | ((e.buttons & 2) ? 16 : 0) | ((e.buttons & 4) ? 32 : 0);
+    const buttonOf = e => e.button === 1 ? 2 : e.button === 2 ? 1 : e.button;
     const coords = e => {
       const rect = state.canvas.getBoundingClientRect();
-      return [
-        Math.round((e.clientX - rect.left) * state.canvas.width / rect.width),
-        Math.round((e.clientY - rect.top) * state.canvas.height / rect.height),
-      ];
+      const x = Math.round((e.clientX - rect.left) * state.canvas.width / rect.width);
+      const y = Math.round((e.clientY - rect.top) * state.canvas.height / rect.height);
+      state.mousePosition = { x, y };
+      return [x, y];
     };
 
     const pointerEvent = (type, handler) => listen(state.canvas, type, e => {
@@ -422,13 +424,34 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
       while (hintNode.showParentHint !== false && hintNode.parent) hintNode = hintNode.parent;
       state.setHint?.(target.owner, hintNode.hint ?? '');
     };
-    const updateHover = async target => {
+    const updateHover = async (target, recheck) => {
       if (target !== capture.hover) {
         if (capture.hover) await deliver(capture.hover.owner, 'onMouseLeave', []);
-        capture.hover = target;
+        if (recheck) target = await recheck();
         if (target) await deliver(target.owner, 'onMouseEnter', []);
+        if (target && recheck) {
+          const next = await recheck();
+          if (target !== next) {
+            await deliver(target.owner, 'onMouseLeave', []);
+            target = next;
+            if (target) await deliver(target.owner, 'onMouseEnter', []);
+          }
+        }
+        capture.hover = target;
       }
       updateHint(target);
+      return target;
+    };
+    // PrimaryMouseMove also runs for down/up rechecks; those must not invent
+    // another window mouse-move event (WindowIntf.cpp dispatches it separately).
+    let lastMouseMoveX = null, lastMouseMoveY = null;
+    const primaryMouseMove = async (x, y, shift) => {
+      const posChanged = lastMouseMoveX !== x || lastMouseMoveY !== y;
+      lastMouseMoveX = x; lastMouseMoveY = y;
+      const targetAt = () => state.captureLayer ?? mostFront(state, x, y);
+      const target = await updateHover(await targetAt(), targetAt);
+      if (target && posChanged) await send(target, 'onMouseMove', [x, y, shift]);
+      return target;
     };
     state.releaseCaptureFromTree = root => {
       const inside = node => {
@@ -519,13 +542,19 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
         if (!e.isPrimary) return;
       }
       const [x, y] = coords(e);
-      const target = await mostFront(state, x, y);
+      await deliver(state.owner, 'onMouseDown', [x, y, buttonOf(e), shiftOf(e)]);
+      // PrimaryMouseDown (LayerManager.cpp:436) first runs PrimaryMouseMove so
+      // enter/leave and a changed-position move precede the down event.
+      await primaryMouseMove(x, y, shiftOf(e));
+      // An existing capture owner receives further button-downs; only a free
+      // cursor hit-tests anew (LayerManager.cpp:437-441).
+      const target = state.captureLayer ?? await mostFront(state, x, y);
       if (!target) { releaseCapture(); state.captureLayer = null; await updateHover(null); return; }
       await updateHover(target);
       capture.node = target;
       state.captureLayer = target;
       state.setHint?.(null, '');
-      await send(target, 'onMouseDown', [x, y, e.button, shiftOf(e)]);
+      await send(target, 'onMouseDown', [x, y, buttonOf(e), shiftOf(e)]);
     });
     pointerEvent('pointerup', async e => {
       if (e.pointerType === 'touch') {
@@ -533,19 +562,27 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
         if (!e.isPrimary) return;
       }
       const [x, y] = coords(e);
-      const target = capture.node ?? await mostFront(state, x, y);
+      // PrimaryClick (LayerManager.cpp:417-424) runs while the capture is
+      // still held: the hit at the release point must be the capture owner.
+      // The platform input queue orders OnClick before OnMouseUp
+      // (cocos2d MainScene.cpp:724-733), so click fires first here too.
+      if (e.button === 0) {
+        await deliver(state.owner, 'onClick', [x, y]);
+        const clickHit = await mostFront(state, x, y);
+        if (clickHit && state.captureLayer === clickHit) await send(clickHit, 'onClick', [x, y]);
+      }
+      await deliver(state.owner, 'onMouseUp', [x, y, buttonOf(e), shiftOf(e)]);
+      // A click may close/invalidate its layer before mouse-up is delivered.
+      const target = state.captureLayer ?? await mostFront(state, x, y);
       if (!target) return;
-      await send(target, 'onMouseUp', [x, y, e.button, shiftOf(e)]);
-      // PrimaryClick delivers only to the layer that received the down.
-      if (e.button === 0 && capture.node === target) await send(target, 'onClick', [x, y]);
+      await send(target, 'onMouseUp', [x, y, buttonOf(e), shiftOf(e)]);
       // PrimaryMouseUp releases capture once no button remains pressed, then
-      // rechecks the layer under the cursor.
+      // rechecks the layer under the cursor via PrimaryMouseMove
+      // (LayerManager.cpp:483-489).
       if (!(e.buttons & 0xff)) {
         releaseCapture();
         state.captureLayer = null;
-        const again = await mostFront(state, x, y);
-        await updateHover(again);
-        if (again) await send(again, 'onMouseMove', [x, y, shiftOf(e)]);
+        await primaryMouseMove(x, y, shiftOf(e));
       }
     });
     pointerEvent('pointermove', async e => {
@@ -554,9 +591,8 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
         if (!e.isPrimary) return;
       }
       const [x, y] = coords(e);
-      const target = capture.node ?? await mostFront(state, x, y);
-      await updateHover(target);
-      if (target) await send(target, 'onMouseMove', [x, y, shiftOf(e)]);
+      await deliver(state.owner, 'onMouseMove', [x, y, shiftOf(e)]);
+      await primaryMouseMove(x, y, shiftOf(e));
     });
     pointerEvent('pointercancel', async e => {
       if (e.pointerType === 'touch') {
@@ -572,17 +608,21 @@ export function attachCompositor(Window, Layer, document, { enqueueEvent }) {
         }
       }
     });
-    pointerEvent('pointerleave', async () => {
+    pointerEvent('pointerleave', async e => {
+      coords(e);
+      await deliver(state.owner, 'onMouseLeave', []);
       if (capture.hover) { await deliver(capture.hover.owner, 'onMouseLeave', []); capture.hover = null; }
       updateHint(null);
     });
     pointerEvent('dblclick', async e => {
       const [x, y] = coords(e);
-      const target = capture.node ?? await mostFront(state, x, y);
+      await deliver(state.owner, 'onDoubleClick', [x, y]);
+      const target = await mostFront(state, x, y);
       if (target) await send(target, 'onDoubleClick', [x, y]);
     });
     pointerEvent('wheel', async e => {
       const [x, y] = coords(e);
+      await deliver(state.owner, 'onMouseWheel', [shiftOf(e), e.deltaY, x, y]);
       const target = capture.node ?? await mostFront(state, x, y);
       // LayerIntf.cpp onMouseWheel: (shift, delta, x, y).
       if (target) await send(target, 'onMouseWheel', [shiftOf(e), e.deltaY, x, y]);

@@ -150,8 +150,7 @@ export async function createRuntime(options) {
     compositor.wire(state);
     return state;
   };
-  register('Font', createFontClass(document, { storage, Rect: global.Rect }));
-  Layer.attachFontClass(global.Font, Layer);
+  register('Font', createFontClass(document, { storage, Rect: global.Rect, Layer }));
   const timerScheduler = await createTimerScheduler({
     vm, enqueueEvent, isIdle: () => pendingEvents === 1, reportError: inform,
     laxTimer: config.arguments['-laxtimer'] === 'yes',

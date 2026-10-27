@@ -17,6 +17,7 @@ target_include_directories(tjs2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/core/common")
 add_executable(tjs-runtime runtime.cpp
     runtime-api.cpp
     runtime-host.cpp
+    runtime-layer.cpp
     core/plugin/PluginRegistry.cpp
     runtime-platform.cpp
     core/base/TextStream.cpp
@@ -53,6 +54,6 @@ target_link_options(tjs-runtime PRIVATE --no-entry -fwasm-exceptions -g2 --emit-
   "-sMODULARIZE=1" "-sEXPORT_ES6=1" "-sENVIRONMENT=node,web"
   "-sALLOW_MEMORY_GROWTH=1" "-sJSPI=1"
   "-sJSPI_IMPORTS=['host_call']"
-  "-sJSPI_EXPORTS=['tjs_execute_source','tjs_execute_bytecode','tjs_object_get','tjs_object_get_raw','tjs_object_set','tjs_object_call','tjs_object_clone','tjs_object_construct','tjs_object_invalidate','tjs_runtime_shutdown','tjs_runtime_destroy','tjs_value_release_async','tjs_runtime_collect','tjs_borrow_end','tjs_window_objects','tjs_plugins']"
+  "-sJSPI_EXPORTS=['tjs_execute_source','tjs_execute_bytecode','tjs_object_get','tjs_object_get_raw','tjs_object_set','tjs_object_call','tjs_object_clone','tjs_object_construct','tjs_object_invalidate','tjs_runtime_shutdown','tjs_runtime_destroy','tjs_value_release_async','tjs_runtime_collect','tjs_borrow_end','tjs_window_objects','tjs_plugins','tjs_layer_font']"
   "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['stringToUTF16','UTF16ToString','HEAPU8','HEAPU32']")

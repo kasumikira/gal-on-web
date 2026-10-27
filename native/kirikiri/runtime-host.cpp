@@ -1,15 +1,19 @@
 #include "MenuItemIntf.h"
 #include "runtime.h"
+#include "runtime-layer.h"
 #include "tjsNative.h"
 #include "tjsArray.h"
 #include "tjsDictionary.h"
 #include "tjsObject.h"
 #include <algorithm>
 #include <emscripten/emscripten.h>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <array>
 #include <memory>
 #include <limits>
+#include <cmath>
 
 // clang-format off
 // Dual-mode host entry under WebAssembly.Suspending: a non-thenable host
@@ -274,11 +278,9 @@ class HostInstance : public tTJSNativeInstance
     int owner = 0, initialize, stateHandle = 0, classId, reference = 0;
 
 public:
-    // Shared with the JS renderer through the Layer field API; no JS mirror.
-    // left, top, imageLeft, imageTop, opacity, visible.
-    std::unique_ptr<std::array<double, 6>> layer;
+    std::unique_ptr<NativeLayerState> layer;
     HostInstance(Runtime *r, int initialize, int classId, bool isLayer) : r(r), initialize(initialize ? host_retain(r, initialize) : 0), classId(classId) {
-        if (isLayer) layer = std::make_unique<std::array<double, 6>>(std::array<double, 6>{0, 0, 0, 0, 255, 0});
+        if (isLayer) layer = std::make_unique<NativeLayerState>(r);
         r->alive++;
     }
     void attach(iTJSDispatch2 *value, int state = 0)
@@ -287,6 +289,7 @@ public:
         stateHandle = state;
         r->attachOwner(value);
         reference = r->owners.at(value).reference;
+        if (layer) layer->owner = value;
         r->nativeInstances[classId][reference] = this;
     }
     int state() const { return stateHandle; }
@@ -328,6 +331,12 @@ public:
                 failure = std::current_exception();
             }
         }
+        if (layer) {
+            try { layer->invalidateFont(); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+            try { layer->childrenArray.Clear(); layer->childrenClear.Clear(); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+        }
         try
         {
             r->releaseOwnerValues(ownerObject);
@@ -352,35 +361,84 @@ public:
             std::rethrow_exception(failure);
     }
 };
-static double &layerField(Runtime *r, int reference, int classId, int field)
+static HostInstance *hostInstance(Runtime *r, int reference, int classId)
 {
     auto classes = r->nativeInstances.find(classId);
-    if (classes == r->nativeInstances.end()) throw std::runtime_error("Layer native instance not found");
+    if (classes == r->nativeInstances.end()) throw std::runtime_error("Layer/Font native instance not found");
     auto instance = classes->second.find(reference);
-    if (instance == classes->second.end() || !instance->second->state() || !instance->second->layer)
-        throw std::runtime_error("Layer native instance not found");
-    return instance->second->layer->at(field);
+    if (instance == classes->second.end()) instance = classes->second.find(r->ownerReference(reference));
+    if (instance == classes->second.end() || !instance->second->state())
+        throw std::runtime_error("Layer/Font native instance not found");
+    return instance->second;
 }
-
-// Keep the existing setter (including paint notification and primary-layer
-// checks), but a script property read no longer enters the host bridge.
-class LayerProperty : public HostProperty
-{
+static NativeLayerState &layerInstance(Runtime *r, int reference, int classId) {
+    auto *host = hostInstance(r, reference, classId);
+    if (!host->layer) throw std::runtime_error("Layer native instance not found");
+    return *host->layer;
+}
+// Script-facing adapters retain TJS conversion, while JS owns all state.
+class LayerProperty : public HostProperty {
     int classId, field;
 public:
     LayerProperty(Runtime *r, int callback, int classId, int field)
         : HostProperty(r, callback), classId(classId), field(field) {}
-    tjs_error PropGet(tjs_uint32, const tjs_char *name, tjs_uint32 *, tTJSVariant *result, iTJSDispatch2 *owner) override
-    {
+    tjs_error PropGet(tjs_uint32 flag, const tjs_char *name, tjs_uint32 *hint, tTJSVariant *result, iTJSDispatch2 *owner) override {
         if (name) return TJS_E_MEMBERNOTFOUND;
-        if (!owner) return TJS_E_NATIVECLASSCRASH;
+        if (field != lrFont && field != lrChildren)
+            return HostProperty::PropGet(flag, name, hint, result, owner);
         iTJSNativeInstance *instance = nullptr;
-        if (TJS_FAILED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classId, &instance)) || !instance)
+        if (!owner || TJS_FAILED(owner->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classId, &instance)) || !instance)
             return TJS_E_NATIVECLASSCRASH;
         auto *host = static_cast<HostInstance *>(instance);
         if (!host->state() || !host->layer) return TJS_E_NATIVECLASSCRASH;
-        if (result) *result = static_cast<tjs_int64>(host->layer->at(field));
+        iTJSDispatch2 *object;
+        if (field == lrFont) object = host->layer->getFont();
+        else {
+            tTJSVariant snapshot;
+            success(HostProperty::PropGet(flag, name, hint, &snapshot, owner));
+            object = host->layer->getChildren(snapshot);
+        }
+        if (result) *result = tTJSVariant(object, object);
         return TJS_S_OK;
+    }
+    tjs_error PropSet(tjs_uint32 flag, const tjs_char *name, tjs_uint32 *hint, const tTJSVariant *value, iTJSDispatch2 *owner) override {
+        if (name) return TJS_E_MEMBERNOTFOUND;
+        tTJSVariant converted;
+        switch (field) {
+            case lfLeft: case lfTop: case lfImageLeft: case lfImageTop:
+            case lfOpacity: case lfType: case lfFace: case lfDrawFace:
+            case lfHitType: case lfHitThreshold: case lfCursor:
+            case lrOrder: case lrAbsolute:
+                converted = tjs_int(value->AsInteger()); break;
+            case lfHoldAlpha: converted = tjs_int(tjs_int(value->AsInteger()) != 0); break;
+            default: return HostProperty::PropSet(flag, name, hint, value, owner);
+        }
+        return HostProperty::PropSet(flag, name, hint, &converted, owner);
+    }
+};
+class LayerMethod : public HostMethod {
+    int method;
+public:
+    LayerMethod(Runtime *r, int, int method, int callback) : HostMethod(r, callback), method(method) {}
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char *name, tjs_uint32 *hint, tTJSVariant *result, tjs_int count, tTJSVariant **args, iTJSDispatch2 *owner) override {
+        // SetPos resizes only for exactly four non-void parameters.
+        const int coordinates = method == 0 && count == 4 && args[2]->Type() != tvtVoid && args[3]->Type() != tvtVoid ? 4 : 2;
+        if (count < 2) return HostMethod::FuncCall(flag, name, hint, result, count, args, owner);
+        std::vector<tTJSVariant> values;
+        for (int i = 0; i < count; ++i) values.push_back(i < coordinates ? tTJSVariant(tjs_int(args[i]->AsInteger())) : *args[i]);
+        std::vector<tTJSVariant *> converted;
+        for (auto &value : values) converted.push_back(&value);
+        return HostMethod::FuncCall(flag, name, hint, result, count, converted.data(), owner);
+    }
+};
+class FontProperty : public HostProperty {
+    int field;
+public:
+    FontProperty(Runtime *r, int callback, int field) : HostProperty(r, callback), field(field) {}
+    tjs_error PropSet(tjs_uint32 flag, const tjs_char *name, tjs_uint32 *hint, const tTJSVariant *value, iTJSDispatch2 *owner) override {
+        if (field > 1) return HostProperty::PropSet(flag, name, hint, value, owner);
+        tTJSVariant converted(tjs_int(value->AsInteger()));
+        return HostProperty::PropSet(flag, name, hint, &converted, owner);
     }
 };
 
@@ -442,16 +500,12 @@ public:
 
 extern "C"
 {
-    EMSCRIPTEN_KEEPALIVE double tjs_layer_field(Runtime *r, int reference, int classId, int field, int write, double value)
-    {
-        double result = 0;
-        if (!checked(r, [&] {
-            auto &slot = layerField(r, reference, classId, field);
-            if (write) slot = value;
-            result = slot;
-            return 1;
-        })) return std::numeric_limits<double>::quiet_NaN();
-        return result;
+    EMSCRIPTEN_KEEPALIVE int tjs_layer_font(Runtime *r, int reference, int classId, int invalidate) {
+        return checked(r, [&] {
+            auto &layer = layerInstance(r, reference, classId);
+            if (invalidate) { layer.invalidateFont(); return r->keep(tTJSVariant()); }
+            auto *font = layer.getFont(); return r->keep(tTJSVariant(font, font));
+        });
     }
     // Class id for a name already registered by tjs_class_create. Lookup only:
     // registering here would turn a misspelled name into a silent empty class.
@@ -525,9 +579,16 @@ extern "C"
                        {
         auto *c=dynamic_cast<HostClass *>(r->value(id).AsObjectNoAddRef());
         if(!c)throw std::runtime_error("not a host class");
-        iTJSDispatch2 *m = property >= 2
-            ? static_cast<iTJSDispatch2 *>(new LayerProperty(r, callback, TJSFindNativeClassID(c->GetClassName().c_str()), property - 2))
+        // Layer/Font adapters handle script semantics, never rendering state.
+        const auto classId=TJSFindNativeClassID(c->GetClassName().c_str());
+        iTJSDispatch2 *m = property >= 300
+            ? static_cast<iTJSDispatch2 *>(new LayerMethod(r, classId, property - 300, callback))
+            : property >= 100
+            ? static_cast<iTJSDispatch2 *>(new FontProperty(r, callback, property - 100))
+            : property >= 2
+            ? static_cast<iTJSDispatch2 *>(new LayerProperty(r, callback, classId, property - 2))
             : property ? static_cast<iTJSDispatch2 *>(new HostProperty(r,callback)) : static_cast<iTJSDispatch2 *>(new HostMethod(r,callback));
-        c->RegisterNCM(name,m,c->GetClassName().c_str(),property?nitProperty:nitMethod);
+        const bool isProperty = property == 1 || (property >= 2 && property < 200);
+        c->RegisterNCM(name,m,c->GetClassName().c_str(),isProperty ? nitProperty : nitMethod);
         return r->keep(tTJSVariant()); });
     }}

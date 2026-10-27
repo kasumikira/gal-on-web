@@ -10,7 +10,7 @@ class FakeNode {
     this.options = options;
     this.port = {
       messages: [],
-      postMessage(message) { this.messages.push(message); },
+      postMessage(message, transfer) { this.messages.push(message); if (transfer) this.transfer = transfer; },
       onmessage: null,
     };
     if (name === 'krkr-wave') globalThis.lastWaveNode = this;
@@ -50,7 +50,7 @@ const context = {
   audioWorklet: { async addModule() {} },
   async resume() {},
   createGain() {
-    const node = { gain: { value: 0 }, connect() {}, disconnect() {} };
+    const node = { gain: { value: 0 }, disconnects: [], connect() {}, disconnect(...args) { this.disconnects.push(args); } };
     gains.push(node);
     return node;
   },
@@ -64,7 +64,7 @@ const context = {
   },
   createChannelSplitter() { return { connect() {}, disconnect() {} }; },
   createChannelMerger() { return { connect() {}, disconnect() {} }; },
-  createBufferSource() { return { connect() {}, disconnect() {}, start() {}, stop() {} }; },
+  createBufferSource() { return { playbackRate: { value: 1 }, connect() {}, disconnect() {}, start() {}, stop() {} }; },
   async decodeAudioData() { return audioBuffer; },
 };
 const storage = {
@@ -91,11 +91,11 @@ try {
   const { createWaveSoundBufferClass } = await server.ssrLoadModule('/engine-js/sound.js');
   const vm = await new TJSInterop().init(Object.create(null));
   const Wave = createWaveSoundBufferClass(storage, () => context, {
-    enqueueEvent: callback => Promise.resolve().then(callback),
+    enqueueEvent: callback => vm.enqueue(callback),
   });
   vm.registerGlobal('WaveSoundBuffer', Wave);
   vm.registerGlobal('PhaseVocoder', Wave.PhaseVocoder);
-  const run = source => vm.source(source, 'sound-worklet-check');
+  const run = source => vm.enqueue(() => vm.source(source, 'sound-worklet-check'));
 
   const metadata = await run(`
     var w = new WaveSoundBuffer();
@@ -108,10 +108,14 @@ try {
   await run('var w = new WaveSoundBuffer(); w.open("voice.wav"); w.play();');
   const node = globalThis.lastWaveNode;
   assert.equal(node.name, 'krkr-wave');
-  assert.equal(node.options.processorOptions.links[0].From, 24000);
-  assert.equal(node.options.processorOptions.links[0].To, 12000);
-  assert.equal(node.options.processorOptions.labels[0].Position, 12000);
-  assert.equal(node.options.processorOptions.position, 0);
+  const loaded = node.port.messages.find(message => message.type === 'load');
+  assert.equal(loaded.options.links[0].From, 24000);
+  assert.equal(loaded.options.links[0].To, 12000);
+  assert.equal(loaded.options.labels[0].Position, 12000);
+  assert.equal(loaded.options.position, 0);
+  assert.equal(node.options.processorOptions, undefined, 'PCM is not cloned in constructor options');
+  assert.deepEqual(node.port.transfer, loaded.channels.map(channel => channel.buffer));
+  assert.notEqual(loaded.channels[0].buffer, channels[0].buffer, 'AudioBuffer retains its own PCM');
 
   // pan uses the reference software mixer's linear left/right attenuation:
   // gains[0] is the volume node, gains[1] the stereo input, gains[2]/[3] the
@@ -140,9 +144,9 @@ try {
 
   // Position messages are decoded samples; the TJS property is milliseconds in
   // the source rate.
-  node.port.onmessage({ data: { type: 'position', value: 24000 } });
+  node.port.onmessage({ data: { type: 'position', value: 24000, generation: 1 } });
   assert.equal(await run('return w.position;'), 500);
-  node.port.onmessage({ data: { type: 'position', value: 48000 } });
+  node.port.onmessage({ data: { type: 'position', value: 48000, generation: 1 } });
   assert.equal(await run('return w.samplePosition;'), 44100);
 
   // Pause posts pause/start messages without tearing down the transport.
@@ -157,7 +161,7 @@ try {
   assert.equal(node.port.messages.at(-1).type, 'frequency');
 
   // Label expressions update flags from the worklet; script writes travel back.
-  node.port.onmessage({ data: { type: 'flags', values: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } });
+  node.port.onmessage({ data: { type: 'flags', generation: 1, values: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } });
   assert.equal(await run('return w.flags[0];'), 2);
   await run('w.flags[0] = 5;');
   assert.deepEqual(node.port.messages.at(-1), { type: 'flag', index: 0, value: 5 });
@@ -175,6 +179,21 @@ try {
     return [s.status, s.position];
   `);
   assert.deepEqual(seekResult, ['play', 250]);
+  const seekNode = globalThis.lastWaveNode;
+  assert.equal(seekNode.port.messages.filter(message => message.type === 'load').length, 1);
+  assert.equal(seekNode.port.messages.at(-1).type, 'restart', 'seek reuses PCM and worklet');
+  seekNode.port.onmessage({ data: { type: 'position', value: 48000, generation: 1 } });
+  assert.equal(await run('return s.position;'), 250, 'old playback messages cannot overwrite a restarted cursor');
+  await run('s.stop(); s.play();');
+  assert.equal(globalThis.lastWaveNode, seekNode, 'stop/play reuses the loaded worklet');
+  await run('s.finalize();');
+  assert.equal(seekNode.port.messages.at(-1).type, 'dispose', 'unload releases worklet PCM');
+  assert.equal(gains[0].disconnects.length, 0, 'starting/stopping another stream does not disconnect the playing stream');
+
+  files.set('plain.wav', wav);
+  await run('var plain = new WaveSoundBuffer(); plain.open("plain.wav"); plain.play();');
+  assert.equal(globalThis.lastWaveNode, seekNode, 'plain audio uses BufferSource without copying PCM into a worklet');
+  await run('plain.stop();');
 
   // Label messages dispatch through the owner's onLabel event hook.
   await run(`
@@ -186,7 +205,7 @@ try {
   `);
   await new Promise(resolve => setTimeout(resolve, 0));
   const labelNode = globalThis.lastWaveNode;
-  labelNode.port.onmessage({ data: { type: 'label', name: 'tick' } });
+  labelNode.port.onmessage({ data: { type: 'label', name: 'tick', generation: 1 } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(await run('return labelEvents;'), ['tick']);
   await run('lw.stop();');
@@ -201,7 +220,7 @@ try {
     return fw.filters.count;
   `);
   assert.equal(filterCount, 1);
-  assert.equal(globalThis.lastWaveNode.options.processorOptions.filters.length, 1);
+  assert.equal(globalThis.lastWaveNode.port.messages[0].options.filters.length, 1);
   await run('fw.stop();');
 
   // Invalid loop information fails open and leaves the buffer unloaded.
@@ -224,6 +243,7 @@ try {
   assert.equal(await run('return w.position;'), 0);
 
   console.log('sound-worklet-check passed');
+  await vm.enqueue(() => {});
   await vm.dispose();
 } finally {
   await server.close();

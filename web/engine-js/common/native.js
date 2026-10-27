@@ -32,6 +32,10 @@ export function unimplemented(name, source) {
 export class NativeProperty {
   constructor(getter, setter) { this.getter = getter; this.setter = setter; }
 }
+// A native parameter adapter delegates business logic to its JS member.
+class NativeMember {
+  constructor(code, fallback) { this.code = code; this.fallback = fallback; }
+}
 export const createNativeProperty = (getter, setter) =>
   new NativeProperty(getter, setter);
 export const readNativeProperty = (member, owner) => {
@@ -103,14 +107,38 @@ export function windowObjects(window, value, operation) {
   return bindingOf(window).vm.windowObjects(nativeReference(window), value, operation);
 }
 
-// Layer scalar storage lives in native. Node accessors and TJS properties use
-// the same fields; this is not a cache of script properties or ownership.
-export const LAYER_FIELDS = ['left', 'top', 'imageLeft', 'imageTop', 'opacity', 'visible'];
+// Layer fields identify script parameter adapters; all business state is JS.
+// Entries are [name, isBoolean] pairs whose order is
+// the C++ field index space (NativeLayerField in runtime-layer.h).
+export const LAYER_FIELDS = [
+  ['left'], ['top'], ['imageLeft'], ['imageTop'], ['opacity'],
+  ['visible', true], ['enabled', true], ['absoluteOrderMode', true], ['absoluteOrderIndex'], ['isPrimary', true],
+  ['type'], ['displayType'], ['face'], ['drawFace'], ['holdAlpha', true],
+  ['hitType'], ['hitThreshold'], ['attentionLeft'], ['attentionTop'], ['useAttention', true],
+  ['focusable', true], ['joinFocusChain', true], ['imeMode'], ['cursor'], ['cursorX'], ['cursorY'],
+];
+// Derived members follow the scalar block; their index is the C++ relation enum.
+const LAYER_RELATIONS = ['parent', 'children', 'order', 'absolute', 'nodeVisible', 'nodeEnabled', 'font'];
 export function registerLayerFields(klass) {
-  for (const [field, name] of LAYER_FIELDS.entries()) klass.members.get(name).layerField = field;
+  const names = [...LAYER_FIELDS.map(([name]) => name), ...LAYER_RELATIONS];
+  for (const [field, name] of names.entries()) {
+    const property = klass.members.get(name);
+    // nodeEnabled has no native form: it also asks the window's modal state.
+    if (property && name !== 'nodeEnabled') property.layerField = field;
+  }
 }
-export function attachLayerFields(owner, node) {
-  return bindingOf(owner).vm.attachLayerFields(owner, node);
+// Coordinate methods retain TJS integer conversion before calling JS.
+export function registerLayerMethods(klass, methods) {
+  for (const [name, method] of Object.entries(methods)) {
+    klass.members.set(name, new NativeMember(300 + method, klass.members.get(name)));
+  }
+}
+export function registerFontFields(klass) {
+  for (const [field, name] of ['height', 'angle', 'bold', 'italic', 'strikeout', 'underline', 'face', 'faceIsFileName'].entries())
+    klass.members.get(name).fontField = field;
+}
+export function nativeLayerFont(owner, invalidate = false) {
+  return bindingOf(owner).vm.layerFont(owner, invalidate);
 }
 
 export function writeScript(object, name, value) {
@@ -301,6 +329,14 @@ function prepareClass(klass) {
 }
 
 function registerNativeMember(klass, name, member, interop, id, forceStatic = false) {
+  if (member instanceof NativeMember) {
+    const callback = member.fallback
+      ? interop.storeHost(({ receiver, args }) => member.fallback.apply(klass.state(receiver), args))
+      : 0;
+    interop.withString(name, pointer => interop.decode(
+      interop.module._tjs_class_register_member(interop.runtime, id, pointer, callback, member.code)));
+    return;
+  }
   const property = member instanceof NativeProperty;
   const isStatic = forceStatic || (property ? member.static : typeof member === 'function' && member[kNativeMember]?.static);
   if (isStatic) {
@@ -319,7 +355,8 @@ function registerNativeMember(klass, name, member, interop, id, forceStatic = fa
     );
     interop.withString(name, pointer => interop.decode(
       interop.module._tjs_class_register_member(interop.runtime, id, pointer, callback,
-        property && member.layerField !== undefined ? 2 + member.layerField : Number(property)),
+        property && member.layerField !== undefined ? 2 + member.layerField
+          : property && member.fontField !== undefined ? 100 + member.fontField : Number(property)),
     ));
   } else interop.setEncoded(id, name, member);
 }

@@ -1,4 +1,4 @@
-import { NativeProperty, nativeClass, nativeMethod, nativeMembers, retainScriptValue, disposeScriptValue, unimplemented, reportUnimplemented } from '#krkr/native';
+import { NativeProperty, nativeClass, nativeMethod, nativeMembers, nativeOwner, retainScriptValue, disposeScriptValue, unimplemented, reportUnimplemented, callScript } from '#krkr/native';
 import { Closure, truth, number, integer } from '#krkr/values';
 import { MotionResourceManager } from './motion-resource.js';
 import { decodeSource } from '../codecs/psb.js';
@@ -343,19 +343,19 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     // PlayerFrameProgress.cpp progressCompatMethod: ms -> frames, then advance.
     progress(delta) {
       const state = this;
-      progressFrames(state, (number(delta) * 60) / 1000);
-      return undefined;
+      return progressFrames(state, (number(delta) * 60) / 1000, nativeOwner(state));
     },
     stop() {
       const state = this;
-      state.allplaying = false; state.playing = false;
+      // PlayerTimeline.cpp 234: the reference body is a single allplaying store.
+      state.allplaying = false;
     },
-    // PlayerTimeline.cpp skipToSync.
+    // PlayerTimeline.cpp 30-73 skipToSync: the raw cursor jumps to the clamped
+    // total and the queue/first-frame gates reseed; no sync event is delivered.
     skipToSync() {
       const state = this;
       if (state.allplaying && state.loopTime < 0) {
-        state.frameTickCount = Math.max(0, Math.min(state.frameTickCount, state.lastTime));
-        state.syncWaiting = false;
+        setFrameCursorState(state, state.lastTime);
       }
     },
     setVariable(...args) {
@@ -417,16 +417,23 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
   class Player {
     static initialize() {
       return {
-        resourceManager: null, motionContext: null, nodes: [], loaded: null, motionName: '',
+        resourceManager: null, motionContext: null, nodes: [new MotionNodeState()], loaded: null, motionName: '',
         charaName: '', stealthChara: '', stealthMotion: '', motionKey: '', project: '',
-        allplaying: false, playing: false, loopTime: -1, lastTime: 0,
+        allplaying: false, loopTime: -1, lastTime: 0,
         frameTickCount: 0, speed: 1, syncActive: Number(defaultSyncActive), syncWaiting: false,
+        // Player.h 1391-1398 cursor machine state: clampedEvalTime drives the
+        // stream walks and updateLayers; queuing/firstFrame gate dt accumulation
+        // behind absolute reseeks (PlayerCore.cpp 700-710, Player.h 546-556).
+        clampedEvalTime: 0, queuing: true, firstFrame: false, motionCompleted: false,
+        // motion["tag"] layer event stream (advanceLayerEventStreamPhase_guess,
+        // PlayerFrameProgress.cpp 242-280): align/sync/action tags.
+        tagFrames: [], layerStream: { cursor: 0, curTime: 0, nextTime: 0 },
         completionType: 0, colorWeight: 0xffffffff, variables: new Map(),
         useD3D: 0, preview: 0, priorDraw: 0, meshDivisionRatio: 1, outsideFactor: 1.5,
         transformOrder: [...defaultTransformOrderGlobal], coordinate: 0,
         drawAffine: { m11: 1, m12: 0, m21: 0, m22: 1, m14: 0, m24: 0, nonIdentity: false },
         rootDelta: { x: 0, y: 0, flipX: false, flipY: false, angle: 0, zoomX: 1, zoomY: 1, slantX: 0, slantY: 0, opacity: 255, visible: true },
-        pendingActions: [], syncRequested: false, report, sourcePreparation: null,
+        pendingEvents: [], syncRequested: false, report, sourcePreparation: null,
       };
     }
   }
@@ -436,9 +443,12 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     return klass.state(owner)[key];
   }
 
-  // PlayerCore.cpp loadMotionResult_guess + playMotionImpl_guess: resolve
+  // PlayerCore.cpp loadMotionResult_guess + initNonEmoteMotion_guess: resolve
   // chara/motion through the manager, build the node tree, and reset the clock.
-  async function loadMotionImpl(owner, chara, motion) {
+  // PlayerCore.cpp 698-711: syncWaiting clears and playback enables before the
+  // tree build; a non-chain play resets the frame clock (cursor clamped against
+  // zero, evaluation time = min(0, lastTime)) and reseeds the first-frame gate.
+  async function loadMotionImpl(owner, chara, motion, playFlags = 0) {
     const state = Player.state(owner);
     const key = String(chara ?? state.charaName ?? '');
     const motionName = String(motion ?? state.motionName ?? '');
@@ -450,6 +460,8 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     state.charaName = key;
     state.motionName = motionName;
     state.motionContext = moduleKey;
+    state.syncWaiting = false;
+    state.allplaying = true;
     buildTree(state, motionNode, key);
     const gpu = getGPU();
     if (!gpu) throw new Error('Motion requires an initialized GPU renderer');
@@ -465,9 +477,12 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
       // Observe background rejection until draw awaits the original promise;
       // keep that rejected promise so the resource consumer receives the error.
     });
-    state.frameTickCount = 0;
-    state.allplaying = true;
-    state.playing = true;
+    if ((playFlags & FLAG_CHAIN) === 0) {
+      state.frameTickCount = 0;
+      state.clampedEvalTime = Math.min(0, state.lastTime);
+      state.queuing = true;
+    }
+    state.firstFrame = true;
     return true;
   }
   // Player::setChara (PlayerCore.cpp 417): an equal value is a no-op; otherwise
@@ -489,8 +504,7 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     if ((flags & (FLAG_FORCE | FLAG_ASCAN)) === 0 && state.motionName === requested) return;
     if ((flags & FLAG_FORCE) === 0 && (flags & FLAG_ASCAN) !== 0 && state.allplaying) return;
     const chara = (flags & FLAG_STEALTH) ? state.stealthChara : state.charaName;
-    await loadMotionImpl(owner, chara, requested);
-    state.pendingActions.length = 0;
+    await loadMotionImpl(owner, chara, requested, flags);
     // PlayFlagJoin rebuilds variable state from the incoming motion.
     if (flags & FLAG_JOIN) state.variables.clear();
     return true;
@@ -509,6 +523,11 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     state.loaded = motionNode;
     state.lastTime = getInt(motionNode, 'lastTime');
     state.loopTime = getInt(motionNode, 'loopTime', -1);
+    // PlayerCore.cpp 651-656: the tag stream (align/sync/action) and priority
+    // root content come straight off the motion definition. The priority root
+    // content stream is not ported (transform setters unused by these motions).
+    state.tagFrames = toArray(motionNode.get('tag'));
+    state.layerStream = { cursor: 0, curTime: 0, nextTime: 0 };
     // Variable-track labels are initialised after the tree (initVariables).
     state.variableLabels = toArray(motionNode.get('variable')).map(entry => ({
       label: getText(entry, 'label', ''), scope: getText(entry, 'scope', ''),
@@ -537,18 +556,229 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     return node;
   }
 
-  // PlayerFrameProgress.cpp frameProgress: advance the clock, seek every node,
-  // then update the transform tree.
-  function progressFrames(state, frameDt) {
-    if (!state.allplaying) return;
-    const delta = state.speed * frameDt;
-    let next = state.frameTickCount + delta;
-    const total = state.lastTime;
-    if (state.loopTime >= 0 && next >= total) next = state.loopTime;
-    else if (state.loopTime < 0 && next >= total) { next = total; state.allplaying = false; state.playing = false; }
-    state.frameTickCount = next;
-    seekAll(state, next);
+  // PlayerFrameProgress.cpp frameProgress (916-1228): advance the clock through
+  // the queue/first-frame gate machine, run the tag event stream, seek every
+  // node, then update the transform tree. progressFrames_guess (1293-1301) adds
+  // the unconditional updateLayers + dispatchPendingEvents tail.
+  function progressFrames(state, frameDt, owner) {
+    frameProgress(state, frameDt);
     updateLayers(state);
+    if (state.pendingEvents.length && owner != null) return dispatchPendingEvents(state, owner);
+  }
+  function frameProgress(state, frameDt) {
+    const delta = state.speed * frameDt;
+    // Entry clears the completion byte before any branch or return (929-932).
+    state.motionCompleted = false;
+    // Idle gate (985-993): without a first frame and without playback the
+    // cursor machine is not entered.
+    if (!state.firstFrame && !state.allplaying) return;
+    if (state.syncWaiting) return;
+    // One-shot absolute seed (1012-1054). The reverse-seek flag belongs to
+    // chain play, which this port does not drive.
+    if (state.firstFrame) {
+      state.firstFrame = false;
+      if (delta < 0 && state.frameTickCount === 0) {
+        state.clampedEvalTime = state.lastTime;
+        state.frameTickCount = state.lastTime;
+      }
+      reseek(state);
+      if (state.syncWaiting) return;
+      if (state.motionCompleted) return;
+    }
+    // The queue gate blocks raw dt accumulation (1056-1062); updateLayers
+    // releases it after applying the node tree (PlayerUpdateLayers.cpp 82).
+    if (!state.queuing) state.frameTickCount += delta;
+    const gate = state.queuing;
+    if (!gate) {
+      let clamped = state.frameTickCount;
+      if (clamped > state.lastTime) clamped = state.lastTime;
+      state.clampedEvalTime = clamped;
+    }
+    let dispatchDirectionStreams = false;
+    if (delta >= 0) {
+      const total = state.lastTime;
+      if (total <= state.frameTickCount) {
+        state.clampedEvalTime = total;
+        if (state.loopTime >= 0) {
+          // Forward wrap (1110-1137): full stream scan at the clamped end, an
+          // absolute reseek at loopTime, then the modulo-wrapped cursor gets a
+          // second scan from the loop target. The overshoot is preserved.
+          advanceStreams(state);
+          if (!state.syncWaiting && !state.motionCompleted) {
+            state.clampedEvalTime = state.loopTime;
+            reseek(state);
+            if (!state.syncWaiting && !state.motionCompleted) {
+              let wrappedTick = state.frameTickCount;
+              if (total > wrappedTick) {
+                state.clampedEvalTime = wrappedTick;
+              } else {
+                do { wrappedTick += state.loopTime - total; } while (total <= wrappedTick);
+                state.frameTickCount = wrappedTick;
+                state.clampedEvalTime = wrappedTick;
+              }
+              advanceStreams(state);
+            }
+          }
+        } else {
+          state.allplaying = false;
+          if (!gate) dispatchDirectionStreams = true;
+        }
+      } else if (!gate) {
+        dispatchDirectionStreams = true;
+      }
+    } else {
+      // Reverse rewind / wrap (1148-1188).
+      const cursor = state.frameTickCount, loopTime = state.loopTime;
+      if (cursor >= 0 && loopTime <= cursor) {
+        if (!gate) dispatchDirectionStreams = true;
+      } else if (loopTime < 0) {
+        state.clampedEvalTime = 0;
+        state.allplaying = false;
+        state.frameTickCount = 0;
+        if (!gate) dispatchDirectionStreams = true;
+      } else {
+        state.clampedEvalTime = loopTime;
+        rewindStreams(state);
+        if (!state.syncWaiting && !state.motionCompleted) {
+          state.clampedEvalTime = state.lastTime;
+          reseek(state);
+          if (!state.syncWaiting && !state.motionCompleted) {
+            let wrappedTick = state.frameTickCount;
+            if (loopTime <= wrappedTick) {
+              state.clampedEvalTime = wrappedTick;
+            } else {
+              do { wrappedTick = wrappedTick - loopTime + state.lastTime; } while (loopTime > wrappedTick);
+              state.frameTickCount = wrappedTick;
+              state.clampedEvalTime = wrappedTick;
+            }
+            rewindStreams(state);
+          }
+        }
+      }
+    }
+    if (dispatchDirectionStreams) {
+      if (delta >= 0) advanceStreams(state);
+      else rewindStreams(state);
+    }
+  }
+  // advanceTimelineStreams_guess (895-905): layer tag phase precedes the node
+  // walk at the same evaluation time, so sync snaps reach the node seek.
+  function advanceStreams(state) {
+    advanceLayerStream(state);
+    seekAll(state, state.clampedEvalTime);
+  }
+  function rewindStreams(state) {
+    rewindLayerStream(state);
+    seekAll(state, state.clampedEvalTime);
+  }
+  // reseekTimelineCursors (482-620): coarse tag scan with exact-time gate, then
+  // STEP 4 reseedNodeTimelineSlots — an absolute reposition per node that does
+  // NOT fire crossing actions; only an exact landing on a clip start fires its
+  // action once (PlayerUpdateLayerEval.cpp 982-987).
+  function reseek(state) {
+    reseekLayerStream(state);
+    const time = state.clampedEvalTime;
+    for (let i = 1; i < state.nodes.length; i++) {
+      const node = state.nodes[i];
+      initializeNode(node, time);
+      if (node.active.clipStartTime === time && (node.active.contentMask & 0x40000)) {
+        enqueueAction(state, node.layerName, node.active.actionValue);
+      }
+    }
+  }
+  function fireLayerTagFrame(state, frame) {
+    const content = frame ? frame.get('content') : undefined;
+    if (state.syncActive) {
+      if (truth(getValue(content, 'align'))) {
+        state.motionCompleted = true;
+        state.clampedEvalTime = state.layerStream.curTime;
+        state.frameTickCount = state.layerStream.curTime;
+      }
+      if (state.syncActive && truth(getValue(content, 'sync'))) {
+        state.syncWaiting = true;
+        state.clampedEvalTime = state.layerStream.curTime;
+        state.frameTickCount = state.layerStream.curTime;
+        state.pendingEvents.push({ type: 1 });
+      }
+    }
+    const action = getText(content, 'action');
+    if (action) state.pendingEvents.push({ type: 0, action });
+  }
+  // advanceLayerEventStreamPhase_guess (242-280).
+  function advanceLayerStream(state) {
+    const frames = state.tagFrames, count = frames.length, stream = state.layerStream;
+    if (count < 2) return;
+    const limit = count - 2;
+    while (stream.cursor < limit) {
+      if (state.clampedEvalTime < stream.nextTime) break;
+      stream.cursor++;
+      const frame = frames[stream.cursor];
+      stream.curTime = getNumber(frame, 'time');
+      stream.nextTime = getNumber(frames[stream.cursor + 1], 'time');
+      if (getInt(frame, 'type') !== 1) continue;
+      fireLayerTagFrame(state, frame);
+    }
+  }
+  // rewindLayerEventStreamPhase_guess (282-318).
+  function rewindLayerStream(state) {
+    const frames = state.tagFrames, count = frames.length, stream = state.layerStream;
+    if (!count) return;
+    if (stream.curTime <= state.clampedEvalTime) return;
+    do {
+      stream.cursor = (stream.cursor - 1 + count) % count;
+      const frame = frames[stream.cursor];
+      stream.curTime = getNumber(frame, 'time');
+      stream.nextTime = getNumber(frames[(stream.cursor + 1) % count], 'time');
+      if (getInt(frame, 'type') === 1) fireLayerTagFrame(state, frame);
+    } while (stream.curTime > state.clampedEvalTime);
+  }
+  // reseekTimelineCursors STEP 1 (482-560): coarse scan to the frame at or
+  // before the evaluation time, then fire the gate only on an exact type-1 hit.
+  function reseekLayerStream(state) {
+    const frames = state.tagFrames, count = frames.length, stream = state.layerStream;
+    if (count < 1) return;
+    let index = 0;
+    for (; index < count; index++) {
+      const frameTime = getNumber(frames[index], 'time');
+      const evaluationTime = state.clampedEvalTime;
+      if (frameTime <= evaluationTime) {
+        if (frameTime < evaluationTime) { index++; continue; }
+      } else {
+        index--;
+      }
+      break;
+    }
+    if (count < 2) { stream.cursor = 0; stream.curTime = getNumber(frames[0], 'time'); stream.nextTime = stream.curTime; return; }
+    stream.cursor = Math.min(index, count - 2);
+    const current = frames[stream.cursor];
+    stream.curTime = getNumber(current, 'time');
+    stream.nextTime = getNumber(frames[stream.cursor + 1], 'time');
+    if (stream.curTime === state.clampedEvalTime && getInt(current, 'type') === 1) {
+      fireLayerTagFrame(state, current);
+    }
+  }
+  // dispatchPendingEvents_guess (1241-1283): onAction(param1, action) and
+  // onSync() run directly against the Player object, and the queue is
+  // deliberately NOT consumed — later passes re-fire the accumulated records
+  // (pinned by tests/unit-tests/plugins/motionplayer-dll.cpp 25859-25864).
+  async function dispatchPendingEvents(state, owner) {
+    for (const event of state.pendingEvents) {
+      const result = await callScript(owner, event.type === 0 ? 'onAction' : 'onSync',
+        event.type === 0 ? [event.label, event.action] : []);
+      await disposeScriptValue(result);
+    }
+  }
+  // Player.h 546-556 setFrameCursorState_guess: cursor setters publish a
+  // queued, first-frame state so the next progress reseeks absolutely instead
+  // of accumulating dt on top of the target.
+  function setFrameCursorState(state, cursor) {
+    if (cursor < 0) cursor = 0;
+    state.frameTickCount = cursor;
+    let evaluation = cursor;
+    if (evaluation > state.lastTime) evaluation = state.lastTime;
+    state.clampedEvalTime = evaluation;
+    state.queuing = true;
+    state.firstFrame = true;
   }
   function seekAll(state, time) {
     for (let i = 1; i < state.nodes.length; i++) {
@@ -558,7 +788,9 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     }
   }
   function enqueueAction(state, label, action) {
-    state.pendingActions.push({ label, action });
+    // Node-level frame actions queue onAction(label, action)
+    // (PlayerUpdateLayerEval.cpp 836-845); tag actions queue onAction(void, action).
+    state.pendingEvents.push({ type: 0, label, action });
   }
   // updateLayersPhase2_MainLoop (PlayerUpdateLayerEval.cpp 1386). Each node's
   // accumulated state starts from its evaluated payload, is combined with the
@@ -583,7 +815,10 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
       while ((state.nodes[parentIndex].inheritFlags & 0x400000) !== 0) parentIndex = state.nodes[parentIndex].parentIndex;
       const effectiveParent = state.nodes[parentIndex];
       const dirty = node.accumulated.dirty || effectiveParent.accumulated.dirty;
-      evaluateTimeline(node, state.frameTickCount, dirty);
+      // updateLayers evaluates at the clamped evaluation time
+      // (PlayerUpdateLayers.cpp:20 `currentTime = _clampedEvalTime`), not the
+      // raw cursor — sync/align snaps and the queue gate live here.
+      evaluateTimeline(node, state.clampedEvalTime, dirty);
       if (node.active.done) {
         // A finished node copies the parent state (delta defaults are identity).
         node.accumulated = { ...effectiveParent.accumulated, dirty: !!effectiveParent.accumulated.dirty };
@@ -610,6 +845,9 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
       node.matrix = localMatrix(a.flipX, a.flipY, a.angle, a.scaleX, a.scaleY, a.slantX, a.slantY, node.transformOrder);
       a.dirty = false;
     }
+    // PlayerUpdateLayers.cpp 82: the queue gate releases only after a complete
+    // node-tree pass, so the next progress may accumulate dt again.
+    state.queuing = false;
   }
   function calcBounds(state) {
     let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
@@ -765,13 +1003,20 @@ export function createMotionPlayerClass({ ResourceManager, getLayerNode, report,
     owner => state(owner).speed,
     (owner, value) => { state(owner).speed = number(value); },
   ));
+  // Player.h 246-260: getTickCount returns the raw double conversion without
+  // truncation; both cursor setters route through setFrameCursorState_guess.
   Player.members.set('tickCount', new NativeProperty(
-    owner => Math.trunc(state(owner).frameTickCount * 1000 / 60),
-    (owner, value) => { state(owner).frameTickCount = number(value) * 60 / 1000; },
+    owner => state(owner).frameTickCount * 1000 / 60,
+    (owner, value) => setFrameCursorState(state(owner), number(value) * 60 / 1000),
   ));
   Player.members.set('frameTickCount', new NativeProperty(
     owner => state(owner).frameTickCount,
-    (owner, value) => { state(owner).frameTickCount = number(value); },
+    (owner, value) => setFrameCursorState(state(owner), number(value)),
+  ));
+  // main.cpp #46: the queue gate is script-visible.
+  Player.members.set('queuing', new NativeProperty(
+    owner => Number(state(owner).queuing),
+    (owner, value) => { state(owner).queuing = truth(value); },
   ));
   Player.members.set('frameLastTime', new NativeProperty(owner => state(owner).lastTime));
   Player.members.set('frameLoopTime', new NativeProperty(owner => state(owner).loopTime));
