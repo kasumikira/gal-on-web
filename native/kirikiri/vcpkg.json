@@ -17,6 +17,8 @@
     "spdlog",
     "oniguruma",
     "zlib",
-    "expat"
+    "expat",
+    "libgdiplus",
+    { "name": "bison", "host": true }
   ]
 }

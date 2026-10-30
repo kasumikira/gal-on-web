@@ -1,32 +1,39 @@
 // Reference layout and NCB bindings; registration state belongs to the Runtime.
 //
-// textrender.dll — TextRenderBase 原生类
+// textrender.dll — TextRenderBase native class
 //
-// 四参考二进制联合取证基线：
+// Combined forensic baseline for the four reference binaries:
 //   analysis/textrender_four_binary_baseline_2026-08-10.md
 //
-// 本文件最初来自旧 Android libkrkr2.so 的单文件逆向。裸地址、反编译器标签和
-// 单一 ABI 字段偏移现已移出实现文件；行为仍必须重新在 Android arm64/armv7 与
-// iOS arm64/armv7 四个目标中定位。现已联合确认的注册面为 1 constructor + 16 methods +
-// 33 properties，四个目标的地址、对象大小和标准库布局差异统一记录在 analysis。
+// This file began as a single-file reverse engineering of an old Android libkrkr2.so.
+// Raw addresses, decompiler labels, and ABI-specific field offsets have been moved out of
+// the implementation. Behavior still must be located across Android arm64/armv7 and iOS
+// arm64/armv7. The shared registration surface is confirmed as 1 constructor + 16 methods +
+// 33 properties; addresses, object sizes, and standard-library layout differences are
+// recorded together in analysis.
 //
-// 绑定器机制：四个参考目标都表明 textrender 不自带独立绑定器——它与 motionplayer
-//   共用同一条 ncbind 注册链。invoker 是 ncbind Functor/Property 模板按签名实例化的
-//   多实例（共享 GETINSTANCE/Itanium PMF 解封/错误码序列），守护串
-//   "Invalid instance type."/"No method pointer."/"Multiple constructors." 全在本地
-//   cpp/core/plugin/ncbind.hpp。故忠实复刻 = 用本地 ncbind 既有设施重接，零改 ncbind.hpp。
+// Binder mechanism: all four reference targets show that textrender has no separate
+// binder; it shares the ncbind registration chain with motionplayer. Invokers are multiple
+// instances of ncbind Functor/Property templates specialized by signature (sharing the
+// GETINSTANCE, Itanium PMF decoding, and error-code sequences). The guard strings
+// "Invalid instance type.", "No method pointer.", and "Multiple constructors." are all in
+// cpp/core/plugin/ncbind.hpp. Faithful reproduction therefore reconnects the implementation
+// using existing ncbind facilities without changing ncbind.hpp.
 //
-// objthis 数据流：四个 factory 都把 TJS objthis 传给真构造器，构造器首个业务写入
-//   是保存该指针；四条析构链都不 Release 它。因此它是借用的 dispatch 指针。
-//   本地用 ncbind `Factory(&factory)`（工厂签名直收 objthis，见
-//   DrawDeviceD3D.cpp:47/:349）`new TextRenderBase(objthis)` 复刻该数据流；
-//   `objthis` 成员是裸指针、不 AddRef/不 Release（生命周期由 TJS 脚本对象持有，
-//   native 仅借引用回调脚本 onGetTextWidth/onEval/onFontChange）。所有内部落字/度量/
-//   eval 函数直接读 `objthis` 成员，不再层层传递同一形参。
+// objthis data flow: all four factories pass TJS objthis to the real constructor, whose
+// first business write saves the pointer. None of the four destructor chains calls Release
+// on it, so this is a borrowed dispatch pointer. The local implementation reproduces this
+// with ncbind `Factory(&factory)` (the factory signature receives objthis directly; see
+// DrawDeviceD3D.cpp:47/:349) and `new TextRenderBase(objthis)`. The `objthis` member is a raw
+// pointer with no AddRef/Release (the TJS script object owns its lifetime; native code only
+// borrows it to call onGetTextWidth/onEval/onFontChange). Internal placement, measurement,
+// and eval functions read the `objthis` member directly instead of passing the same argument
+// through multiple layers.
 //
-// 字节布局复刻工作法：下面用语义字段名写普通 C++ 类，声明顺序按四个目标共同
-// 证明的字段顺序排列，让各平台编译器自由计算 ABI 偏移。逐平台偏移只写入 analysis，
-// 不进入可编译代码（wasm32 ABI 必然不同，禁 pragma pack/static_assert(offsetof)）。
+// Byte-layout reproduction: the ordinary C++ class below uses semantic field names and the
+// field order confirmed by all four targets, allowing each platform compiler to calculate
+// ABI offsets. Per-platform offsets belong only in analysis, not compilable code (wasm32
+// necessarily has a different ABI; do not use pragma pack/static_assert(offsetof)).
 //
 #include <spdlog/spdlog.h>
 #include <vector>
@@ -931,7 +938,7 @@ public:
         arr.GetDispatch()->NativeInstanceSupport(
                 TJS_NIS_GETINSTANCE, TJSGetArrayClassID(),
                 (iTJSNativeInstance **)&ni);
-        // 保留原始 accessor idiom；元素实际全部经 dispatch 写入。
+        // Preserve the original accessor idiom; elements are actually written through dispatch.
         tTJSArrayItems *items = &ni->Items;
         (void)items;
         if(!count)

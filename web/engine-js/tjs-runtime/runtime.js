@@ -11,9 +11,10 @@ export class TJSRuntime {
     this.nextIdentity = 1;
     this.tail = Promise.resolve();
   }
-  async init({ onError, onDispatch, onReadOnly }) {
+  async init({ onError, onDispatch, onReadOnly, canvas, gl }) {
     this.module = await createModule({
       locateFile: () => this.wasmURL,
+      ...(canvas ? { getRenderCanvas: () => canvas, preinitializedWebGLContext: gl } : {}),
     });
     this.runtime = this.module._tjs_runtime_create();
     this.module.hostError = (_, message) => onError(message);

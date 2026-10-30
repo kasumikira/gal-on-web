@@ -1,9 +1,10 @@
-// AMV 专用 Worker 的解码会话：一个会话持有一个 AMVDecoder。
+// Decode session for the AMV-specific Worker: each session owns one AMVDecoder.
 //
-// 与参考实现的分工一致：Worker 只负责“从当前位置解下一帧 / seek / 重置”，
-// 容器策略（Loop、NextMovieFile 切换）留在主线程，因为它需要 storage 读取
-// （参考实现的 Decoder 直接按名字打开文件，Web 侧存储读取是异步的）。
-// 会话与 Worker 传输层解耦，便于在 Node 检查里用假解码器驱动同一套协议。
+// As in the reference, the Worker only decodes the next frame from the current position,
+// seeks, and resets. Container policy (Loop and NextMovieFile switching) stays on the main
+// thread because it needs storage reads (the reference Decoder opens files by name, while
+// storage reads on the Web are asynchronous).
+// Decouple sessions from Worker transport so Node checks can use a fake decoder with the same protocol.
 
 const frameReply = (header, width, height) => ({
   frame: {
@@ -24,7 +25,7 @@ export function createAmvSession(createDecoder) {
   });
   return {
     get decoder() { return decoder; },
-    // 返回 { reply, transfer }；transfer 是需要转移所有权的 ArrayBuffer 列表。
+    // Return { reply, transfer }; transfer is the list of ArrayBuffers whose ownership should move.
     async handle(message) {
       switch (message.type) {
         case 'open': {
@@ -38,7 +39,7 @@ export function createAmvSession(createDecoder) {
         }
         case 'decode': {
           if (!decoder?.bytes) return { reply: { ok: true, end: true } };
-          // DecodeNext_guess：片尾时循环回到开头，或交由主线程切换下一个文件。
+          // DecodeNext_guess: at end of media, loop to the beginning or let the main thread switch files.
           if (decoder.advance() === 'next') return { reply: { ok: true, end: true } };
           const decoded = await decoder.decodeNext({ transferable: true });
           if (!decoded) return { reply: { ok: true, end: true } };
@@ -72,8 +73,8 @@ export function createAmvSession(createDecoder) {
   };
 }
 
-// await 会让 Worker 处理后续消息；每个会话显式串行，避免 seek/dispose
-// 修改尚在等待初始化或 alpha 解压的 decoder。
+// await lets the Worker process later messages. Serialize each session explicitly so seek/dispose
+// cannot modify a decoder that is still waiting for initialization or alpha decompression.
 export function createAmvWorkerEndpoint({ createDecoder, postMessage }) {
   const sessions = new Map();
   return message => {

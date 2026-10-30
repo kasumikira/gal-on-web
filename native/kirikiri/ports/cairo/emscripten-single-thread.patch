@@ -1,0 +1,14 @@
+--- a/meson.build
++++ b/meson.build
+@@ -713,6 +713,11 @@
+ pthread_c_args = []
+ pthread_link_args = []
+ 
++if host_machine.system() == 'emscripten'
++  check_thread_flags = []
++  add_project_arguments('-DCAIRO_NO_MUTEX=1', language: 'c')
++endif
++
+ foreach thread_flags : check_thread_flags
+   if not conf.has('CAIRO_HAS_PTHREAD')
+     cflags = thread_flags[0]

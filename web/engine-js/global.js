@@ -4,11 +4,12 @@ export const config = {};
 
 export function initializeGlobals(options) {
   const {
-    entry, document, container, wasmURL, gameStorage, saveStorage,
+    entry, document, canvas, container, wasmURL, gameStorage, saveStorage,
     inform, message, arguments: args, unimplementedMode, continuousFrameRate, onTitleChange,
   } = options;
   if (typeof entry !== 'string' || !entry) throw new TypeError('entry must specify the XP3 path');
   if (typeof document?.createElement !== 'function' || !document.defaultView) throw new TypeError('document must provide a browser document');
+  if (typeof canvas?.getContext !== 'function') throw new TypeError('canvas must provide a rendering canvas');
   if (typeof container?.append !== 'function') throw new TypeError('container must be a DOM container');
   if (typeof wasmURL !== 'string' || !wasmURL) throw new TypeError('wasmURL must specify the WASM resource');
   for (const [name, callback] of Object.entries({ inform, message, onTitleChange })) {

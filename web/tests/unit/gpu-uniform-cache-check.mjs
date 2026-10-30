@@ -55,7 +55,7 @@ const server = await createServer({
   optimizeDeps: { noDiscovery: true },
 });
 try {
-  const { initializeGPU } = await server.ssrLoadModule('/engine-js/gpu.js');
+  const { initializeGPU } = await server.ssrLoadModule('/tests/gpu/gpu-reference.js');
   const gpu = initializeGPU({ defaultView: { alert() {} } }, 'uniform sampler2D textTexture;\n');
 
   // Same state setup() establishes before it sets uniforms: an active program and

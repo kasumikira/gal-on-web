@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>native 渲染后端验证</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 16px; color: #111; background: #fbfbfb; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #summary { font-weight: 600; margin-bottom: 8px; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #ddd; padding: 2px 8px; text-align: left; }
+  tr.fail td { background: #ffecec; }
+  canvas { border: 1px solid #ccc; image-rendering: pixelated; width: 128px; height: 128px; }
+</style>
+</head>
+<body>
+<h1>native 渲染后端验证</h1>
+<div id="summary">运行中…</div>
+<table id="report"><thead><tr><th>用例</th><th>结果</th><th>说明</th></tr></thead><tbody></tbody></table>
+<h2 style="font-size:14px">呈递输出</h2>
+<canvas id="stage"></canvas>
+<script type="module">
+import createModule from '../../engine-js/tjs-runtime/tjs-runtime.js';
+import { TJSInterop } from '../../engine-js/wasm-vm.js';
+import { Storages } from '../../engine-js/storage.js';
+import { defineNativeClass } from '#krkr/native';
+import { encodeTLG } from '../fixtures/tlg-encode.js';
+
+const WIDTH = 64, HEIGHT = 64;
+// Blend encoding uses the same values as reference tTVPBBBltMethod and is passed directly
+// to the native backend.
+const BM = {
+  Copy: 0, CopyOnAlpha: 1, Alpha: 2, AlphaOnAlpha: 3, Add: 4, Sub: 5, Mul: 6,
+  Dodge: 7, Darken: 8, Lighten: 9, Screen: 10, AddAlpha: 11,
+  AddAlphaOnAddAlpha: 12, AddAlphaOnAlpha: 13, AlphaOnAddAlpha: 14,
+  CopyOnAddAlpha: 15, PsNormal: 16, PsAdditive: 17, PsSubtractive: 18,
+  PsMultiplicative: 19, PsScreen: 20, PsOverlay: 21, PsHardLight: 22,
+  PsSoftLight: 23, PsColorDodge: 24, PsColorDodge5: 25, PsColorBurn: 26,
+  PsLighten: 27, PsDarken: 28, PsDifference: 29, PsDifference5: 30, PsExclusion: 31,
+};
+const results = [];
+function record(name, pass, detail = '') {
+  results.push({ name, pass: !!pass, detail });
+}
+function rgba(r, g, b, a = 255) { return [r, g, b, a]; }
+function argb([r, g, b, a]) { return ((a << 24) | (r << 16) | (g << 8) | b) >>> 0; }
+// GLSL mix(x, y, a) = x*(1-a) + y*a.
+function mix(x, y, a) { return x * (1 - a) + y * a; }
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+const canvas = document.getElementById('stage');
+function trackResources(gl) {
+  const objects = new Set(), locations = new Map();
+  for (const kind of ['Texture', 'Framebuffer', 'Renderbuffer', 'Buffer', 'Shader', 'Program']) {
+    const create = gl[`create${kind}`].bind(gl), remove = gl[`delete${kind}`].bind(gl);
+    gl[`create${kind}`] = (...args) => { const object = create(...args); if (object) objects.add(object); return object; };
+    gl[`delete${kind}`] = object => { objects.delete(object); if (kind === 'Program') locations.delete(object); return remove(object); };
+  }
+  const getLocation = gl.getUniformLocation.bind(gl);
+  gl.getUniformLocation = (program, name) => {
+    const location = getLocation(program, name);
+    if (location) locations.set(program, (locations.get(program) ?? 0) + 1);
+    return location;
+  };
+  return { objects, locations };
+}
+const gl = canvas.getContext('webgl2', { alpha: true, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+const resources = trackResources(gl);
+const module = await createModule({ getRenderCanvas: () => canvas, preinitializedWebGLContext: gl, locateFile: () => new URL('../../engine-js/tjs-runtime/tjs-runtime.wasm', import.meta.url).href });
+const scratch = module._malloc(WIDTH * HEIGHT * 4);
+// Read and write through the same WASM memory to avoid introducing an extra pixel-copy
+// path in the test itself.
+const view = () => new Uint8Array(module.HEAPU8.buffer, scratch, WIDTH * HEIGHT * 4);
+
+function writePixels(pixels) {
+  new Uint8Array(module.HEAPU8.buffer, scratch, pixels.length).set(pixels);
+  return scratch;
+}
+function readTexture(id) {
+  module._gal_render_texture_read(id, scratch);
+  return Array.from(view());
+}
+function readCanvas() {
+  module._gal_render_read_canvas(scratch);
+  return Array.from(view());
+}
+function pixelAt(bytes, width, x, y) {
+  const offset = (y * width + x) * 4;
+  return bytes.slice(offset, offset + 4);
+}
+function compare(name, actual, expected, width, tolerance = 0) {
+  let maxDiff = 0, worst = null;
+  for (let i = 0; i < expected.length; i += 4) {
+    for (let c = 0; c < 4; c++) {
+      const diff = Math.abs(actual[i + c] - expected[i + c]);
+      if (diff > maxDiff) { maxDiff = diff; worst = { index: i / 4, channel: c, actual: actual[i + c], expected: expected[i + c] }; }
+    }
+  }
+  const pass = maxDiff <= tolerance;
+  record(name, pass, pass ? `最大误差 ${maxDiff}` : `最大误差 ${maxDiff} 于像素 ${worst.index} 通道 ${worst.channel}（实际 ${worst.actual}，期望 ${worst.expected}）`);
+  return pass;
+}
+function fillPattern(width, height, colors) {
+  const out = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) out.push(...colors[(y * width + x) % colors.length]);
+  }
+  return out;
+}
+
+const globalErrors = [];
+window.addEventListener('error', event => globalErrors.push(String(event.message)));
+
+try {
+  const initResult = module._gal_render_initialize(WIDTH, HEIGHT);
+  const initError = (() => {
+    const length = module._gal_render_last_error(scratch, 1024);
+    return length > 0 ? new TextDecoder().decode(new Uint8Array(module.HEAPU8.buffer, scratch, length)) : '';
+  })();
+  record('初始化 WebGL2 后端', initResult === 1, `返回 ${initResult}${initError ? `，错误：${initError}` : ''}`);
+  record('纹理上限查询可用', module._gal_render_max_texture() >= 2048, `MAX_TEXTURE_SIZE=${module._gal_render_max_texture()}`);
+
+  // 1. Create a texture, fill it, and read it back.
+  {
+    const tex = module._gal_render_texture_create(4, 4, 1);
+    module._gal_render_texture_fill(tex, 0, 0, 4, 4, 0xFF3366CC);
+    compare('创建纹理并填充（ARGB→RGBA 通道顺序）', readTexture(tex),
+      fillPattern(4, 4, [rgba(0x33, 0x66, 0xCC, 0xFF)]), 4);
+    // 2. Clear.
+    module._gal_render_texture_clear(tex);
+    compare('清空纹理', readTexture(tex), fillPattern(4, 4, [rgba(0, 0, 0, 0)]), 4);
+    module._gal_render_texture_release(tex);
+  }
+
+  // Rows have padding bytes; no padding is required after the final row.
+  {
+    const pixels = [...rgba(255, 0, 0), ...rgba(0, 255, 0), 7, 8, 9, 10,
+      ...rgba(0, 0, 255), ...rgba(255, 255, 255)];
+    const expected = [...rgba(255, 0, 0), ...rgba(0, 255, 0),
+      ...rgba(0, 0, 255), ...rgba(255, 255, 255)];
+    const tex = module._gal_render_texture_from_pixels(2, 2, 12, writePixels(pixels));
+    compare('带行距的纹理上传', readTexture(tex), expected, 2);
+    module._gal_render_texture_update(tex, 0, 0, 2, 2, writePixels(expected));
+    compare('紧凑行更新不继承上传行距', readTexture(tex), expected, 2);
+    module._gal_render_texture_release(tex);
+  }
+
+  // 3. Copy (including texture orientation: row 0 is the top row).
+  {
+    const pattern = [
+      ...rgba(255, 0, 0), ...rgba(0, 255, 0),
+      ...rgba(0, 0, 255), ...rgba(255, 255, 255),
+    ];
+    const src = module._gal_render_texture_from_pixels(2, 2, 8, writePixels(pattern));
+    const dst = module._gal_render_texture_create(4, 4, 1);
+    module._gal_render_texture_clear(dst);
+    module._gal_render_copy(dst, src, 0, 0, 2, 2, 1, 1, 0);
+    const expected = fillPattern(4, 4, [rgba(0, 0, 0, 0)]);
+    for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
+      const offset = ((1 + y) * 4 + (1 + x)) * 4;
+      expected.splice(offset, 4, ...pattern.slice((y * 2 + x) * 4, (y * 2 + x) * 4 + 4));
+    }
+    compare('复制到偏移位置并保持方向', readTexture(dst), expected, 4);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 4. Scale (nearest-neighbor must copy blocks without interpolation).
+  {
+    const src = module._gal_render_texture_from_pixels(2, 2, 8, writePixels([
+      ...rgba(10, 20, 30), ...rgba(40, 50, 60),
+      ...rgba(70, 80, 90), ...rgba(100, 110, 120),
+    ]));
+    const dst = module._gal_render_texture_create(4, 4, 1);
+    module._gal_render_scale(dst, src, 0, 0, 2, 2, 0, 0, 4, 4, 0);
+    const expected = fillPattern(4, 4, [rgba(0, 0, 0, 0)]);
+    const colors = [rgba(10, 20, 30), rgba(40, 50, 60), rgba(70, 80, 90), rgba(100, 110, 120)];
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+      const offset = (y * 4 + x) * 4;
+      expected.splice(offset, 4, ...colors[(y >> 1) * 2 + (x >> 1)]);
+    }
+    compare('放大 2 倍（最近邻）', readTexture(dst), expected, 4);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 5. Affine draw: rotate by 90 degrees and check that all four corners land correctly.
+  {
+    const src = module._gal_render_texture_from_pixels(2, 2, 8, writePixels([
+      ...rgba(255, 0, 0), ...rgba(0, 255, 0),
+      ...rgba(0, 0, 255), ...rgba(255, 255, 0),
+    ]));
+    const dst = module._gal_render_texture_create(2, 2, 1);
+    module._gal_render_texture_clear(dst);
+    // lt->(2,0), rt->(2,2), lb->(0,0), rb->(0,2): source rows become target columns.
+    const quad = new Float32Array([2, 0, 2, 2, 0, 0, 0, 2]);
+    const quadPtr = module._malloc(quad.byteLength);
+    new Uint8Array(module.HEAPU8.buffer, quadPtr, quad.byteLength).set(new Uint8Array(quad.buffer));
+    module._gal_render_draw_quad(dst, src, 0, 0, 2, 2, quadPtr, 0, 0, 255, 0, 0, 0, 0, 0);
+    const actual = readTexture(dst);
+    // lt->(2,0) samples source (0,0); rt->(2,2) samples (1,0); lb->(0,0) samples (0,1);
+    // rb->(0,2) samples (1,1).
+    const pass = pixelAt(actual, 2, 0, 0).join() === rgba(0, 0, 255).join()   // lb -> source (0,1), blue
+      && pixelAt(actual, 2, 1, 0).join() === rgba(255, 0, 0).join()          // lt -> source (0,0), red
+      && pixelAt(actual, 2, 0, 1).join() === rgba(255, 255, 0).join()        // rb -> source (1,1), yellow
+      && pixelAt(actual, 2, 1, 1).join() === rgba(0, 255, 0).join();         // rt -> source (1,0), green
+    record('仿射绘制（90 度旋转）', pass,
+      `lt=${pixelAt(actual, 2, 0, 0)} rt=${pixelAt(actual, 2, 1, 0)} lb=${pixelAt(actual, 2, 0, 1)} rb=${pixelAt(actual, 2, 1, 1)}`);
+    module._free(quadPtr);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 6. Clipping.
+  {
+    const dst = module._gal_render_texture_create(4, 4, 1);
+    module._gal_render_texture_fill(dst, 0, 0, 4, 4, 0xFFFF0000);
+    const src = module._gal_render_texture_from_pixels(4, 4, 16, writePixels(fillPattern(4, 4, [rgba(0, 0, 255, 255)])));
+    module._gal_render_draw_rect(dst, src, 0, 0, 4, 4, 0, 0, 0, 0, 255, 1, 1, 3, 3, 0);
+    const actual = readTexture(dst);
+    const pass = pixelAt(actual, 4, 0, 0).join() === rgba(255, 0, 0).join()
+      && pixelAt(actual, 4, 1, 1).join() === rgba(0, 0, 255).join()
+      && pixelAt(actual, 4, 3, 3).join() === rgba(255, 0, 0).join();
+    record('裁剪只在区域内绘制', pass,
+      `(0,0)=${pixelAt(actual, 4, 0, 0)} (1,1)=${pixelAt(actual, 4, 1, 1)} (3,3)=${pixelAt(actual, 4, 3, 3)}`);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 7. Opacity (alpha blending; hda=0 writes target alpha).
+  {
+    const dst = module._gal_render_texture_create(2, 1, 1);
+    module._gal_render_texture_fill(dst, 0, 0, 2, 1, 0xFF000000);
+    const src = module._gal_render_texture_from_pixels(2, 1, 8, writePixels(fillPattern(2, 1, [rgba(255, 255, 255, 255)])));
+    module._gal_render_draw_rect(dst, src, 0, 0, 2, 1, 0, 0, BM.Alpha, 0, 128, 0, 0, 0, 0, 0);
+    const actual = readTexture(dst);
+    const expectedAlpha = Math.round(255 * (128 / 255) * 1 + 255 * (1 - 128 / 255));
+    compare('不透明度 128 的 alpha 混合', actual,
+      fillPattern(2, 1, [rgba(128, 128, 128, Math.min(255, expectedAlpha))]), 2, 1);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 8. Special blends: addition / subtraction / multiplication.
+  {
+    const make = () => {
+      const dst = module._gal_render_texture_create(1, 1, 1);
+      module._gal_render_texture_fill(dst, 0, 0, 1, 1, 0xFF404040);
+      return dst;
+    };
+    const src = module._gal_render_texture_from_pixels(1, 1, 4, writePixels([...rgba(0x80, 0x80, 0x80) /* straight, a=128 */]));
+    const semi = module._gal_render_texture_from_pixels(1, 1, 4, writePixels([...rgba(0x80, 0x80, 0x80, 128)]));
+    // Add: dst.rgb = src.rgb*opa + dst.rgb*(1 - src.a*opa)
+    let dst = make();
+    const quad = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
+    const quadPtr = module._malloc(32);
+    new Uint8Array(module.HEAPU8.buffer, quadPtr, 32).set(new Uint8Array(quad.buffer));
+    module._gal_render_draw_quad(dst, semi, 0, 0, 1, 1, quadPtr, BM.AddAlpha, 1, 255, 0, 0, 0, 0, 0);
+    const additive = readTexture(dst);
+    const additiveAlpha = 128 / 255;
+    const expectedAdd = Math.round(0x80 + 0x40 * (1 - additiveAlpha));
+    record('加算混合', Math.abs(additive[0] - expectedAdd) <= 1,
+      `实际 ${additive[0]}，期望 ${expectedAdd}`);
+    module._gal_render_texture_release(dst);
+
+    // Subtract: dst.rgb = dst.rgb - (1 - src.rgb)*opa
+    dst = make();
+    module._gal_render_draw_quad(dst, src, 0, 0, 1, 1, quadPtr, BM.Sub, 1, 255, 0, 0, 0, 0, 0);
+    const subtract = readTexture(dst);
+    const expectedSub = Math.max(0, Math.round(0x40 - (255 - 0x80)));
+    record('减算混合', Math.abs(subtract[0] - expectedSub) <= 1,
+      `实际 ${subtract[0]}，期望 ${expectedSub}`);
+    module._gal_render_texture_release(dst);
+
+    // Multiply: dst.rgb = dst.rgb * (1 - (1 - src.rgb))
+    dst = make();
+    module._gal_render_draw_quad(dst, src, 0, 0, 1, 1, quadPtr, BM.Mul, 1, 255, 0, 0, 0, 0, 0);
+    const multiply = readTexture(dst);
+    const expectedMul = Math.round(0x40 * (0x80 / 255));
+    record('乘算混合', Math.abs(multiply[0] - expectedMul) <= 1,
+      `实际 ${multiply[0]}，期望 ${expectedMul}`);
+    module._gal_render_texture_release(dst);
+
+    module._free(quadPtr);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(semi);
+  }
+
+  // 9. Preserve RGB for transparent pixels (do not premultiply).
+  {
+    const src = module._gal_render_texture_from_pixels(1, 1, 4, writePixels([...rgba(200, 100, 50, 0)]));
+    const dst = module._gal_render_texture_create(1, 1, 1);
+    module._gal_render_copy(dst, src, 0, 0, 1, 1, 0, 0, 0);
+    compare('透明像素 RGB 原样保留', readTexture(dst), rgba(200, 100, 50, 0), 1);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 10. Copy-on-write.
+  {
+    const a = module._gal_render_texture_from_pixels(2, 1, 8, writePixels([...rgba(1, 2, 3, 255), ...rgba(4, 5, 6, 255)]));
+    const shared = module._gal_render_texture_share(a);
+    record('共享纹理不是独占', module._gal_render_texture_independent(a) === 0, `share=${shared}`);
+    const writable = module._gal_render_texture_writable(a);
+    record('写时复制产生独立纹理', writable !== a && module._gal_render_texture_independent(writable) === 1,
+      `writable=${writable} 原=${a}`);
+    const before = readTexture(writable);
+    compare('复制后内容一致', before, [...rgba(1, 2, 3, 255), ...rgba(4, 5, 6, 255)], 2);
+    module._gal_render_texture_fill(writable, 0, 0, 2, 1, 0xFF000000);
+    compare('写入新纹理后共享副本不变', readTexture(shared),
+      [...rgba(1, 2, 3, 255), ...rgba(4, 5, 6, 255)], 2);
+    record('旧句柄已释放', module._gal_render_texture_width(a) === 0, `宽度=${module._gal_render_texture_width(a)}`);
+    module._gal_render_texture_release(writable);
+    module._gal_render_texture_release(shared);
+  }
+
+  // 11. Exceed the single-texture limit.
+  {
+    const max = module._gal_render_max_texture();
+    const tooLarge = module._gal_render_texture_create(max + 1, 4, 1);
+    record('超过纹理上限被拒绝', tooLarge === 0, `MAX=${max} 创建结果=${tooLarge}`);
+    const near = module._gal_render_texture_create(2048, 2048, 1);
+    record('上限内的纹理可创建', near !== 0, `2048x2048 => ${near}`);
+    if (near) module._gal_render_texture_release(near);
+  }
+
+  // 12. Present to the canvas (flip Y only here).
+  {
+    // Put two colors in the same column: with the wrong orientation, (0,0) reads yellow.
+    const image = [
+      ...rgba(255, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0),
+      ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0),
+      ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0),
+      ...rgba(255, 255, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0), ...rgba(0, 0, 0),
+    ];
+    const tex = module._gal_render_texture_from_pixels(4, 4, 16, writePixels(image));
+    module._gal_render_clear(0, 0, 0, 1);
+    module._gal_render_present(tex, 0);
+    const canvasPixels = readCanvas();
+    const pass = pixelAt(canvasPixels, WIDTH, 0, 0).join() === rgba(255, 0, 0).join()
+      && pixelAt(canvasPixels, WIDTH, 0, 3).join() === rgba(255, 255, 0).join();
+    record('呈递方向正确（画布 row 0 = 纹理 row 0）', pass,
+      `(0,0)=${pixelAt(canvasPixels, WIDTH, 0, 0)} (0,3)=${pixelAt(canvasPixels, WIDTH, 0, 3)}`);
+    module._gal_render_texture_release(tex);
+  }
+
+  // 13. Context loss and restoration.
+  {
+    const oldTarget = module._gal_render_texture_create(2, 2, 1);
+    const beforeLoss = module._gal_render_draw_count();
+    module._gal_render_context_lost();
+    module._gal_render_texture_fill(oldTarget, 0, 0, 2, 2, 0xff00ff00);
+    record('平台丢失通知暂停绘制', module._gal_render_draw_count() === beforeLoss);
+    record('平台丢失通知清理 uniform 引用', resources.locations.size === 0);
+    module._gal_render_context_restored();
+    module._gal_render_texture_release(oldTarget);
+    const tex = module._gal_render_texture_create(2, 2, 1);
+    module._gal_render_texture_fill(tex, 0, 0, 2, 2, 0xFF00FF00);
+    compare('恢复后重新创建纹理并绘制', readTexture(tex), fillPattern(2, 2, [rgba(0, 255, 0, 255)]), 2);
+    module._gal_render_texture_release(tex);
+  }
+
+  // 14. Target as input: the _d family reads a target snapshot without framebuffer fetch.
+  {
+    const dst = module._gal_render_texture_create(2, 2, 1);
+    module._gal_render_texture_fill(dst, 0, 0, 2, 2, 0x80404040);
+    const src = module._gal_render_texture_from_pixels(2, 2, 8,
+      writePixels(fillPattern(2, 2, [rgba(255, 0, 0, 128)])));
+    module._gal_render_draw_rect(dst, src, 0, 0, 2, 2, 0, 0, BM.AlphaOnAlpha, 0, 255, 0, 0, 0, 0, 0);
+    const sa = 128 / 255, da = 128 / 255;
+    const outA = sa + da - sa * da;
+    const t = sa / (outA + 0.0001);
+    const expR = Math.round(mix(64 / 255, 1, t) * 255);
+    const expG = Math.round(mix(64 / 255, 0, t) * 255);
+    compare('目标作为输入（AlphaBlend_d）', readTexture(dst),
+      fillPattern(2, 2, [rgba(expR, expG, expG, Math.round(outA * 255))]), 2, 2);
+    module._gal_render_texture_release(src);
+    module._gal_render_texture_release(dst);
+  }
+
+  // 15. Photoshop per-pixel mode.
+  {
+    const modes = [
+      { bm: BM.PsAdditive, name: 'Ps 加算', f: (s, d, a) => mix(d, clamp01(s + d), a) },
+      { bm: BM.PsSubtractive, name: 'Ps 减算', f: (s, d, a) => mix(d, clamp01(d + s - 1), a) },
+      { bm: BM.PsDarken, name: 'Ps 变暗', f: (s, d, a) => mix(d, Math.min(s, d), a) },
+      { bm: BM.PsLighten, name: 'Ps 变亮', f: (s, d, a) => mix(d, Math.max(s, d), a) },
+      { bm: BM.PsDifference, name: 'Ps 差值', f: (s, d, a) => mix(d, Math.abs(s - d), a) },
+      { bm: BM.PsExclusion, name: 'Ps 排除', f: (s, d, a) => d + (s - s * d * 2) * a },
+      // The reference shader is step(0.5, x) * ((s+d)*2 - sd*4 - 1) + sd*2; sd*2 is constant.
+      { bm: BM.PsOverlay, name: 'Ps 叠加',
+        f: (s, d, a) => mix(d, (d >= 0.5 ? (s + d) * 2 - s * d * 4 - 1 : 0) + s * d * 2, a) },
+      { bm: BM.PsHardLight, name: 'Ps 强光',
+        f: (s, d, a) => mix(d, (s >= 0.5 ? (s + d) * 2 - s * d * 4 - 1 : 0) + s * d * 2, a) },
+    ];
+    const srcPixel = [0x80, 0x60, 0x40, 0x80];
+    const dstPixel = [0x60, 0x80, 0x20, 0xFF];
+    for (const mode of modes) {
+      const dst = module._gal_render_texture_create(1, 1, 1);
+      module._gal_render_texture_fill(dst, 0, 0, 1, 1, argb(dstPixel));
+      const src = module._gal_render_texture_from_pixels(1, 1, 4, writePixels(srcPixel));
+      module._gal_render_draw_rect(dst, src, 0, 0, 1, 1, 0, 0, mode.bm, 0, 255, 0, 0, 0, 0, 0);
+      const weight = srcPixel[3] / 255;
+      const expected = [0, 1, 2].map(i =>
+        Math.round(clamp01(mode.f(srcPixel[i] / 255, dstPixel[i] / 255, weight)) * 255));
+      expected.push(dstPixel[3]);
+      compare(`${mode.name}（Ps 逐像素模式）`, readTexture(dst), expected, 1, 2);
+      module._gal_render_texture_release(src);
+      module._gal_render_texture_release(dst);
+    }
+  }
+
+  // 16. Target and source are the same texture, with target reads (reference tex == tar handling).
+  {
+    const tex = module._gal_render_texture_from_pixels(2, 2, 8,
+      writePixels(fillPattern(2, 2, [rgba(0x80, 0x60, 0x40, 0x80)])));
+    module._gal_render_draw_rect(tex, tex, 0, 0, 2, 2, 0, 0, BM.AlphaOnAlpha, 0, 255, 0, 0, 0, 0, 0);
+    const a = 128 / 255;
+    const outA = a + a - a * a;
+    const t = a / (outA + 0.0001);
+    const rgb = [0x80, 0x60, 0x40].map(v => Math.round(mix(v / 255, v / 255, t) * 255));
+    compare('自绘不产生反馈（src == dst 且目标作为输入）', readTexture(tex),
+      fillPattern(2, 2, [rgba(rgb[0], rgb[1], rgb[2], Math.round(outA * 255))]), 2, 2);
+    module._gal_render_texture_release(tex);
+  }
+
+  // 17. Self-copy: snapshot the source before writing; do not read and write the same texture simultaneously.
+  {
+    const tex = module._gal_render_texture_from_pixels(4, 1, 16, writePixels([
+      ...rgba(255, 0, 0), ...rgba(0, 255, 0), ...rgba(0, 0, 255), ...rgba(255, 255, 255),
+    ]));
+    module._gal_render_draw_rect(tex, tex, 0, 0, 3, 1, 1, 0, BM.Copy, 0, 255, 0, 0, 0, 0, 0);
+    compare('自拷贝（src == dst）', readTexture(tex), [
+      ...rgba(255, 0, 0), ...rgba(255, 0, 0), ...rgba(0, 255, 0), ...rgba(0, 0, 255),
+    ], 4);
+    module._gal_render_texture_release(tex);
+  }
+
+  // LayerBitmap resource operations stay inside native after the encoded input arrives.
+  {
+    const pixels = new Uint8Array([
+      ...rgba(123, 45, 67, 0), ...rgba(255, 0, 0),
+      ...rgba(0, 255, 0), ...rgba(0, 0, 255, 128),
+    ]);
+    const encoded = encodeTLG({ width: 2, height: 2, pixels }, 'tlg5');
+    const input = module._malloc(encoded.length);
+    module.HEAPU8.set(encoded, input);
+    const src = module._gal_bitmap_decode(input, encoded.length, 0x1fffffff);
+    module._free(input);
+    const dst = module._gal_bitmap_create(2, 2, 0);
+    const read = id => {
+      if (module._gal_bitmap_read(id, scratch, 0) !== 1) throw new Error('Bitmap read failed');
+      return Array.from(view());
+    };
+    try {
+      record('编码图像直接解码到 native 位图', src > 0);
+      compare('解码上传保留透明像素 RGB', read(src), pixels, 2);
+      const before = module._gal_render_draw_count();
+      record('整图复制成功', module._gal_bitmap_copy(dst, src, 0, 0, 2, 2, 0, 0) === 1);
+      record('整图复制只共享资源，不发绘制', module._gal_render_draw_count() === before);
+      module._gal_bitmap_fill(dst, 1, 1, 2, 2, 0xff112233);
+      compare('整图共享后写入保留原图', read(src), pixels, 2);
+      record('扩大尺寸并保留图像', module._gal_bitmap_resize(dst, 3, 3, 1, 0xffabcdef) === 1);
+      compare('尺寸扩大保留左上图像并填充新增区域', read(dst), [
+        ...pixels.slice(0, 8), ...rgba(0xab, 0xcd, 0xef),
+        ...pixels.slice(8, 12), ...rgba(0x11, 0x22, 0x33), ...rgba(0xab, 0xcd, 0xef),
+        ...fillPattern(3, 1, [rgba(0xab, 0xcd, 0xef)]),
+      ], 3);
+      module._gal_bitmap_resize(dst, 3, 3, 0, 0);
+      record('相同尺寸不清空（原版 SetSize 语义）', pixelAt(read(dst), 3, 2, 2).join() === '171,205,239,255');
+      module._gal_bitmap_resize(dst, 1, 1, 0, 0xff123456);
+      compare('不保留图像的尺寸调整', read(dst), rgba(0x12, 0x34, 0x56), 1);
+      module._gal_bitmap_resize(dst, 0, 0, 1, 0);
+      record('零尺寸按原版归一化为一像素', module._gal_bitmap_width(dst) === 1 && module._gal_bitmap_height(dst) === 1);
+    } finally {
+      module._gal_bitmap_release(src);
+      module._gal_bitmap_release(dst);
+    }
+  }
+
+  // Logical bitmaps may exceed the hardware texture limit. Exercise both sides of a tile seam.
+  {
+    const height = module._gal_render_max_texture() + 3;
+    const seam = height - 5;
+    const bytes = new Uint8Array(2 * height * 4);
+    for (let y = 0; y < height; y++) for (let x = 0; x < 2; x++)
+      bytes.set([y % 251, x * 100, (y * 3) % 253, 255], (y * 2 + x) * 4);
+    const buffer = module._malloc(bytes.length);
+    const read = id => {
+      if (!module._gal_bitmap_read(id, buffer, 8)) throw new Error('Bitmap read failed');
+      return new Uint8Array(module.HEAPU8.buffer, buffer, bytes.length).slice();
+    };
+    const ids = [];
+    try {
+      module.HEAPU8.set(bytes, buffer);
+      const original = module._gal_bitmap_from_pixels(2, height, 8, buffer); ids.push(original);
+      record('超长逻辑位图创建', original > 0 && module._gal_bitmap_height(original) === height);
+      compare('分块上传与回读', read(original), bytes, 2);
+      const shared = module._gal_bitmap_share(original); ids.push(shared);
+      module._gal_bitmap_fill(shared, 0, seam - 1, 2, seam + 2, 0xff123456);
+      const expected = bytes.slice();
+      for (let y = seam - 1; y < seam + 2; y++) for (let x = 0; x < 2; x++)
+        expected.set([0x12, 0x34, 0x56, 255], (y * 2 + x) * 4);
+      compare('跨分块填充', read(shared), expected, 2);
+      compare('分块 CoW 保留原图', read(original), bytes, 2);
+      module._gal_bitmap_copy(shared, original, 0, seam - 2, 2, seam + 2, 0, seam - 1);
+      expected.set(bytes.slice((seam - 2) * 8, (seam + 2) * 8), (seam - 1) * 8);
+      compare('跨分块复制', read(shared), expected, 2);
+      const before = expected.slice();
+      module._gal_bitmap_copy(shared, shared, 0, seam - 2, 2, seam + 2, 0, seam - 1);
+      expected.set(before.slice((seam - 2) * 8, (seam + 2) * 8), (seam - 1) * 8);
+      compare('跨分块重叠自复制', read(shared), expected, 2);
+      const top = seam - 2;
+      module.HEAPU8.set(bytes.slice(top * 8, (top + 4) * 8), buffer);
+      const reference = module._gal_bitmap_from_pixels(2, 4, 8, buffer); ids.push(reference);
+      const scaled = module._gal_bitmap_create(8, 16, 0); ids.push(scaled);
+      const control = module._gal_bitmap_create(8, 16, 0); ids.push(control);
+      const draw = (dst, src, sy) => {
+        new Float64Array(module.HEAPU8.buffer, buffer, 6).set([4, 0, 0, 4, 0, -sy * 4]);
+        return module._gal_bitmap_draw(dst, src, 0, sy, 2, sy + 4, buffer, BM.Copy, 0, 255, 0, 0, 8, 16, 1);
+      };
+      record('跨块线性缩放提交', draw(scaled, original, top) === 1 && draw(control, reference, 0) === 1);
+      module._gal_bitmap_read(scaled, buffer, 32);
+      const actual = new Uint8Array(module.HEAPU8.buffer, buffer, 512).slice();
+      module._gal_bitmap_read(control, buffer, 32);
+      const target = new Uint8Array(module.HEAPU8.buffer, buffer, 512).slice();
+      const interior = pixels => {
+        const result = [];
+        for (let y = 4; y < 12; y++) result.push(...pixels.slice((y * 8 + 2) * 4, (y * 8 + 6) * 4));
+        return result;
+      };
+      compare('跨分块线性采样无接缝', interior(actual), interior(target), 4, 1);
+    } finally {
+      for (const id of ids) module._gal_bitmap_release(id);
+      module._free(buffer);
+    }
+  }
+  {
+    const visualCanvas = document.createElement('canvas');
+    const visualGL = visualCanvas.getContext('webgl2', { alpha: true, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+    const visualResources = trackResources(visualGL);
+    const vm = await new TJSInterop().init({}, { canvas: visualCanvas, gl: visualGL });
+    vm.module._gal_render_initialize(4, 4);
+    const storage = new Storages({ list: async () => [] }, null, '/');
+    await storage.initialize();
+    storage.registerMedia('engine-resource://', {
+      isExistent: path => path === 'fonts/default.ttf',
+      read: async () => new Uint8Array(await (await fetch(new URL(
+        '../../assets/fonts/default.ttf', import.meta.url))).arrayBuffer()),
+    });
+    vm.attachStorage(storage);
+    const source = `
+      var a = new Bitmap(2, 2, 32), b = new Bitmap(2, 2, 32);
+      a.setPixel(0, 0, 0x112233); a.setMaskPixel(0, 0, 128);
+      if(a.getPixel(0, 0) != 0x112233 || a.getMaskPixel(0, 0) != 128)
+        throw new Exception("native Bitmap pixel mismatch");
+      b.copyFrom(a); b.setPixel(0, 0, 0xabcdef);
+      if(a.getPixel(0, 0) != 0x112233 || b.getPixel(0, 0) != 0xabcdef)
+        throw new Exception("native Bitmap CoW mismatch");
+      b.setSize(3, 3);
+      if(b.width != 3 || b.height != 3 || b.getPixel(0, 0) != 0xabcdef)
+        throw new Exception("native Bitmap resize mismatch: " + b.width + "," + b.height + "," + b.getPixel(0, 0));
+      invalidate a; invalidate b;
+    `;
+    try {
+      await vm.initializeVisual();
+      await vm.dispose(await vm.source(source, 'native-bitmap-check'));
+      record('原版 TJS Bitmap 注册、像素读写、CoW 与保留图像缩放', true, '');
+      const Window = defineNativeClass('Window', { initialize: () => ({}), members: { Window() {} } });
+      vm.registerGlobal('Window', Window);
+      const nativeWindow = (...args) => vm.visualWindow(...args);
+      await nativeWindow(4, Window);
+      await vm.dispose(await vm.source('var nativeWindow = new Window();'));
+      const window = await vm.source('nativeWindow', 'window-check', 0, undefined, true);
+      try {
+        let paintRequests = 0;
+        const platform = Object.fromEntries(['cursor', 'cursorPosition', 'releaseCapture', 'hint',
+          'layerSize', 'paint', 'attention', 'disableAttention', 'ime', 'resetIme'].map(name => [name, () => {}]));
+        platform.paint = () => { paintRequests++; };
+        await nativeWindow(0, window, platform);
+        await vm.dispose(await vm.source(`
+          var primary = new Layer(nativeWindow, null);
+          primary.setSize(4, 4); primary.setImageSize(4, 4);
+          primary.fillRect(0, 0, 4, 4, 0xffff0000);
+          var child = new Layer(nativeWindow, primary);
+          child.setSize(2, 2); child.setImageSize(2, 2);
+          child.setPos(1, 1); child.type = 1; child.visible = true;
+          child.fillRect(0, 0, 2, 2, 0xff0000ff);
+          if(nativeWindow.primaryLayer !== primary)
+            throw new Exception("native primary layer mismatch");
+        `, 'native-layer-check'));
+        const movieLayer = await vm.source('child', 'movie-layer', 0, undefined, true);
+        try {
+          await vm.visualMovieFrame(movieLayer, { width: 2, height: 2, rgba: new Uint8Array([
+            255, 0, 0, 128, 0, 255, 0, 255,
+            0, 0, 255, 255, 255, 255, 255, 0,
+          ]) }, 0, 1);
+          await vm.dispose(await vm.source(`
+            if (child.width != 2 || child.height != 2 || child.left != 0 || child.top != 1 ||
+                child.getMainPixel(0, 0) != 0xff0000 || child.getMaskPixel(0, 0) != 128 ||
+                child.getMainPixel(1, 0) != 0x00ff00)
+              throw new Exception('AlphaMovie native frame mismatch');
+            child.setPos(1, 1); child.fillRect(0, 0, 2, 2, 0xff0000ff);
+          `, 'native-movie-frame-check'));
+          record('AlphaMovie 帧写入 native Layer', true, '');
+          await vm.visualMovieFrame(movieLayer, { width: 1, height: 1, rgba: new Uint8Array([12, 34, 56, 255]) }, 0, 0, true);
+          await vm.dispose(await vm.source(`
+            if (child.width != 1 || child.height != 1 || child.imageWidth != 1 || child.imageHeight != 1 ||
+                child.left != 1 || child.top != 1 || child.getMainPixel(0, 0) != 0x0c2238)
+              throw new Exception('VideoOverlay native frame mismatch');
+            child.setSize(2, 2); child.setImageSize(2, 2); child.fillRect(0, 0, 2, 2, 0xff0000ff);
+          `, 'native-video-frame-check'));
+          record('VideoOverlay 帧调整图像尺寸并保留图层位置', true, '');
+        } finally { await vm.dispose(movieLayer); }
+        await nativeWindow(1, window);
+        const pixels = vm.module._malloc(64);
+        try {
+          vm.module._gal_render_read_canvas(pixels);
+          const expected = new Uint8Array(fillPattern(4, 4, [rgba(255, 0, 0, 255)]));
+          for(let y = 1; y < 3; ++y) for(let x = 1; x < 3; ++x)
+            expected.set([0, 0, 255, 255], (y * 4 + x) * 4);
+          compare('原版 Layer/LayerManager 合成与原生窗口呈递',
+            new Uint8Array(vm.module.HEAPU8.buffer, pixels, 64).slice(), expected, 4);
+        } finally { vm.module._free(pixels); }
+        const beforeProperties = vm.module._gal_render_draw_count();
+        const beforePaints = paintRequests;
+        await vm.dispose(await vm.source('child.left = 0; child.left = 1;'));
+        record('原版窗口更新去重：属性修改不立即重新合成',
+          vm.module._gal_render_draw_count() === beforeProperties && paintRequests - beforePaints === 1,
+          `paint requests=${paintRequests - beforePaints}`);
+        await nativeWindow(2, window, undefined, 32, 16);
+        await vm.dispose(await vm.source(`
+          child.visible = false;
+          primary.setSize(32, 16); primary.setImageSize(32, 16);
+          primary.fillRect(0, 0, 32, 16, 0xff000000);
+          primary.font.height = 14;
+          primary.drawText(0, 0, "文", 0xffffff, 255, true, 0);
+        `, 'native-font-check'));
+        await nativeWindow(1, window);
+        const glyphPixels = vm.module._malloc(32 * 16 * 4);
+        try {
+          vm.module._gal_render_read_canvas(glyphPixels);
+          const rgba = new Uint8Array(vm.module.HEAPU8.buffer, glyphPixels, 32 * 16 * 4);
+          record('原版 Layer.Font、FreeType 字形与 GPU 文本合成',
+            rgba.some((value, index) => index % 4 !== 3 && value > 0), '');
+        } finally { vm.module._free(glyphPixels); }
+        // A transparent group has no main image, but must still initialize its
+        // reused offscreen target before compositing children.
+        await vm.dispose(await vm.source(`
+          child.visible = false;
+          primary.fillRect(0, 0, 32, 16, 0xff00ff00);
+          var warmGroup = new Layer(nativeWindow, primary);
+          warmGroup.setSize(32, 16); warmGroup.hasImage = false;
+          warmGroup.opacity = 128; warmGroup.visible = true;
+          var warmChild = new Layer(nativeWindow, warmGroup);
+          warmChild.setSize(32, 16); warmChild.fillRect(0, 0, 32, 16, 0xffff0000); warmChild.visible = true;
+        `, 'warm-group-buffer'));
+        await nativeWindow(1, window);
+        await vm.dispose(await vm.source(`
+          warmGroup.visible = false;
+          var emptyGroup = new Layer(nativeWindow, primary);
+          emptyGroup.setSize(32, 16); emptyGroup.hasImage = false;
+          emptyGroup.opacity = 128; emptyGroup.visible = true;
+          var emptyChild = new Layer(nativeWindow, emptyGroup);
+          emptyChild.setSize(32, 16); emptyChild.fillRect(0, 0, 32, 16, 0); emptyChild.visible = true;
+        `, 'reuse-group-buffer'));
+        await nativeWindow(1, window);
+        // Reuse the same group after another group has borrowed the pool slot.
+        await vm.dispose(await vm.source('emptyGroup.visible = false; warmGroup.visible = true;'));
+        await nativeWindow(1, window);
+        await vm.dispose(await vm.source('warmGroup.visible = false; emptyGroup.visible = true; primary.fillRect(0, 0, 32, 16, 0xff00ff00);'));
+        await nativeWindow(1, window);
+        const groupPixels = vm.module._malloc(32 * 16 * 4);
+        try {
+          vm.module._gal_render_read_canvas(groupPixels);
+          const pixel = Array.from(vm.module.HEAPU8.subarray(groupPixels, groupPixels + 4));
+          record('无主图像的透明图层组复用离屏缓冲时不残留旧画面',
+            pixel[0] === 0 && pixel[1] === 255 && pixel[2] === 0, `rgba=${pixel}`);
+        } finally { vm.module._free(groupPixels); }
+        await vm.dispose(await vm.source('invalidate warmChild; invalidate warmGroup; invalidate emptyChild; invalidate emptyGroup; child.visible = true;'));
+
+        await vm.dispose(await vm.source(`
+          primary.fillRect(0, 0, 32, 16, 0xff000000);
+          var transA = new Layer(nativeWindow, primary), transB = new Layer(nativeWindow, primary);
+          transA.setSize(4, 4); transA.setImageSize(4, 4); transA.setPos(10, 4);
+          transA.fillRect(0, 0, 4, 4, 0xffff0000); transA.type = 1; transA.visible = true;
+          transB.setSize(4, 4); transB.setImageSize(4, 4); transB.setPos(10, 4);
+          transB.fillRect(0, 0, 4, 4, 0xff0000ff); transB.type = 1; transB.visible = false;
+          var transChild = new Layer(nativeWindow, transB);
+          transChild.setSize(1, 1); transChild.setImageSize(1, 1);
+          transChild.fillRect(0, 0, 1, 1, 0xff0000ff); transChild.type = 1; transChild.visible = true;
+          var transTime = 0;
+          function transClock() { return transTime; }
+          transA.beginTransition("crossfade", true, transB, %[time: 100, selfupdate: true, callback: transClock]);
+        `, 'native-transition-offset'));
+        await nativeWindow(1, window);
+        await vm.dispose(await vm.source('transTime = 50;'));
+        await nativeWindow(1, window);
+        const transitionPixels = vm.module._malloc(32 * 16 * 4);
+        try {
+          vm.module._gal_render_read_canvas(transitionPixels);
+          const p = new Uint8Array(vm.module.HEAPU8.buffer, transitionPixels + (5 * 32 + 11) * 4, 4);
+          record('带偏移的子树转场使用正确的源图像', p[0] > 100 && p[2] > 100, `rgba=${Array.from(p)}`);
+        } finally { vm.module._free(transitionPixels); }
+        await vm.dispose(await vm.source('transA.stopTransition(); invalidate transA; invalidate transB;'));
+        await vm.nativePlugins(0, 'extrans.dll');
+        for (const effect of ['wave', 'mosaic', 'ripple', 'turn', 'rotatezoom', 'rotatevanish', 'rotateswap']) {
+          await vm.source(`
+            transA = new Layer(nativeWindow, primary); transB = new Layer(nativeWindow, primary);
+            transA.setSize(16, 16); transA.setImageSize(16, 16); transA.setPos(8, 0);
+            transB.setSize(16, 16); transB.setImageSize(16, 16); transB.setPos(8, 0);
+            transA.fillRect(0, 0, 16, 16, 0xffff0000); transA.type=1; transA.visible=true;
+            transB.fillRect(0, 0, 16, 16, 0xff0000ff); transB.type=1; transB.visible=false;
+            transTime=0;
+            transA.beginTransition("${effect}", false, transB,
+              %[time:100, maxh:0, maxdrift:0, selfupdate:true, callback:transClock]);
+          `, `extrans-${effect}`);
+          await nativeWindow(1, window);
+          await vm.source('transTime=50;');
+          await nativeWindow(1, window);
+          const ptr = vm.module._malloc(32 * 16 * 4);
+          try {
+            vm.module._gal_render_read_canvas(ptr);
+            const rgba = Array.from(new Uint8Array(vm.module.HEAPU8.buffer, ptr + (8 * 32 + 16) * 4, 4));
+            const mix = !['wave', 'mosaic', 'ripple'].includes(effect) || (rgba[0] > 80 && rgba[2] > 80);
+            record(`GLES extrans ${effect} 中间帧`, mix, `rgba=${rgba}`);
+          } finally { vm.module._free(ptr); }
+          await vm.source('transTime=100;');
+          await nativeWindow(1, window);
+          await vm.source('transA.stopTransition(); invalidate transA; invalidate transB;');
+        }
+        const ruleCanvas = document.createElement('canvas');
+        ruleCanvas.width = ruleCanvas.height = 4;
+        const ruleContext = ruleCanvas.getContext('2d');
+        ruleContext.fillStyle = '#000'; ruleContext.fillRect(0, 0, 2, 4);
+        ruleContext.fillStyle = '#fff'; ruleContext.fillRect(2, 0, 2, 4);
+        const rule = new Uint8Array(await (await new Promise(resolve => ruleCanvas.toBlob(resolve))).arrayBuffer());
+        storage.registerMedia('rule://', { isExistent: path => path === 'stripe.png', read: async () => rule });
+        await vm.dispose(await vm.source(`
+          transA = new Layer(nativeWindow, primary); transB = new Layer(nativeWindow, primary);
+          transA.setSize(4, 4); transA.setImageSize(4, 4); transA.setPos(10, 4);
+          transA.fillRect(0, 0, 4, 4, 0xffff0000); transA.type = 1; transA.visible = true;
+          transB.setSize(4, 4); transB.setImageSize(4, 4); transB.setPos(10, 4);
+          transB.fillRect(0, 0, 4, 4, 0xff0000ff); transB.type = 1; transB.visible = false;
+          transChild = new Layer(nativeWindow, transB);
+          transChild.setSize(1, 1); transChild.setImageSize(1, 1);
+          transChild.fillRect(0, 0, 1, 1, 0xff0000ff); transChild.type = 1; transChild.visible = true;
+          transTime = 0;
+          transA.beginTransition("universal", true, transB, %[time: 100, vague: 4, rule: "rule://stripe.png", selfupdate: true, callback: transClock]);
+          var otherA = new Layer(nativeWindow, primary), otherB = new Layer(nativeWindow, primary);
+          otherA.setSize(4, 4); otherA.setImageSize(4, 4); otherA.setPos(20, 4);
+          otherB.setSize(4, 4); otherB.setImageSize(4, 4); otherB.setPos(20, 4);
+          otherA.fillRect(0, 0, 4, 4, 0xffff0000); otherA.type = 1; otherA.visible = true;
+          otherB.fillRect(0, 0, 4, 4, 0xff0000ff); otherB.type = 1; otherB.visible = false;
+          otherA.beginTransition("universal", true, otherB, %[time: 100, vague: 64, rule: "rule://stripe.png", selfupdate: true, callback: function(){ return 0; }]);
+        `, 'native-universal-transition'));
+        await nativeWindow(1, window);
+        await vm.dispose(await vm.source('transTime = 50;'));
+        await nativeWindow(1, window);
+        const stripePixels = vm.module._malloc(32 * 16 * 4);
+        try {
+          vm.module._gal_render_read_canvas(stripePixels);
+          const rgba = new Uint8Array(vm.module.HEAPU8.buffer, stripePixels, 32 * 16 * 4);
+          const left = Array.from(rgba.slice((5 * 32 + 10) * 4, (5 * 32 + 10) * 4 + 4));
+          const right = Array.from(rgba.slice((5 * 32 + 13) * 4, (5 * 32 + 13) * 4 + 4));
+          record('并行规则转场隔离进度与模糊参数、保留子树源', left[2] > 240 && right[0] > 240, `left=${left} right=${right}`);
+        } finally { vm.module._free(stripePixels); }
+        await vm.dispose(await vm.source('transA.stopTransition(); invalidate transA; invalidate transB; otherA.stopTransition(); invalidate otherA; invalidate otherB;'));
+        await vm.dispose(await vm.source(`
+          child.setMainPixel(0, 0, 0x804020); child.setMaskPixel(0, 0, 128);
+          child.type = 12; child.convertType(0);
+          if(child.getMainPixel(0, 0) != 0x402010 || child.getMaskPixel(0, 0) != 128)
+            throw new Exception("alpha to additive conversion mismatch");
+          child.type = 2; child.convertType(4);
+          if(child.getMainPixel(0, 0) != 0x804020 || child.getMaskPixel(0, 0) != 128)
+            throw new Exception("additive to alpha conversion mismatch");
+        `, 'native-alpha-conversion'));
+        record('原版 Layer.convertType：硬件预乘与 shader 反向转换', true, '');
+        await vm.dispose(await vm.source(`
+          child.setMainPixel(0, 0, 0x804020); child.setMaskPixel(0, 0, 128);
+          child.adjustGamma(1, 10, 210, 1, 20, 220, 1, 30, 230);
+          var pixel = child.getMainPixel(0, 0);
+          if(Math.abs(((pixel >> 16) & 255) - 110) > 1 ||
+             Math.abs(((pixel >> 8) & 255) - 70) > 1 ||
+             Math.abs((pixel & 255) - 55) > 1 || child.getMaskPixel(0, 0) != 128)
+            throw new Exception("gamma channel parameters mismatch");
+          child.doGrayScale();
+          pixel = child.getMainPixel(0, 0);
+          if(((pixel >> 16) & 255) != ((pixel >> 8) & 255) ||
+             ((pixel >> 8) & 255) != (pixel & 255) || child.getMaskPixel(0, 0) != 128)
+            throw new Exception("grayscale channel mismatch");
+        `, 'native-layer-color-adjustment'));
+        record('原版 Layer gamma 与灰度：通道参数及 alpha 保留', true, '');
+        const mediaBitmap = await vm.visualBitmap({width: 1, height: 1, pixels: new Uint8Array([17, 34, 51, 255])});
+        try {
+          vm.registerGlobal('mediaBitmap', mediaBitmap);
+          await vm.dispose(await vm.source(`
+            child.operateAffine(mediaBitmap, 0, 0, 1, 1, false, 0, 0, 1, 0, 0, 1, 2, 255, 1);
+            if(child.getMainPixel(0, 0) != 0x112233)
+              throw new Exception("browser media native affine mismatch: " + child.getMainPixel(0, 0) + ", source=" + mediaBitmap.getPixel(0, 0));
+          `, 'native-media-affine'));
+        } finally { await vm.dispose(mediaBitmap); }
+        record('浏览器媒体上传至原版 Bitmap 并通过 Layer 仿射绘制', true, '');
+        await vm.dispose(await vm.source(`
+          var blur = new Layer(nativeWindow, primary);
+          blur.setSize(4, 4); blur.setImageSize(4, 4);
+          blur.type = 1;
+          blur.fillRect(0, 0, 4, 4, 0xff000000);
+          blur.setMainPixel(1, 1, 0xffffff);
+          blur.doBoxBlur(1, 1);
+          var center = blur.getMainPixel(1, 1);
+          var expected = 255 / 9;
+          if(Math.abs(((center >> 16) & 255) - expected) > 2 ||
+             Math.abs(((center >> 8) & 255) - expected) > 2 ||
+             Math.abs((center & 255) - expected) > 2)
+            throw new Exception("BoxBlur average mismatch: " + center);
+          blur.doBoxBlur(1, 1);
+          if(blur.getMainPixel(1, 1) == 0)
+            throw new Exception("BoxBlur second pass returned black");
+          invalidate blur;
+        `, 'native-box-blur'));
+        record('原版 Layer.doBoxBlur（BoxBlur/BoxBlurAlpha 与 u_sample 偏移）', true, '');
+        // System.graphicCache* is exercised through the TJSInterop bridge
+        // instead of a script System global: this page only registers the
+        // native Layer/Bitmap/Font globals, not the JS System class.
+        const savedLimit = vm.graphicCacheLimit();
+        try {
+          // The platform ceiling must be non-zero before a script limit can
+          // enable the cache (SysInitImpl.cpp derives it from physical memory).
+          const ceiling = vm.setGraphicCacheSystemLimit(256 * 1024 * 1024);
+          record('图形缓存上限可由宿主提供（SysInitImpl 等价初始化）',
+            ceiling === 256, `ceiling=${ceiling}MB`);
+          vm.setGraphicCacheLimit(32 * 1024 * 1024);
+          record('System.graphicCacheLimit 直连 native 图形缓存',
+            vm.graphicCacheLimit() === 32 * 1024 * 1024, `limit=${vm.graphicCacheLimit()}`);
+          vm.clearGraphicCache();
+          await vm.touchImages([], 1024, 0);
+          // Missing storage is swallowed by TVPTouchImages like the reference;
+          // this also covers the JSPI suspension path.
+          await vm.touchImages(['missing.png'], 1024, 0);
+          record('System.clearGraphicCache/touchImages 直连 native 图形缓存', true, '');
+        } finally {
+          vm.setGraphicCacheLimit(savedLimit);
+        }
+      } finally { await vm.dispose(window); }
+    } catch(error) {
+      record('原版 TJS 视觉链执行', false, String(error));
+    } finally {
+      const visualModule = vm.module;
+      await vm.dispose();
+      visualModule._gal_render_shutdown();
+      record('原版窗口、图层和字体退出后释放 GL 资源', visualResources.objects.size === 0 && visualResources.locations.size === 0,
+        `objects=${visualResources.objects.size}, programs=${visualResources.locations.size}`);
+    }
+  }
+  module._gal_render_shutdown();
+  record('关闭设备清理全部 GL 对象和 uniform', resources.objects.size === 0 && resources.locations.size === 0,
+    `objects=${resources.objects.size}, programs=${resources.locations.size}`);
+  const restarted = module._gal_render_initialize(WIDTH, HEIGHT);
+  const restartedTexture = module._gal_render_texture_create(2, 2, 1);
+  record('关闭后重建保留有效纹理句柄', restarted === 1 && restartedTexture > 0, `id=${restartedTexture}`);
+  if (restartedTexture > 0) {
+    module._gal_render_texture_fill(restartedTexture, 0, 0, 2, 2, 0x80123456);
+    compare('关闭后重建可以绘制', readTexture(restartedTexture), fillPattern(2, 2, [rgba(0x12, 0x34, 0x56, 0x80)]), 2);
+    module._gal_render_texture_release(restartedTexture);
+  }
+
+  const drawCount = module._gal_render_draw_count();
+  record('绘制调用计数可用', Number(drawCount) > 0, `draws=${drawCount}`);
+  const glError = gl.getError();
+  record('WebGL 无错误', glError === 0, `gl.getError()=${glError}`);
+  const backendError = (() => {
+    const length = module._gal_render_last_error(scratch, 512);
+    return length > 0 ? new TextDecoder().decode(new Uint8Array(module.HEAPU8.buffer, scratch, length)) : '';
+  })();
+  record('后端无编译错误', backendError === '', backendError);
+} catch (error) {
+  record('执行异常', false, String(error && error.stack || error));
+} finally {
+  module._free(scratch);
+  module._gal_render_shutdown();
+}
+
+const failed = results.filter(item => !item.pass);
+const summary = `${results.length - failed.length}/${results.length} 通过`;
+document.getElementById('summary').textContent = failed.length ? `FAIL — ${summary}` : `PASS — ${summary}`;
+const body = document.querySelector('#report tbody');
+for (const item of results) {
+  const row = document.createElement('tr');
+  if (!item.pass) row.className = 'fail';
+  row.innerHTML = `<td>${item.name}</td><td>${item.pass ? '通过' : '失败'}</td><td>${item.detail ?? ''}</td>`;
+  body.appendChild(row);
+}
+window.renderTestResult = { passed: results.length - failed.length, total: results.length, failures: failed, results, globalErrors };
+
+</script>
+</body>
+</html>

@@ -1,8 +1,8 @@
 #pragma once
 #include "tjs.h"
 #include "tjsError.h"
+#include "MsgIntf.h"
 using namespace TJS;
-inline constexpr auto TVPInternalError = TJS_W("Internal error at %1 line %2");
 struct tTVPCompactEventCallbackIntf
 {
     virtual void OnCompact(tjs_int level) = 0;
@@ -10,8 +10,10 @@ struct tTVPCompactEventCallbackIntf
 };
 inline constexpr tjs_int TVP_COMPACT_LEVEL_IDLE = 5;
 inline constexpr tjs_int TVP_COMPACT_LEVEL_DEACTIVATE = 10;
+inline constexpr tjs_int TVP_COMPACT_LEVEL_MINIMIZE = 15;
 inline constexpr tjs_int TVP_COMPACT_LEVEL_MAX = 100;
 void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf *callback);
+void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf *callback);
 iTJSTextReadStream *TVPCreateTextStreamForRead(const ttstr &name, const ttstr &mode);
 void TVPExecuteExpression(const ttstr &expression, iTJSDispatch2 *context, tTJSVariant *result);
 void TVPAddLog(const ttstr &text);

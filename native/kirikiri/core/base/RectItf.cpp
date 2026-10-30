@@ -358,3 +358,16 @@ tTJSNativeClass *TVPCreateNativeClass_Rect() {
     tTJSNativeClass *cls = new tTJSNC_Rect();
     return cls;
 }
+
+iTJSDispatch2 *TVPCreateRectObject(tjs_int left, tjs_int top, tjs_int right, tjs_int bottom) {
+    struct Holder {
+        iTJSDispatch2 *Object = new tTJSNC_Rect();
+        ~Holder() { Object->Release(); }
+    } static rectClass;
+    tTJSVariant values[] = {left, top, right, bottom};
+    tTJSVariant *args[] = {values, values + 1, values + 2, values + 3};
+    iTJSDispatch2 *result = nullptr;
+    if (TJS_FAILED(rectClass.Object->CreateNew(0, nullptr, nullptr, &result, 4, args, rectClass.Object)))
+        TVPThrowInternalError;
+    return result;
+}

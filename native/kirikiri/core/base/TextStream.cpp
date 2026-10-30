@@ -11,10 +11,6 @@
 #include <cstring>
 #include <memory>
 
-static constexpr auto TVPUnsupportedCipherMode = TJS_W("Unsupported text cipher mode: %1");
-static constexpr auto TVPUnsupportedModeString = TJS_W("Unsupported text stream mode: %1");
-static constexpr auto TVPCompressionFailed = TJS_W("Text stream compression failed");
-static constexpr auto TVPUnsupportedEncoding = TJS_W("Unsupported text encoding: %1");
 
 extern "C" int gbk_mbtowc(unsigned short *wc, const unsigned char *s);
 extern "C" int sjis_mbtowc(unsigned short *wc, const unsigned char *s);

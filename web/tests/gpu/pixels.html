@@ -3,47 +3,14 @@
 <title>GPU text pixel check</title>
 <pre id="result">running</pre>
 <script type="module">
-import { Image, tileImage } from '/engine-js/bitmap.js';
-import { shrinkArea, rasterCopy } from '/engine-js/plugins/gpu-resample.js';
-import { gpuBtoa } from '/engine-js/plugins/gpu-btoa.js';
-import { uploadVideoCanvas } from '/engine-js/video.js';
-import { initializeGPU, getGPU } from '/engine-js/gpu.js';
-import { clipBlit, blurGlyphImage, createTextRenderer, TEXT_BLEND } from '/engine-js/font.js';
-import { decodeSource } from '/engine-js/codecs/psb.js';
-import { loadGraphic } from '/engine-js/codecs/decode.js';
-import { loadGraphicAsync } from '/engine-js/codecs/async-decode.js';
-import { encodeTLG, makeBMP } from '/engine-js/codecs/encode.js';
-import { codecs } from '/engine-js/codecs/wasm.js';
-import { createGraphicLoader } from '/engine-js/graphic.js';
+import { Image, tileImage } from './bitmap-reference.js';
+import { initializeGPU, getGPU } from './gpu-reference.js';
+import { clipBlit, blurGlyphImage, createTextRenderer, TEXT_BLEND } from '/tests/gpu/font-reference.js';
 
 const gpu = initializeGPU(document, TEXT_BLEND);
 const result = [];
 const fail = message => { throw new Error(message); };
 async function checkSharedImages() {
-  const bmpPixels = new Uint8ClampedArray(64 * 64 * 4);
-  for (let i = 0; i < bmpPixels.length; i += 4) bmpPixels.set([12, 34, 56, 255], i);
-  const bmp = makeBMP(new Image(64, 64, { pixels: bmpPixels }), 24);
-  const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQMAAABIeJ9nAAAABlBMVEUMIjhOWnuhvGg+AAAAAnRSTlMAgJsrThgAAAAMSURBVHicY3BgaAAAAUQAwTp6HFYAAAAASUVORK5CYII='), c => c.charCodeAt(0));
-  const clear = gpu.gl.clear;
-  let clears = 0;
-  gpu.gl.clear = function(...args) { clears++; return clear.apply(this, args); };
-  try {
-    for (const [bytes, province, expected] of [
-      [bmp, false, bmpPixels],
-      [png, false, new Uint8ClampedArray([12,34,56,0,78,90,123,128,78,90,123,128,12,34,56,0])],
-      [png, true, new Uint8ClampedArray([0,1,1,0])],
-    ]) {
-      const before = gpu.diagnostics();
-      const { image } = await loadGraphic({ read: async () => bytes, name: 'decoder-check' }, 0x1fffffff, { province });
-      if (clears || gpu.diagnostics().textureCount !== before.textureCount || image.gpuValid)
-        fail('BMP/PNG decoding performed GPU pixel writes');
-      if (firstDifference(expected, image.pixels) !== -1) fail('CPU decoder changed image bytes');
-      gpu.texture(image);
-      if (gpu.diagnostics().uploads !== before.uploads + 1) fail('decoded image must upload once on first GPU use');
-      image.release();
-    }
-  } finally { gpu.gl.clear = clear; }
-  result.push('BMP/indexed PNG: exact CPU pixels, zero GPU clears during decode, one deferred upload');
   const rect = { left: 0, top: 0, right: 8, bottom: 8 };
   const source = new Image(8, 8);
   gpu.fill(source, rect, [12, 23, 34, 127]);
@@ -76,37 +43,6 @@ async function checkSharedImages() {
     fail('GPU use lost the exported writable buffer');
   externalAssigned.fill(rect, 0xffabcdef);
   if (writable[0] !== 99) fail('assigned GPU write changed exported array');
-  const prepared = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);
-  const preparedCopy = prepared.copyReference(), shared = prepared._storage;
-  const beforePreparation = gpu.diagnostics();
-  await gpu.prepareTextures([prepared, preparedCopy, new Image(1, 1)]);
-  if (prepared._storage !== shared || preparedCopy.gpu !== prepared.gpu || !preparedCopy.gpuValid
-    || gpu.diagnostics().uploads !== beforePreparation.uploads + 1 || preparedCopy.point(0, 0) !== 0x7f0c1722)
-    fail('texture preparation split shared storage or uploaded it twice');
-  const encoded = encodeTLG(Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1));
-  let reads = 0;
-  const loader = createGraphicLoader({
-    getPlacedPath: async name => name === 'shared.tlg' ? name : '',
-    readPlaced: async () => { reads++; return encoded.slice(); },
-  });
-  const beforeLoad = gpu.diagnostics();
-  const first = await loader.load('shared.tlg');
-  if (gpu.diagnostics().uploads !== beforeLoad.uploads) fail('loading forced a texture upload');
-  await gpu.prepareTextures([first.image]);
-  const second = await loader.load('shared.tlg');
-  const entry = first.image.gpu, beforeClear = gpu.diagnostics();
-  if (reads !== 1 || second.image.gpu !== entry) fail('cached load did not share texture');
-  loader.clear();
-  if (second.image.gpu !== entry || !second.image.gpuValid
-    || gpu.diagnostics().readbacks !== beforeClear.readbacks
-    || gpu.diagnostics().textureCount !== beforeClear.textureCount)
-    fail('cache eviction released or read back a live shared texture');
-  first.image.fill({ left: 0, top: 0, right: 1, bottom: 1 }, 0xffabcdef);
-  if (second.image.point(0, 0) !== 0x7f0c1722) fail('cached image write changed another caller');
-  first.image.release();
-  second.image.release();
-  if (gpu.imageTextures.has(entry)) fail('last explicit image release retained texture');
-  result.push('Graphic cache: deferred upload, shared hits, eviction preserves live GPU storage, isolated writes');
   const commands = Array.from({ length: 3 }, () => ({ source, options: { motion: true, mode: 0, opacity: 255 } }));
   // Startup Motion changes target dimensions, forcing accumulation-buffer
   // replacement. The texture cache is keyed by storage, not Image wrappers.
@@ -799,63 +735,6 @@ try {
     result.push('GPU glyph blur to atlas: zero CPU readbacks');
   }
   {
-    const image = target(128), province = new Image(12, 9, { gray: true });
-    const before = gpu.stats.readbackBytes;
-    const bounds = gpuBtoa.fillToProvince(image, province, [2, 1, 10, 8], 0, 7, 64, true);
-    if (String(bounds) !== '2,1,8,7') fail('GPU province bounding box');
-    if (gpu.stats.readbackBytes - before !== 7 * 4) fail('GPU bbox readback must be per-row');
-    const bytes = province.pixels;
-    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
-      if (bytes[y * 12 + x] !== (x >= 2 && x < 10 && y >= 1 && y < 8 ? 7 : 0)) fail('GPU province clipped write');
-    }
-    if (gpuBtoa.fillToProvince(image, province, [0, 0, 12, 9], 0, 3, 256, true) !== undefined) fail('GPU empty bbox');
-    const mask = Image.from(new Uint8ClampedArray(12 * 9).fill(37), 12, 9, { gray: true });
-    const expected = image.clone(), p = expected.writablePixels;
-    for (let i = 3; i < p.length; i += 4) p[i] = 37;
-    gpuBtoa.assignAlpha(image, mask);
-    compare('GPU gray mask alpha assignment', expected, image);
-    const mat = image.clone(), matExpected = image.clone(), q = matExpected.writablePixels, rgb = [211, 53, 137];
-    for (let i = 0; i < q.length; i += 4) {
-      for (let c = 0; c < 3; c++) q[i + c] = rgb[c] + ((q[i + c] - rgb[c]) * q[i + 3] >> 8);
-      q[i + 3] = 255;
-    }
-    gpuBtoa.alphaColorMat(mat, 0xd33589);
-    compare('GPU alpha color mat signed rounding', matExpected, mat);
-    result.push('GPU province fill: clipped/empty bbox, only 4 bytes readback per row');
-  }
-  {
-    const source = target(128), p = source.pixels;
-    for (const ratio of [[1, 1], [2, 2], [2.5, 2.25], [3.7, 2.9]]) {
-      const dest = new Image(4, 4), expected = new Image(4, 4), out = expected.writablePixels;
-      const offset = [0.4, 0.2];
-      for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) for (let c = 0; c < 4; c++) {
-        const a = [(x - offset[0]) * ratio[0], (y - offset[1]) * ratio[1]], b = [a[0] + ratio[0], a[1] + ratio[1]];
-        let sum = 0;
-        for (let sy = Math.max(0, Math.floor(a[1])); sy <= Math.min(6, Math.ceil(b[1]) - 1); sy++)
-          for (let sx = Math.max(0, Math.floor(a[0])); sx <= Math.min(9, Math.ceil(b[0]) - 1); sx++)
-            sum += p[((sy + 1) * 12 + sx + 1) * 4 + c] * (Math.min(b[0], sx + 1) - Math.max(a[0], sx)) * (Math.min(b[1], sy + 1) - Math.max(a[1], sy));
-        out[(y * 4 + x) * 4 + c] = Math.trunc(sum / (ratio[0] * ratio[1]));
-      }
-      shrinkArea(source, dest, { clip: { left: 0, top: 0, right: 4, bottom: 4 }, ratio, sourceOrigin: [1, 1], sourceExtent: [10, 7], destinationOffset: offset });
-      const actual = dest.pixels;
-      const max = Math.max(...actual.map((v, i) => Math.abs(v - out[i])));
-      if (max > 1) fail('fractional GPU shrink error ' + max);
-      result.push(`GPU fractional area ${ratio}: max byte difference=${max}`);
-    }
-    const fast = new Image(3, 3), expected = new Image(3, 3), out = expected.writablePixels;
-    for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) {
-      const w = Math.min(5, 12 - x * 5), h = Math.min(4, 9 - y * 4);
-      for (let c = 0; c < 3; c++) {
-        let sum = 0;
-        for (let sy = 0; sy < h; sy++) for (let sx = 0; sx < w; sx++) sum += p[((y * 4 + sy) * 12 + x * 5 + sx) * 4 + c];
-        out[(y * 3 + x) * 4 + c] = Math.trunc(sum / (w * h));
-      }
-      out[(y * 3 + x) * 4 + 3] = 255;
-    }
-    shrinkArea(source, fast, { clip: { left: 0, top: 0, right: 3, bottom: 3 }, ratio: [5, 4], fast: true });
-    compare('GPU fast shrink remainder blocks and opaque alpha', expected, fast);
-  }
-  {
     const gray = Image.from(new Uint8ClampedArray([11, 22, 33, 44]), 2, 2, { gray: true });
     gpu.texture(gray);
     const copy = gray.clone();
@@ -864,52 +743,14 @@ try {
     if (String(tiled.pixels) !== '11,22,11,33,44,33,11,22,11') fail('R8 tiled texture');
     copy.fill({ left: 0, top: 0, right: 1, bottom: 1 }, 99);
     if (copy.point(0, 0) !== 99 || copy.pixels[3] !== 44) fail('R8 GPU fill');
-    const province = new Image(12, 9, { gray: true }), source = target(128);
-    gpuBtoa.copyAlphaToProvince(source, province, [0, 0, 12, 9], 127, 7, 3, 1);
-    if (!province.pixels.every(x => x === 7)) fail('R8 alpha threshold');
-    result.push('R8 upload, clone, readback, GPU fill, tiling and alpha threshold: exact bytes');
-  }
-  {
-    const source = target(128), dest = target(71), expected = dest.clone();
-    for (let i = 3; i < expected.writablePixels.length; i += 4) expected._pixels[i] = (71 * 128 + (71 * 128 >> 7)) >> 8;
-    gpuBtoa.clipAlphaRect(dest, source, [0, 0, 12, 9], [0, 0, 12, 9], [0, 0]);
-    compare('GPU alpha clip uses alpha channel', expected, dest);
-    const overlap = Image.from(new Uint8ClampedArray([10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255]), 4, 1);
-    gpuBtoa.overwrapRect(overlap, overlap, [1, 0, 4, 1], [1, 0, 4, 1], [0, 0], 1);
-    if ([0, 4, 8, 12].some(i => overlap.pixels[i] !== 10)) fail('GPU forward self-copy');
-    const filled = target(71);
-    gpuBtoa.fillAlpha(filled, [2, 1, 10, 8]);
-    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
-      if (filled.pixels[(y * 12 + x) * 4 + 3] !== (x >= 2 && x < 10 && y >= 1 && y < 8 ? 255 : 71)) fail('GPU fillAlpha clip');
-    }
-    result.push('GPU alpha helper self-copy: exact bytes');
-  }
-  {
-    const source = target(128), dest = new Image(4, 3), expected = new Image(4, 3);
-    const p = source.pixels, out = expected.writablePixels;
-    for (let y = 0; y < 3; y++) for (let x = 0; x < 4; x++) for (let c = 0; c < 4; c++) {
-      let sum = 0;
-      for (let sy = 0; sy < 3; sy++) for (let sx = 0; sx < 3; sx++) sum += p[((y * 3 + sy) * 12 + x * 3 + sx) * 4 + c];
-      out[(y * 4 + x) * 4 + c] = Math.trunc(sum / 9);
-    }
-    const reads = gpu.stats.readbacks;
-    shrinkArea(source, dest, { clip: { left: 0, top: 0, right: 4, bottom: 3 }, ratio: [3, 3] });
-    if (gpu.stats.readbacks !== reads) fail('GPU shrink read pixels');
-    compare('GPU integer area average', expected, dest);
-    const raster = target(71), rasterExpected = raster.clone(), shifts = [0, 1, -1, 2, -2, 30, -30, 0, 3];
-    for (let y = 0; y < 9; y++) for (let x = 0; x < 12; x++) {
-      const sx = x - shifts[y];
-      if (sx >= 0 && sx < 12) rasterExpected.writablePixels.set(p.subarray((y * 12 + sx) * 4, (y * 12 + sx) * 4 + 4), (y * 12 + x) * 4);
-    }
-    rasterCopy(source, raster, shifts, { left: 0, top: 0, right: 12, bottom: 9 });
-    compare('GPU raster signed shifts and untouched edges', rasterExpected, raster);
+    result.push('R8 upload, clone, readback, GPU fill and tiling: exact bytes');
   }
   {
     const canvas = new OffscreenCanvas(2, 2), context = canvas.getContext('2d');
     const pixels = new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 12, 34, 56, 255]);
     context.putImageData(new ImageData(pixels, 2, 2), 0, 0);
     const image = new Image(2, 2, { defer: true });
-    uploadVideoCanvas(image, canvas);
+    gpu.uploadCanvas(image, canvas);
     if (firstDifference(image.pixels, pixels) !== -1) fail('GPU canvas upload orientation');
     result.push('GPU video canvas upload orientation: exact RGBA');
   }
@@ -1026,75 +867,6 @@ try {
       gpu.compositeOffscreen(actual, commands);
       compare('Offscreen without float colour extension', expected, actual);
     } finally { gpu.floatCompositing = original; }
-  }
-  {
-    const original = target(128);
-    for (const format of ['tlg5', 'tlg6']) {
-      const bytes = encodeTLG(original, format, new Map([['caption', 'worker pixels']]));
-      const storage = { read: async () => bytes, name: `${format}.tlg` };
-      const sync = await loadGraphic(storage), async = await loadGraphicAsync(storage);
-      const raw = encodeTLG(original, format);
-      const reference = format === 'tlg5' ? decodeTLG5CPUReference(raw) : decodeTLG6CPUReference(raw);
-      compare(`${format} Rust vs legacy JS decoder`, reference, sync.image);
-      compare(`${format} worker decode`, sync.image, async.image);
-      if (async.metainfo?.get('caption') !== 'worker pixels') fail('worker TLG metadata');
-      if (!bytes.byteLength) fail('worker detached storage buffer');
-      const gray = await loadGraphicAsync(storage, 0x1fffffff, { gray: true });
-      const syncGray = await loadGraphic(storage, 0x1fffffff, { gray: true });
-      if (!gray.image.gray || firstDifference(gray.image.pixels, syncGray.image.pixels) !== -1) fail('worker grayscale mismatch');
-    }
-    result.push('TLG worker metadata, grayscale and storage ownership preserved');
-  }
-  {
-    // Two literal pixels followed by a three-pixel run, clipped to four pixels.
-    const values = { width: 4, height: 1, compress: 'RL',
-      pixel: new Uint8Array([1, 3, 2, 1, 0, 6, 5, 4, 127, 128, 9, 8, 7, 255]) };
-    const node = { file: {}, offset: 0, has: key => key in values,
-      get: key => key in values ? { toInt: () => values[key], toText: () => values[key], toResource: () => values[key] } : null };
-    const actual = decodeSource(node).pixels;
-    const expected = new Uint8ClampedArray([1, 2, 3, 0, 4, 5, 6, 127, 7, 8, 9, 255, 7, 8, 9, 255]);
-    if (firstDifference(actual, expected) !== -1) fail('PSB direct RL32 decode');
-    const reference = new Uint32Array(4);
-    decodeRL32CPUReference(values.pixel, reference);
-    if (firstDifference(actual, new Uint8Array(reference.buffer)) !== -1) fail('PSB Rust vs legacy RL32');
-    const rl8 = new Uint8Array([1, 3, 4, 128, 5]);
-    if (firstDifference(codecs.decodeRl8(rl8, 5), decodeRL8CPUReference(rl8, 5)) !== -1) fail('PSB Rust vs legacy RL8');
-    result.push('PSB direct RL32 decode: literal/run/alpha/clipped run exact RGBA');
-  }
-  {
-    const file = {};
-    const sourceNode = () => ({ file, offset: 42, path: 'src/test/icon', has: () => false,
-      get: name => name === 'pixel' ? { toResource: () => new Uint8Array([34, 23, 12, 127]) }
-        : ['width', 'height'].includes(name) ? { toInt: () => 1 } : null });
-    const image = decodeSource(sourceNode()), before = gpu.diagnostics();
-    if (!(image instanceof Image) || image.point(0, 0) !== 0x7f0c1722) fail('Motion decoded image or colour mismatch');
-    for (let i = 0; i < 1000; i++) {
-      const cached = decodeSource(sourceNode());
-      if (cached !== image) fail('Motion source identity changed');
-      gpu.texture(cached);
-    }
-    const after = gpu.diagnostics();
-    if (after.textureCount !== before.textureCount + 1 || after.uploads !== before.uploads + 1) fail('Motion source recreated textures');
-    result.push('Motion source: 1000 lookups reuse one Image, one texture and one upload');
-  }
-  {
-    const width = 1024, height = 1025;
-    const pixels = new Uint8ClampedArray(width * height * 4);
-    for (let i = 0; i < pixels.length; i++) pixels[i] = i * 17 + (i >>> 12);
-    const image = new Image(width, height, { pixels });
-    const before = gpu.diagnostics();
-    let yielded = false;
-    requestAnimationFrame(() => { yielded = true; });
-    await gpu.prepareTextures([image, image]);
-    if (!yielded || !image.gpuValid || image.cpuValid || image._pixels !== null)
-      fail('Motion preparation must yield, publish GPU authority and release CPU storage');
-    const prepared = gpu.diagnostics();
-    if (prepared.uploadedBytes - before.uploadedBytes !== pixels.byteLength || prepared.uploads - before.uploads < 2)
-      fail('Motion preparation must split uploads and skip duplicate sources');
-    const copy = image.clone();
-    if (gpu.diagnostics().uploadedBytes !== prepared.uploadedBytes) fail('prepared Motion drawing uploaded source again');
-    if (firstDifference(pixels, copy.pixels) !== -1) fail('prepared Motion pixels changed');
-    result.push('Motion preparation: yields between chunks, uploads each source once, exact RGBA and GPU-only storage');
   }
   {
     const image = Image.from(new Uint8ClampedArray([12, 23, 34, 127]), 1, 1);

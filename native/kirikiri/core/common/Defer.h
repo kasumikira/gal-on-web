@@ -35,7 +35,7 @@ namespace clover {
                     _fun();
                 } catch(...) {
                     std::terminate();
-                } // 或记录日志
+                } // Or log the error.
             }
         }
 

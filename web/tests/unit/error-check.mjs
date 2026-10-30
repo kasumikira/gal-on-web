@@ -321,7 +321,7 @@ const Layer = defineNativeClass('Layer', {
   },
 });
 const { joinLayer, detachLayerTree, setLayerOrder, exchangeLayers,
-  focusNeighbor, layerOffset, isNodeEnabled } = await import('../../engine-js/layer-tree.js');
+  focusNeighbor, layerOffset, isNodeEnabled } = await import('./layer-tree-reference.js');
 Layer.invalidate = owner => detachLayerTree(Layer.state(owner).node);
 registerLayerFields(Layer);
 registerLayerMethods(Layer, { setPos: 0, setImagePos: 1 });

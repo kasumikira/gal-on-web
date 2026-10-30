@@ -1,7 +1,7 @@
 // Focused Image assign copy-on-write checks without the reference fixtures.
-import { Image } from '/engine-js/bitmap.js';
-import { TEXT_BLEND } from '/engine-js/font.js';
-import { initializeGPU, getGPU } from '/engine-js/gpu.js';
+import { Image } from './bitmap-reference.js';
+import { TEXT_BLEND } from '/tests/gpu/font-reference.js';
+import { initializeGPU, getGPU } from './gpu-reference.js';
 
 const output = document.getElementById('result');
 const checks = [];

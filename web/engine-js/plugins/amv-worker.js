@@ -1,5 +1,5 @@
-// AMV 专用 Worker 入口：把会话协议接到 worker 消息通道上。
-// 解码本体在 amv.js（Rust/WASM），协议与容器策略见 amv-worker-core.js。
+// Entry point for the AMV-specific Worker: connect the session protocol to the Worker message channel.
+// Decoding itself is in amv.js (Rust/WASM); see amv-worker-core.js for the protocol and container policy.
 import { AMVDecoder } from './amv.js';
 import { createAmvWorkerEndpoint } from './amv-worker-core.js';
 

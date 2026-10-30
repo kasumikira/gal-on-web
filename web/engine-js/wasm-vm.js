@@ -26,6 +26,7 @@ const INTERPRETER_CLASSES = [
   "Timer",
   "AsyncTrigger",
   "Storages",
+  "System",
 ];
 const TJS_MEMBER_ENSURE_IGNORE_PROPERTY = 0x0a00;
 const TJS_HIDDEN_MEMBER = 0x1000;
@@ -91,8 +92,9 @@ export class TJSInterop {
   get callbacks() {
     return this.host.callbacks;
   }
-  async init(global) {
+  async init(global, graphics = {}) {
     await this.host.init({
+      ...graphics,
       onError: (message) => this.setRuntimeError(message),
       onReadOnly: (callback, name) => this.encodeResult(this.callbacks.get(callback)(name)),
       onDispatch: (callback, operation, receiver, args) => {
@@ -660,11 +662,100 @@ export class TJSInterop {
         case 19: return storage.getPlacedPath(name);
         // KAG lookahead hint: fire-and-forget, must return synchronously.
         case 20: storage.prefetch?.(name); return;
+        case 21: return storage.exists(name);
         case 10: return backend.write(name, value);
         default: throw Error('Unknown storage operation: ' + operation);
       }
     });
     this.module._tjs_runtime_set_storage(this.runtime, callback);
+  }
+
+  async initializeSystem(service) {
+    await this.withAsyncReference(service, async id => {
+      if (!await this.module._tjs_system_initialize(this.runtime, id)) this.fail();
+    });
+  }
+
+  async maintainSystem(start = false) {
+    if (!await this.module._tjs_system_maintain(this.runtime, Number(start))) this.fail();
+  }
+
+  async initializeVisual() {
+    if (!await this.module._tjs_visual_register(this.runtime)) this.fail();
+    const root = this.module._tjs_runtime_global(this.runtime);
+    try {
+      for (const name of ['Layer', 'Font', 'Bitmap']) {
+        const value = await this.withString(name, async pointer =>
+          this.decode(await this.module._tjs_object_get_raw(this.runtime, root, pointer)));
+        try { this.global[name] = await this.pin(value); }
+        finally { await this.dispose(value); }
+      }
+    } finally { this.releaseHandle(root); }
+    return this.global;
+  }
+
+  visualWindow(operation, window, service, x = 0, y = 0, kind = 0, button = 0, flags = 0, cx = 0, cy = 0) {
+    return this.withAsyncReference(window, id => {
+      const call = async (callback = 0) => {
+        if (!await this.module._tjs_visual_window(this.runtime, operation, id, callback, x, y, kind, button, flags, cx, cy)) this.fail();
+      };
+      return operation === 0 ? this.withAsyncReference(service, call) : call();
+    });
+  }
+
+  async visualBitmap(source) {
+    const pointer = this.module._malloc(source.pixels.byteLength);
+    try {
+      this.module.HEAPU8.set(source.pixels, pointer);
+      return this.decode(await this.module._tjs_visual_bitmap(this.runtime, source.width, source.height, pointer));
+    } finally { this.module._free(pointer); }
+  }
+
+  async visualMovieFrame(target, frame, left = 0, top = 0, video = false) {
+    return this.withAsyncReference(target, async id => {
+      const pointer = frame.rgba ? this.module._malloc(frame.rgba.byteLength) : 0;
+      try {
+        if (pointer) this.module.HEAPU8.set(frame.rgba, pointer);
+        if (!await this.module._tjs_visual_movie_frame(this.runtime, id, frame.width, frame.height, left, top, pointer, Number(video))) this.fail();
+      } finally { if (pointer) this.module._free(pointer); }
+    });
+  }
+
+  visualEvents(operation, service) {
+    const call = async (callback = 0) => {
+      if (!await this.module._tjs_visual_events(this.runtime, operation, callback)) this.fail();
+    };
+    return operation === 0 ? this.withAsyncReference(service, call) : call();
+  }
+  // System graphic cache bridge (SystemIntf.cpp): the cache now lives in the
+  // native GraphicsLoaderIntf, so these three members must not be emulated by
+  // the JS loader.  The limit getter/setter stay synchronous; touchImages
+  // loads storages and therefore suspends like any other native storage call.
+  graphicCacheLimit() {
+    const call = this.module._tjs_graphic_cache_limit;
+    return call ? call(this.runtime, 0, 0) : 0;
+  }
+  setGraphicCacheLimit(value) {
+    const call = this.module._tjs_graphic_cache_limit;
+    if (call) call(this.runtime, 1, Number(value));
+  }
+  // SysInitImpl.cpp computes TVPGraphicCacheSystemLimit from physical memory;
+  // the browser passes its deviceMemory estimate (clamped natively to 512MB).
+  setGraphicCacheSystemLimit(bytes) {
+    const call = this.module._tjs_graphic_cache_system_limit;
+    if (call) return call(this.runtime, Number(bytes));
+    return undefined;
+  }
+  clearGraphicCache() {
+    const call = this.module._tjs_clear_graphic_cache;
+    if (call && !call(this.runtime)) this.fail();
+  }
+  async touchImages(images, limit = 0, timeout = 0) {
+    const call = this.module._tjs_touch_images;
+    if (!call) return;
+    await this.withAsyncReference(images, async id => {
+      if (!await call(this.runtime, id, limit, timeout)) this.fail();
+    });
   }
   registerGlobal(name, value) {
     if (INTERPRETER_CLASSES.includes(name)) throw new Error(`TJS owns the global class ${name}`);

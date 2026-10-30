@@ -11,6 +11,3 @@ lto = true
 opt-level = 3
 codegen-units = 1
 panic = "abort"
-
-[dependencies]
-png = "=0.18.1"

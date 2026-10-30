@@ -13,7 +13,7 @@ const server = await createServer({
 });
 try {
   const { setKeyState, queryKeyState, clearKeyStates } = await server.ssrLoadModule('/engine-js/key-state.js');
-  const { virtualKeyCode, virtualKeySide } = await server.ssrLoadModule('/engine-js/layer-composite.js');
+  const { virtualKeyCode, virtualKeySide } = await server.ssrLoadModule('/engine-js/key-state.js');
 
   assert.equal(virtualKeyCode({ key: 'Control', code: 'ControlLeft', keyCode: 17 }), 0x11);
   assert.equal(virtualKeyCode({ key: 'Control', code: 'ControlLeft', keyCode: 0 }), 0x11);
@@ -61,14 +61,13 @@ try {
   const { TJSInterop } = await server.ssrLoadModule('/engine-js/wasm-vm.js');
   const { createSystem } = await server.ssrLoadModule('/engine-js/system.js');
   const vm = await new TJSInterop().init(Object.create(null));
-  const system = createSystem({ vm, enqueueEvent: callback => Promise.resolve().then(callback), storage: null });
-  vm.registerGlobal('System', system.api);
+  const system = await createSystem({ vm, storage: null });
   setKeyState(0xa2, true);
   assert.equal(await vm.source('return System.getKeyState(17);', 'poll-generic'), 1);
   assert.equal(await vm.source('return System.getKeyState(0xA2);', 'poll-left'), 1);
   setKeyState(0xa2, false);
   assert.equal(await vm.source('return System.getKeyState(17);', 'poll-released'), 0);
-  await assert.rejects(() => vm.source('System.getKeyState();', 'poll-noarg'), /requires a key code/);
+  await assert.rejects(() => vm.source('System.getKeyState();', 'poll-noarg'), /Invalid argument count/);
   await vm.dispose();
 
   console.log('key-state-check passed');

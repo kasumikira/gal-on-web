@@ -1,11 +1,13 @@
-// 视频管线定向检查：有界队列、管线生产/消费、公共图层呈现入口、AMV Worker
-// 会话协议与脚本驱动消费。不依赖浏览器：Worker 传输层用回环端点替代，
-// GPU 上传路径单独断言其缺少 WebGL2 时的报错边界。
+// Focused video-pipeline checks: bounded queue, pipeline production/consumption, shared layer
+// presentation entry point, AMV Worker session protocol, and script-driven consumption.
+// No browser is needed: a loopback endpoint replaces Worker transport, and the GPU upload
+// path separately checks the error boundary when WebGL2 is unavailable.
 import assert from 'node:assert/strict';
 import {
-  FrameQueue, VideoPipeline, presentVideoFrame,
+  FrameQueue, VideoPipeline,
 } from '../../engine-js/video-pipeline.js';
-import { Image } from '../../engine-js/bitmap.js';
+import { Image } from '../video/bitmap-reference.js';
+import { presentVideoFrame } from '../video/presentation-reference.js';
 import { createAmvSession, createAmvWorkerEndpoint } from '../../engine-js/plugins/amv-worker-core.js';
 import { AmvWorkerSource } from '../../engine-js/plugins/amv-source.js';
 import { buildAmv } from '../fixtures/amv-fixture.mjs';
@@ -15,8 +17,8 @@ import { readFile } from 'node:fs/promises';
 import { VideoAudio } from '../../engine-js/video-audio.js';
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
-// amv.js 通过 `?url` 引入 WASM，Node 无法直接解析；按 amv-benchmark 的做法把
-// 该导入替换成 data URL，以便在 Node 里驱动真实解码器。
+// amv.js imports WASM through `?url`, which Node cannot parse. As in amv-benchmark, replace
+// that import with a data URL so Node can drive the real decoder.
 const moduleUrl = text => `data:text/javascript;base64,${Buffer.from(text).toString('base64')}`;
 let passed = 0;
 async function check(label, fn) {
@@ -55,7 +57,7 @@ await check('WebCodecs bridge: signed i64 low words preserve negative AAC timest
   }
 });
 
-// --- 有界队列 -------------------------------------------------------------
+// --- Bounded queue ---------------------------------------------------------
 await check('Shared demux: demand-driven reads, delayed audio, cancel and reset', async () => {
   let reads = 0, freed = 0, release;
   const video = { index: 0 }, audio = { index: 1 };
@@ -197,7 +199,7 @@ await check('FrameQueue: 容量变化与 close 都会唤醒等待者', async () 
   assert.deepEqual([...closed].sort(), [1, 2, 3]);
 });
 
-// --- 管线 -----------------------------------------------------------------
+// --- Pipeline --------------------------------------------------------------
 function scriptedSource(frames) {
   const state = { calls: 0, seeks: [], closed: 0, disposed: false };
   let index = 0;
@@ -302,7 +304,7 @@ await check('VideoPipeline: stop 保留已解码帧且不再生产，错误上�
   await broken.dispose();
 });
 
-// --- 公共图层呈现入口 -----------------------------------------------------
+// --- Shared layer presentation entry point --------------------------------
 await check('presentVideoFrame: 尺寸、位置、逐行写入与重绘请求', async () => {
   const node = { image: new Image(8, 8), width: 0, height: 0, left: 0, top: 0, imageModified: false };
   const Layer = {
@@ -322,7 +324,8 @@ await check('presentVideoFrame: 尺寸、位置、逐行写入与重绘请求', 
   assert.equal(node.top, 6);
   assert.equal(node.imageModified, true);
   assert.equal(repainted.length, 1);
-  // 图像(8x8)大于帧(4x3)：按图像行距写入，帧外的行与列保持不变。
+  // Image (8x8) is larger than the frame (4x3): write using the image row stride and leave
+  // rows/columns outside the frame unchanged.
   const pixels = node.image.pixels;
   assert.equal(pixels[0], 0x7f);
   assert.equal(pixels[3 * 4 + 3], 0x7f);
@@ -370,8 +373,9 @@ await check('presentVideoFrame: 接管整帧缓冲，多目标共享 CoW 而非�
   assert.equal(held[0], 7);
 });
 
-// --- AMV Worker 会话协议 --------------------------------------------------
-// 帧号编码在文件首字节；每帧 2x2，像素值等于帧号，用来验证复用缓冲的拷贝。
+// --- AMV Worker session protocol -------------------------------------------
+// The frame index is encoded in the first file byte. Each frame is 2x2, with pixel values
+// equal to the frame index, to verify copies from reused buffers.
 class FakeDecoder {
   constructor() {
     this.bytes = null; this.frame = 0; this.position = 0; this.firstPosition = 0;
@@ -436,8 +440,8 @@ await check('AMV 会话: open/decode/loop/seek/rewind/dispose 与缓冲拷贝', 
   assert.equal((await session.handle({ type: 'decode' })).reply.frame.frame, 1);
   assert.equal((await session.handle({ type: 'decode' })).reply.frame.frame, 2);
   assert.equal((await session.handle({ type: 'seek', frame: 9 })).reply.found, false);
-  // 参考 DecodeNext_guess 先判 Frame >= NumOfFrame-1：seek 到最后一帧后再解
-  // 会直接走片尾分支，而不是解出该帧。
+  // DecodeNext_guess first checks Frame >= NumOfFrame-1, so seeking to the last frame and
+  // then decoding takes the end-of-media branch instead of decoding that frame.
   assert.equal((await session.handle({ type: 'seek', frame: 2 })).reply.found, true);
   assert.equal((await session.handle({ type: 'decode' })).reply.end, true);
   assert.equal((await session.handle({ type: 'nonsense' })).reply.ok, false);
@@ -452,7 +456,7 @@ await check('AMV 会话: 无效文件返回打开错误', async () => {
   assert.equal(failed.reply.error, 'File read error');
 });
 
-// --- Worker 后端（回环传输）+ 脚本驱动消费 --------------------------------
+// --- Worker backend (loopback transport) + script-driven consumption --------
 function loopbackTransport() {
   const handlers = new Set();
   const handle = createAmvWorkerEndpoint({
@@ -546,7 +550,7 @@ await check('AmvWorkerSource: nextMovieFile 切换文件并按 nextLoop 恢复�
   assert.equal(source.info.numOfFrame, 3, 'info 跟随新文件');
   assert.deepEqual((await source.next()).frame, 1);
   assert.deepEqual((await source.next()).frame, 2);
-  // NextMovieFile 仍指向 b：片尾会再次打开同一个文件（参考实现同样如此）。
+  // NextMovieFile still points to b, so end-of-media opens the same file again (matching the reference).
   assert.deepEqual((await source.next()).frame, 0);
   source.nextMovieFile = '';
   assert.deepEqual((await source.next()).frame, 1);
@@ -562,7 +566,7 @@ await check('AmvWorkerSource: 脚本驱动消费经有界队列受 preloadSample
   pipeline.start();
   await flush();
   assert.equal(pipeline.length, 3, '预解码不超过帧池容量');
-  // showNextImage：每次只取一帧，取走后队列按容量补满。
+  // showNextImage takes one frame at a time; after it is removed, the queue refills to capacity.
   for (let expected = 0; expected < 6; expected++) {
     const frame = pipeline.shift();
     assert.equal(frame.frame, expected);
@@ -614,7 +618,7 @@ await check('AMV 会话 + 真实 AMVDecoder：合成素材经 Rust/WASM 解码�
     assert.equal(decoded.reply.frame.left, 2 * index);
     assert.equal(decoded.reply.frame.width, 16);
     assert.equal(decoded.reply.pixels.length, 16 * 16 * 4);
-    // 中性位流：Rust/WASM 解码结果恒为 (128,128,128,128)。
+    // Neutral bitstream: Rust/WASM decoding always yields (128,128,128,128).
     assert.deepEqual([...decoded.reply.pixels.subarray(0, 4)], [128, 128, 128, 128]);
     assert.deepEqual(decoded.transfer, [decoded.reply.pixels.buffer]);
     const received = structuredClone(decoded.reply, { transfer: decoded.transfer });
@@ -721,6 +725,19 @@ await check('VideoOverlay: 过期帧、循环边界、取消及脚本事件分�
     `, 'video-events');
     assert.equal(await vm.source('movie.setSize(100,80); movie.setPos(50,20); return movie.width+","+movie.height;'), '100,80');
     assert.equal(await vm.source('movie.left=60; movie.top=25; return movie.width+","+movie.height;'), '100,80');
+    await vm.source(`
+      class VideoTestLayer {
+        var left = 0, top = 0, width = 10, height = 20;
+        function setPos(x, y) { left = x; top = y; }
+      }
+      var videoLayer1 = new VideoTestLayer(), videoLayer2 = new VideoTestLayer();
+      movie.mode = 1; movie.layer1 = videoLayer1; movie.layer2 = videoLayer2;
+      movie.setPos(12, 34); movie.left = 21; movie.top = 43;
+    `);
+    assert.equal(await vm.source('return movie.left + "," + movie.top + "," + movie.width + "," + movie.height;'), '60,25,100,80');
+    assert.equal(await vm.source('return videoLayer1.left + "," + videoLayer1.top;'), '21,43');
+    assert.equal(await vm.source('return videoLayer2.left + "," + videoLayer2.top;'), '21,43');
+    await vm.source('movie.width = 99; movie.height = 99; movie.layer1 = void; movie.layer2 = void; movie.mode = 0;');
     const state = [...Video.instances.values()][0];
     state.status = 'play';
     await vm.source('movie.close();', 'video-owner-event');

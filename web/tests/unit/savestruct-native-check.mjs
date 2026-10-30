@@ -1,5 +1,5 @@
 // Verifies the native saveStruct members (native/kirikiri/plugins/saveStruct.cpp)
-// against the serializer body in cpp/plugins/saveStruct.cpp.
+// against the historical Wamsoft serializer, retaining default CRLF.
 import assert from 'node:assert/strict';
 import { TJSInterop } from '../../engine-js/wasm-vm.js';
 
@@ -22,7 +22,7 @@ const cases = [
   [
     'scalars and special values',
     'return [int 1, real 1.5, "x", <% 01 02 %>, void, null].toStructString();',
-    '[int 1,real 1.5,"x",<% 01 02 %>,void,nullptr]',
+    '[int 1,real 0x1.8000000000000p0 /* 1.5 */,"x",<% 01 02 %>,void,null]',
   ],
   [
     'string escaping',

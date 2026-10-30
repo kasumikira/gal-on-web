@@ -4,7 +4,13 @@
 
 脚本引擎使用一个 WASM 模块，包含原版 TJS2 编译器、解释执行器和内建类型。源码与已有字节码由同一个 tTJS 实例处理；KAGParser、Scripts 及已移植的 native 插件在该实例内使用原版 Variant 与 dispatch。Rect、Pad、MenuItem 是启动时注册的核心类；scriptsEx、csvParser、saveStruct、PSBFile、TextRenderBase、JSON、Expat 和 kirikiroid2 扩展经 Plugins.link 按需注册。
 
-JS 实现图像、渲染、音频、资源 IO、Motion 及 PSB 媒体读取；脚本 PSBFile 和只读容器位于 C++。XP3 过滤脚本使用独立的 TJS2 实例执行，`xp3-filter.js` 提供 BinaryAccessor 字节读写桥接。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
+JS 实现图像、音频、资源 IO、Motion 及 PSB 媒体读取；脚本 PSBFile 和只读容器位于 C++。
+
+渲染正在迁入 native：`native/kirikiri/render/` 提供不依赖 Cocos 的 GLES 后端，
+JS 创建 WebGL2 上下文并交给 Emscripten GLES 绑定，现状与阶段见
+[native 渲染与图层迁移](MIGRATION-PLAN.md)。
+
+XP3 过滤脚本使用独立的 TJS2 实例执行，`xp3-filter.js` 提供 BinaryAccessor 字节读写桥接。业务类使用普通 JS 类和装饰器；绑定层负责注册、参数/结果转换及 API 封装。开发方法见 [Native 绑定开发规范](NATIVE-BINDINGS.md)。
 
 ## 初始化配置
 

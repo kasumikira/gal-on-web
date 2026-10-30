@@ -1,8 +1,10 @@
-#include "StoragesIntf.h"
+#include "StorageIntf.h"
 #include "TimerIntf.h"
 #include "RectItf.h"
 #include "PadIntf.h"
 #include "MenuItemIntf.h"
+#include "GraphicsLoaderIntf.h"
+#include "EventIntf.h"
 #include "runtime.h"
 #include "ScriptMgnIntf.h"
 #include "KAGParser.h"
@@ -12,6 +14,7 @@
 #include "tjsObject.h"
 #include <algorithm>
 #include <malloc.h>
+#include <vector>
 #include <emscripten/emscripten.h>
 #include <spdlog/sinks/stdout_sinks.h>
 #include <spdlog/spdlog.h>
@@ -53,13 +56,19 @@ extern "C"
         scripts->Release();
         runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, TJS_W("Scripts"), nullptr, &scriptsValue, nullptr);
         TVPInitializeTimers();
-        for (auto *coreClass : {TVPCreateNativeClass_Storages(), TVPCreateNativeClass_Timer(), TVPCreateNativeClass_AsyncTrigger(), TVPCreateNativeClass_Rect(), TVPCreateNativeClass_Pad(), TVPCreateNativeClass_MenuItem()}) {
+        for (auto *coreClass : {TVPCreateNativeClass_Storages(), TVPCreateNativeClass_Timer(), TVPCreateNativeClass_AsyncTrigger(), TVPCreateNativeClass_Rect(), TVPCreateNativeClass_Pad(), TVPCreateNativeClass_MenuItem(), TVPCreateNativeClass_System()}) {
             tTJSVariant held(coreClass, nullptr);
             coreClass->Release();
             success(runtime->engine->GetGlobalNoAddRef()->PropSet(TJS_MEMBERENSURE, coreClass->GetClassName().c_str(), nullptr, &held, nullptr));
         }
         TVPInitializePlugins();
         return runtime;
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_system_initialize(Runtime *r, int service) {
+        return checked(r, [&] { TVPInitializeSystem(r->value(service)); return 1; });
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_system_maintain(Runtime *r, int start) {
+        return checked(r, [&] { TVPMaintainSystem(start != 0); return 1; });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_plugins(Runtime *r, int operation, const tjs_char *name)
     {
@@ -304,9 +313,59 @@ extern "C"
             const auto &value = r->value(id);
             const tjs_int level = value.Type() == tvtVoid
                 ? TVP_COMPACT_LEVEL_MAX : static_cast<tjs_int>(value.AsInteger());
-            if (level >= TVP_COMPACT_LEVEL_IDLE) r->engine->DoGarbageCollection();
-            compactRuntime(level);
+            TVPDeliverCompactEvent(level);
             return r->keep(tTJSVariant(level));
+        });
+    }
+    // System.graphicCacheLimit / clearGraphicCache / touchImages
+    // (SystemIntf.cpp 215-370).  The graphic cache lives in the native
+    // GraphicsLoaderIntf now, so these TJS members must drive the native
+    // cache instead of a JS-side loader.
+    EMSCRIPTEN_KEEPALIVE int tjs_graphic_cache_limit(Runtime *r, int operation, double value)
+    {
+        return checked(r, [&] {
+            if (operation == 0) return static_cast<int>(TVPGetGraphicCacheLimit());
+            // Reference casts through tjs_int first, so -1 selects the
+            // platform maximum after the unsigned conversion.
+            TVPSetGraphicCacheLimit(static_cast<tjs_uint64>(static_cast<tjs_int>(value)));
+            return static_cast<int>(TVPGetGraphicCacheLimit());
+        });
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_graphic_cache_system_limit(Runtime *r, double bytes)
+    {
+        return checked(r, [&] {
+            // SysInitImpl.cpp derives TVPGraphicCacheSystemLimit from physical
+            // memory (physmem / 10, at most 512MB).  The browser host supplies
+            // its navigator.deviceMemory estimate through this entry point.
+            tjs_uint64 limit = static_cast<tjs_uint64>(static_cast<tjs_int64>(bytes));
+            if (limit > 512ull * 1024 * 1024) limit = 512ull * 1024 * 1024;
+            TVPGraphicCacheSystemLimit = limit;
+            return static_cast<int>(limit / (1024 * 1024));
+        });
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_clear_graphic_cache(Runtime *r)
+    {
+        return checked(r, [&] {
+            TVPClearGraphicCache();
+            return 1;
+        });
+    }
+    EMSCRIPTEN_KEEPALIVE int tjs_touch_images(Runtime *r, int array, double limit, double timeout)
+    {
+        return checked(r, [&] {
+            std::vector<ttstr> storages;
+            auto source = r->value(array).AsObjectClosureNoAddRef();
+            if (!source.Object) return 1;
+            for (tjs_int index = 0;; ++index) {
+                tTJSVariant value;
+                if (TJS_FAILED(source.Object->PropGetByNum(0, index, &value, source.ObjThis)))
+                    break;
+                if (value.Type() == tvtVoid) break;
+                storages.emplace_back(value);
+            }
+            TVPTouchImages(storages, static_cast<tjs_int64>(limit),
+                           static_cast<tjs_uint64>(timeout));
+            return 1;
         });
     }
     EMSCRIPTEN_KEEPALIVE int tjs_runtime_shutdown(Runtime *r)

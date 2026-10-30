@@ -15,7 +15,6 @@
 #include "tjsDebug.h"
 #define TVPScriptEngine TVPGetScriptEngine()
 #define TVPThrowInternalError TVPThrowExceptionMessage(TVPInternalError)
-static constexpr auto TVPCannotCreateInstance=TJS_W("Cannot create an instance");
 tjs_uint32 tTJSNC_Scripts::ClassID = -1;
 
 tTJSNC_Scripts::tTJSNC_Scripts() :

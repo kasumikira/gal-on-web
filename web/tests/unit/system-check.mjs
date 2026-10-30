@@ -6,10 +6,10 @@ import { TJSInterop } from '../../engine-js/wasm-vm.js';
 import { config } from '../../engine-js/global.js';
 import { createSystem } from '../../engine-js/system.js';
 
-const create = async (storage, graphicCache) => {
+const create = async storage => {
   const vm = await new TJSInterop().init(Object.create(null));
   Object.assign(config, {
-    document: { defaultView: {} }, inform: () => {}, arguments: {},
+    document: { defaultView: {} }, inform: () => {}, arguments: { startup: "value" },
     continuousFrameRate: 60, onTitleChange: () => {},
   });
   vm.attachStorage({
@@ -17,8 +17,8 @@ const create = async (storage, graphicCache) => {
     getPlacedPath: async name => await storage.exists(name) ? name : '',
     readPlaced: name => storage.read(name),
   });
-  const system = createSystem({ vm, enqueueEvent: callback => Promise.resolve().then(callback), storage, graphicCache });
-  vm.registerGlobal('System', system.api);
+  const system = await createSystem({ vm, storage });
+  await system.startMaintenance();
   return vm;
 };
 const missingStorage = {
@@ -28,17 +28,16 @@ const missingStorage = {
 };
 
 // --- without RegisterData.tjs every lookup is void --------------------------
-let graphicClears = 0;
-const vm = await create(missingStorage, { limit: 0, clear() { graphicClears++; } });
+const vm = await create(missingStorage);
+assert.equal(await vm.source('return System.getArgument("startup");'), "value");
 assert.equal(await vm.source('return System.readRegValue("HKEY_CURRENT_USER/Software/X");', 'reg-missing'), undefined);
 assert.equal(await vm.source('return System.readRegValue("");', 'reg-empty'), undefined);
-await assert.rejects(() => vm.source('System.readRegValue();', 'reg-noarg'), /requires a path/);
+await assert.rejects(() => vm.source('System.readRegValue();', 'reg-noarg'), /Invalid argument count/);
 await vm.source('System.doCompact(5);');
-assert.equal(graphicClears, 0, 'idle compact keeps the graphic cache');
 await vm.source('System.doCompact("15");');
-assert.equal(graphicClears, 1, 'native integer conversion selects minimize compact');
+assert.equal(await vm.source('return System.graphicCacheLimit;'), 0);
 await vm.source('System.doCompact();');
-assert.equal(graphicClears, 2, 'omitted level uses the strongest compact');
+assert.equal(await vm.source('return System.graphicCacheLimit;'), 0);
 assert.equal(await vm.compact(), 100);
 await assert.rejects(vm.compact(null), /Cannot convert/);
 assert.equal(await vm.compact(-1), -1);
@@ -69,65 +68,25 @@ return [System.readRegValue("HKEY_LOCAL_MACHINE/Software/Microsoft/Windows/Curre
         System._readRegValue("HKEY_CURRENT_USER/Software/Foo")];
 `, 'patch');
 assert.deepEqual(patched, ['1', 'bar'], 'the aliased native method and the replacement both work');
-console.log('system-check passed');
 await vm2.dispose();
 
-// Maintenance follows the reference's strict interval and continuous-mode gate.
-const originalPerformance = globalThis.performance;
-let tick = 1500, rehashes = 0, timerJob = null, timerDelay = null;
-const compactLevels = [];
-Object.assign(config, { document: { defaultView: {
-  requestAnimationFrame: () => 1, cancelAnimationFrame() {},
-  setTimeout(callback, delay) { timerJob = callback; timerDelay = delay; return 1; },
-  clearTimeout() { timerJob = null; },
-} } });
-const maintenance = createSystem({ vm: {
-  async compact(level) { compactLevels.push(level); },
-  rehash() { rehashes++; }, retain: value => value,
-  sameReference: (a, b) => a === b, async dispose() {},
-}, enqueueEvent: async callback => {
-  await maintenance.maintain();
-  await callback();
-  await maintenance.maintain();
-} });
-try {
-  globalThis.performance = { now: () => tick };
-  await maintenance.maintain();
-  assert.equal(rehashes, 0);
-  tick++;
-  await maintenance.maintain();
-  await maintenance.maintain();
-  assert.equal(rehashes, 1);
-  const handler = () => {};
-  maintenance.api.addContinuousHandler(handler);
-  tick += 2000;
-  await maintenance.maintain();
-  assert.equal(rehashes, 1, 'continuous delivery suppresses periodic rehash');
-  await maintenance.api.removeContinuousHandler(handler);
-  await maintenance.maintain();
-  assert.equal(rehashes, 2, 'maintenance resumes after continuous delivery');
-  tick = 4000;
-  await maintenance.maintain();
-  assert.deepEqual(compactLevels, []);
-  tick++;
-  await maintenance.maintain();
-  assert.deepEqual(compactLevels, [5], 'idle maintenance uses level 5 after the strict interval');
-  maintenance.startMaintenance();
-  assert.equal(typeof timerJob, 'function', 'idle pages schedule an independent wakeup');
-  tick += timerDelay;
-  await timerJob();
-  assert.equal(rehashes, 3, 'timer delivers maintenance without user input');
-  maintenance.api.addContinuousHandler(handler);
-  assert.equal(timerJob, null, 'continuous delivery cancels the idle wakeup');
-  await maintenance.api.removeContinuousHandler(handler);
-  assert.equal(typeof timerJob, 'function');
-  maintenance.stop();
-  assert.equal(timerJob, null);
-  tick += 2000;
-  await maintenance.maintain();
-  assert.equal(rehashes, 3);
-} finally {
-  globalThis.performance = originalPerformance;
-  maintenance.stop();
-  await maintenance.finalize();
-}
+// Maintenance and continuous-handler ownership now run in the native VM.
+const vm3 = await create(missingStorage);
+let continuous = false;
+await vm3.visualEvents(0, { schedule() {}, continuous(value) { continuous = !!value; } });
+await vm3.source('var calls = 0; function handler(tick) { calls++; } System.addContinuousHandler(handler); System.addContinuousHandler(handler);');
+assert.equal(continuous, true);
+await vm3.visualEvents(2);
+assert.equal(await vm3.source('return calls;'), 1, 'native handler registration deduplicates the closure');
+await vm3.source('System.eventDisabled = true;');
+assert.equal(await vm3.source('return System.eventDisabled;'), 1);
+await vm3.visualEvents(2);
+assert.equal(await vm3.source('return calls;'), 1, 'eventDisabled gates script continuous delivery');
+await vm3.source('System.eventDisabled = false; System.removeContinuousHandler(handler);');
+await vm3.visualEvents(2);
+assert.equal(continuous, false);
+await vm3.source('System.setArgument("test", 42);');
+assert.equal(await vm3.source('return System.getArgument("test");'), '42');
+await vm3.dispose();
+
+console.log("system-check passed");

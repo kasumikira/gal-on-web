@@ -7,6 +7,7 @@
 #include "tjsGlobalStringMap.h"
 #include "md5.h"
 #include <vector>
+#include "bitap_fuzzy.hpp"
 #include <algorithm>
 class ScriptsAdd {
 
@@ -68,6 +69,8 @@ public:
 
     //----------------------------------------------------------------------
     // (const)つき辞書／配列を安全に評価
+    static tjs_error stringFuzzySearch(tTJSVariant *result, tjs_int numparams,
+        tTJSVariant **param, iTJSDispatch2 *objthis);
     static tjs_error safeEvalStorage(tTJSVariant *result, tjs_int numparams,
                                      tTJSVariant **param,
                                      iTJSDispatch2 *objthis);
@@ -792,6 +795,32 @@ tjs_error ScriptsAdd::safeEvalStorage(tTJSVariant *result, tjs_int numparams,
 }
 //----------------------------------------------------------------------
 
+tjs_error
+ScriptsAdd::stringFuzzySearch(tTJSVariant *result,
+							  tjs_int numparams,
+							  tTJSVariant **param,
+							  iTJSDispatch2 *objthis)
+{
+	if(numparams < 3) return TJS_E_BADPARAMCOUNT;
+
+	ttstr text   (*param[0]);
+	ttstr pattern(*param[1]);
+	tjs_int const maxign = *param[2];
+	tjs_int const chbits = (numparams > 3 && param[3]->Type() != tvtVoid) ? (tjs_int)(tTVInteger)*param[3] : (tjs_int)7;
+
+	tjs_int const plen = pattern.length();
+	if (plen >= 64 || maxign < 0 || chbits <= 0 || chbits > 16) return TJS_E_INVALIDPARAM;
+
+	tjs_int index = 0;
+	if (plen < 32) {
+		index = bitap_fuzzy_bitwise_search<tjs_char, tjs_uint32>(text.c_str(), text.length(), pattern.c_str(), plen, maxign, chbits);
+	} else {
+		index = bitap_fuzzy_bitwise_search<tjs_char, tjs_uint64>(text.c_str(), text.length(), pattern.c_str(), plen, maxign, chbits);
+	}
+	if (result) *result = index;
+	return TJS_S_OK;
+}
+
 NCB_ATTACH_CLASS(ScriptsAdd, Scripts) {
     RawCallback(TJS_W("getObjectKeys"), &ScriptsAdd::getKeys, TJS_STATICMEMBER);
     RawCallback(TJS_W("getObjectCount"), &ScriptsAdd::getCount,
@@ -804,6 +833,7 @@ NCB_ATTACH_CLASS(ScriptsAdd, Scripts) {
     RawCallback(TJS_W("getMD5HashString"), &ScriptsAdd::getMD5HashString,
                 TJS_STATICMEMBER);
     NCB_METHOD(clone);
+    RawCallback("stringFuzzySearch", &ScriptsAdd::stringFuzzySearch, TJS_STATICMEMBER);
 
     RawCallback("propSet", &ScriptsAdd::propSet, TJS_STATICMEMBER);
     RawCallback("propGet", &ScriptsAdd::propGet, TJS_STATICMEMBER);

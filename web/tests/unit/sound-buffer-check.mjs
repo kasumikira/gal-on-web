@@ -80,7 +80,8 @@ const server = await createServer({
 });
 try {
   const { config } = await server.ssrLoadModule('/engine-js/global.js');
-  config.inform = message => console.log('[inform]', message);
+  const reports = [];
+  config.inform = message => reports.push(String(message));
   const fakeDocument = {
     visibilityState: 'visible', hidden: false, hasFocus: () => true,
     addEventListener() {}, removeEventListener() {},
@@ -95,11 +96,28 @@ try {
   });
   vm.registerGlobal('WaveSoundBuffer', Wave);
   vm.registerGlobal('PhaseVocoder', Wave.PhaseVocoder);
-  const run = source => vm.enqueue(() => vm.source(source, 'sound-worklet-check'));
+  const run = async source => {
+    const result = await vm.enqueue(() => vm.source(source, 'sound-worklet-check'));
+    // All fake IO resolves immediately; yield a turn for detached decoding,
+    // then drain script events before inspecting the resulting transport.
+    await new Promise(resolve => setImmediate(resolve));
+    await vm.enqueue(() => {});
+    return result;
+  };
 
-  const metadata = await run(`
+  await run(`
     var w = new WaveSoundBuffer();
     w.open("voice.wav");
+  `);
+  const openOrder = await run(`
+    var ordered = new WaveSoundBuffer();
+    ordered.open("voice.wav");
+    ordered.samplePosition = 22050;
+    return [ordered.samplePosition, ordered.position, ordered.totalTime, ordered.frequency];
+  `);
+  assert.deepEqual(openOrder, [22050, 500, 1000, 44100],
+    'open keeps synchronous TJS ordering for seeks and metadata');
+  const metadata = await run(`
     return [w.frequency, w.bits, w.totalTime, w.status,
       w.labels["tick"].position, w.labels["tick"].samplePosition];
   `);
@@ -181,7 +199,8 @@ try {
   assert.deepEqual(seekResult, ['play', 250]);
   const seekNode = globalThis.lastWaveNode;
   assert.equal(seekNode.port.messages.filter(message => message.type === 'load').length, 1);
-  assert.equal(seekNode.port.messages.at(-1).type, 'restart', 'seek reuses PCM and worklet');
+  const seekRestart = [...seekNode.port.messages].reverse().find(message => message.type === 'restart');
+  assert.equal(seekRestart.options.position, 12000, 'seek restarts the paused transport at the requested cursor');
   seekNode.port.onmessage({ data: { type: 'position', value: 48000, generation: 1 } });
   assert.equal(await run('return s.position;'), 250, 'old playback messages cannot overwrite a restarted cursor');
   await run('s.stop(); s.play();');
@@ -223,16 +242,11 @@ try {
   assert.equal(globalThis.lastWaveNode.port.messages[0].options.filters.length, 1);
   await run('fw.stop();');
 
-  // Invalid loop information fails open and leaves the buffer unloaded.
+  // Invalid loop information leaves the synchronously opened buffer unloaded.
   files.set('bad.wav', wav);
   files.set('bad.wav.sli', new TextEncoder().encode('#2.01\nLink { From=1; To=0; }'));
-  const invalid = await run(`
-    var b = new WaveSoundBuffer();
-    try { b.open("bad.wav"); } catch (e) { return [b.status, e.message]; }
-    return [b.status, ""];
-  `);
-  assert.equal(invalid[0], 'unload');
-  assert.match(invalid[1], /Invalid loop information/);
+  await assert.rejects(run('var b = new WaveSoundBuffer(); b.open("bad.wav");'), /Invalid loop information/);
+  assert.equal(await run('return b.status;'), 'unload');
 
   // stopFade() is StopFade(false, true): it snaps to the target volume.
   await run('w.volume = 0; w.fade(100000, 1000); w.stopFade();');
@@ -244,6 +258,8 @@ try {
 
   console.log('sound-worklet-check passed');
   await vm.enqueue(() => {});
+  Wave.stop();
+  await Wave.finalize();
   await vm.dispose();
 } finally {
   await server.close();

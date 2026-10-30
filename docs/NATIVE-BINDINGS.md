@@ -72,6 +72,10 @@ async initialize(path) {
 
 `this` 上的普通字段是 JS 状态。`Class.of(object)`（与 `Class.state(object)` 等价）通过 API 取得指定 native 类的状态；跨类访问明确写所属类。`Class.instances.values()` 通过 API 枚举 native 实例状态，不另建实例索引。
 
+Layer 的全部业务状态由 JS Node 唯一持有，包括几何、绘制模式、父子关系、子节点顺序、绝对排序、焦点和启用状态。Font 的字号、角度、样式、字体名和预渲染字体资源也由 JS FontState 持有，绑定到 Layer 的 Font 访问同一份参数。合成、转场和命中测试直接遍历 JS 树、读取 JS 字段，不维护 native 状态镜像，不生成或跨帧缓存通用树快照。启用状态通知先在 JS 完成状态差异收集，再依次 await 脚本事件。
+
+Native 接口适配器仅保留 TJS 参数转换、对象身份与引用生命周期。`Layer.font` 的唯一脚本对象及其失效由 C++ 管理；`Layer.children` 保留稳定的原生数组身份，内容从 JS getter 的当前 Z 顺序生成，替换前持有所有子对象引用，避免清空旧数组时提前终结子对象。JS 不缓存脚本对象的有效性或所有权。Layer 树只是宿主业务数据，脚本对象及其 retain/dispose 仍由 WASM 管理。
+
 | 函数 | 使用方式 |
 | --- | --- |
 | `script(object)` | 取得脚本访问影子；不延长引用期限 |
@@ -168,6 +172,8 @@ retain 保存独立的原版 Variant，不延长原参数的借用，也不复�
 - 返回影子：必须在来源引用有效时交给绑定层编码。禁止在 finally 中 dispose 某个影子后再把该影子作为异步返回结果交给绑定层。可以返回普通 JS 结果，或明确转交独立引用并由接收方释放。
 
 `dispose` 结束引用持有，不等于原版 `invalidate`。失效是否发生、何时终结交给原版 TJS2；不能用其中一个替代另一个。终结可能执行脚本，因此释放也必须等待。
+
+`createNativeInstance(Class, state, owner)` 会立即实例化并返回由 native owner 持有的脚本引用；省略 owner 时仍返回延迟实例化描述符。其它随所属实例存活的 JS 宿主对象可传入 owner，并在所属实例失效时按原版顺序等待 invalidate、dispose。`layer.font` 已直接由 C++ 图层持有，不再使用这条 JS 创建/缓存路径。
 
 ## 4. 执行边界与调度约定
 

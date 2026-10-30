@@ -18,8 +18,10 @@ body{display:flex;align-items:center;justify-content:center;overflow:hidden}
 </svg>
 </button>
 <script>
-// 移动端左下角全屏入口，仅在非全屏时显示；进入全屏后靠系统手势退出。
-// iPadOS 的 UA 是 Macintosh，靠触点数补充识别；iPhone Safari 不支持页面全屏 API，按钮保持隐藏。
+// Show the mobile fullscreen button in the lower-left corner only when not fullscreen;
+// exit fullscreen with the system gesture.
+// iPadOS reports a Macintosh UA, so also check the touch count. iPhone Safari does not
+// support the page fullscreen API, so keep the button hidden there.
 (() => {
   const isMobile = /Android|iPhone|iPad|iPod|Mobile|Silk/i.test(navigator.userAgent)
     || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));

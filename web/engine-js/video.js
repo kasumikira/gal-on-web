@@ -1,23 +1,20 @@
 import { VideoAudio } from './video-audio.js';
 import { config } from './global.js';
-// VideoOverlay from VideoOvlIntf.cpp / VideoOvlImpl.cpp. 消费端是“时钟驱动”：
-// libav/WebCodecs 后端把帧放进统一有界队列，本文件按媒体
-// 时钟取出到期帧，再经公共图层呈现入口写进 layer1/layer2，等价于 KRMovieLayer
-// 双缓冲的 MoviePlayerLayer::OnPlayEvent EC_UPDATE。
+// VideoOverlay from VideoOvlIntf.cpp / VideoOvlImpl.cpp. The consumer is clock-driven:
+// the libav/WebCodecs backend puts frames into a shared bounded queue, and this file takes
+// due frames according to the media clock before sending them through the shared layer
+// presentation entry point to layer1/layer2, matching KRMovieLayer.
+// MoviePlayerLayer::OnPlayEvent EC_UPDATE double buffering.
 // Overlay and layer rendering are implemented; vomMixer/vomMFEVR playback falls
 // back the same way the game's own Movie script falls back when mixer
 // playback fails. A format WebCodecs cannot decode fails open() with a thrown
 // error, matching "no video decoder available" in the original Open(); WMV3
 // video and WMA2 audio use the modular libav.js backend.
-import { nativeClass, nativeMembers, nativeProperty, nativeDictionary, unimplemented, reportUnimplemented, nativeOwner, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
+import { nativeClass, nativeMembers, nativeProperty, nativeDictionary, unimplemented, reportUnimplemented, nativeOwner, nativeReference, writeScript, callScript, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { number, truth } from '#krkr/values';
-import { VideoPipeline, presentVideoFrame, closeFrame } from './video-pipeline.js';
+import { VideoPipeline, closeFrame } from './video-pipeline.js';
 import { probeLibavVideo } from './video-libav.js';
-import { Image } from './bitmap.js';
-import { getGPU } from './gpu.js';
-import { present } from './layer-composite.js';
 
-export { uploadVideoCanvas } from './video-pipeline.js';
 
 // tTVPPeriodEventReason (VideoOvlIntf.h).
 export const perLoop = 0, perPeriod = 1, perPrepare = 2, perSegLoop = 3;
@@ -174,21 +171,12 @@ export class Player {
 }
 
 // tTJSNI_VideoOverlay state machine, geometry and TJS surface.
-export function createVideoOverlayClass({ Window, Layer, storage, getAudioContext, enqueueEvent }) {
+export function createVideoOverlayClass({ Window, storage, getAudioContext, enqueueEvent, presentLayerFrame }) {
   const { document, inform: report } = config;
   const view = document.defaultView;
   const players = new Set();
   let schedulingActive = true;
-  // Overlay pixels use the same upload/presentation path as movie layers, but
-  // live above the window canvas, like the native overlay draw device.
-  const overlayLayer = {
-    peekState: node => ({ node }),
-    peekNode: node => node,
-    resizeNode(node, width, height) {
-      node.width = width; node.height = height;
-      if (node.image.width !== width || node.image.height !== height) node.image.resize(width, height);
-    },
-  };
+  // Browser overlays display decoded frames directly above the native window.
   const moveOverlay = (s, left, top) => {
     s.rect.right += left - s.rect.left;
     s.rect.bottom += top - s.rect.top;
@@ -208,7 +196,6 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
   const closeOverlay = s => {
     if (!s.overlay) return;
     s.overlay.canvas.remove();
-    s.overlay.image.release();
     s.overlay = null;
   };
   // Backend events target the VideoOverlay object so script overrides run.
@@ -256,19 +243,38 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
         const canvas = document.createElement('canvas');
         Object.assign(canvas.style, { position: 'fixed', pointerEvents: 'none', zIndex: '1' });
         s.window.canvas.parentNode.append(canvas);
-        s.overlay = { canvas, image: new Image(1, 1) };
+        s.overlay = { canvas };
       }
-      await presentVideoFrame([s.overlay], frame, { Layer: overlayLayer });
-      if (token !== s.eventToken || !s.overlay) return;
-      const { canvas, image } = s.overlay;
-      if (canvas.width !== image.width) canvas.width = image.width;
-      if (canvas.height !== image.height) canvas.height = image.height;
-      if (image.width && image.height) present(getGPU(), image, canvas);
+      const { canvas } = s.overlay;
+      if (canvas.width !== frame.width) canvas.width = frame.width;
+      if (canvas.height !== frame.height) canvas.height = frame.height;
+      const context = canvas.getContext('2d', { alpha: false });
+      if (frame.canvas) {
+        context.globalCompositeOperation = 'copy';
+        context.drawImage(frame.canvas, 0, 0, frame.width, frame.height);
+      } else {
+        const pixels = new Uint8ClampedArray(frame.rgba.buffer, frame.rgba.byteOffset,
+          frame.width * frame.height * 4);
+        context.putImageData(new ImageData(pixels, frame.width, frame.height), 0, 0);
+      }
       updateOverlay(s);
       // VideoOvlImpl.cpp EC_UPDATE dispatches frame/period events only for vomLayer.
       return;
     } else if (render) {
-      await presentVideoFrame([s.layer1, s.layer2], frame, { Layer });
+      let pixels = frame.rgba;
+      if (!pixels) {
+        const canvas = document.createElement('canvas');
+        canvas.width = frame.width; canvas.height = frame.height;
+        const context = canvas.getContext('2d');
+        context.drawImage(frame.canvas, 0, 0, frame.width, frame.height);
+        pixels = context.getImageData(0, 0, frame.width, frame.height).data;
+      }
+      await enqueueEvent(async () => {
+        if (token !== s.eventToken) return;
+        for (const layer of [s.layer1, s.layer2]) {
+          if (layer) await presentLayerFrame(layer, { width: frame.width, height: frame.height, rgba: pixels });
+        }
+      });
       if (token !== s.eventToken) return;
       s.onLayerChange?.();
     }
@@ -282,12 +288,11 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       await post(s, 'onPeriod', [perPeriod]);
     }
   };
-  const eachVideoLayer = (s, fn) => {
+  const eachVideoLayer = async (s, fn) => {
     for (const slot of [1, 2]) {
       const owner = s['layer' + slot];
       if (!owner) continue;
-      const node = Layer.peekNode(owner);
-      if (node) fn(node);
+      await fn(owner);
     }
   };
 
@@ -368,11 +373,11 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
       s.isPrepare = false;
       return setStatus(s, 'unload');
     },
-    setPos: function(left, top) {
+    setPos: async function(left, top) {
       if (arguments.length < 2) throw new Error('TJS VideoOverlay.setPos requires 2 arguments');
       const s = this;
       left = Math.trunc(number(left)); top = Math.trunc(number(top));
-      if (s.mode === 1) eachVideoLayer(s, node => { node.left = left; node.top = top; });
+      if (s.mode === 1) await eachVideoLayer(s, layer => callScript(layer, 'setPos', [left, top]));
       else moveOverlay(s, left, top);
       updateOverlay(s);
     },
@@ -484,33 +489,33 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
 
     @nativeProperty get position() { const s = this; return s.player ? Math.round(s.player.pts * 1000) : 0; }
     @nativeProperty set position(value) { const s = this; if (s.player) return s.player.startAt(number(value) / 1000); }
-    @nativeProperty get left() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.left ?? 0) : s.rect.left; }
+    @nativeProperty get left() { return this.rect.left; }
     @nativeProperty set left(value) {
       const s = this;
       const left = Math.trunc(number(value));
-      if (s.mode === 1) eachVideoLayer(s, node => { node.left = left; });
+      if (s.mode === 1) return eachVideoLayer(s, layer => writeScript(layer, 'left', left));
       else moveOverlay(s, left, s.rect.top);
       updateOverlay(s);
     }
-    @nativeProperty get top() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.top ?? 0) : s.rect.top; }
+    @nativeProperty get top() { return this.rect.top; }
     @nativeProperty set top(value) {
       const s = this;
       const top = Math.trunc(number(value));
-      if (s.mode === 1) eachVideoLayer(s, node => { node.top = top; });
+      if (s.mode === 1) return eachVideoLayer(s, layer => writeScript(layer, 'top', top));
       else moveOverlay(s, s.rect.left, top);
       updateOverlay(s);
     }
-    @nativeProperty get width() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.width ?? 0) : s.rect.right - s.rect.left; }
-    @nativeProperty set width(value) { const s = this; s.rect.right = s.rect.left + Math.trunc(number(value)); updateOverlay(s); }
-    @nativeProperty get height() { const s = this; return s.mode === 1 ? (Layer.peekNode(s.layer1)?.height ?? 0) : s.rect.bottom - s.rect.top; }
-    @nativeProperty set height(value) { const s = this; s.rect.bottom = s.rect.top + Math.trunc(number(value)); updateOverlay(s); }
+    @nativeProperty get width() { return this.rect.right - this.rect.left; }
+    @nativeProperty set width(value) { const s = this; if (s.mode !== 1) { s.rect.right = s.rect.left + Math.trunc(number(value)); updateOverlay(s); } }
+    @nativeProperty get height() { return this.rect.bottom - this.rect.top; }
+    @nativeProperty set height(value) { const s = this; if (s.mode !== 1) { s.rect.bottom = s.rect.top + Math.trunc(number(value)); updateOverlay(s); } }
     @nativeProperty get originalWidth() { return this.info?.width ?? 0; }
     @nativeProperty get originalHeight() { return this.info?.height ?? 0; }
     @nativeProperty get visible() { return Number(this.visible); }
     @nativeProperty set visible(value) {
       const s = this;
       s.visible = !!truth(value);
-      eachVideoLayer(s, node => { node.visible = s.visible; });
+      if (s.mode === 1 && s.player) return eachVideoLayer(s, layer => writeScript(layer, 'visible', s.visible));
       updateOverlay(s);
       if (s.onLayerChange) s.onLayerChange();
     }
@@ -522,9 +527,9 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
     @nativeProperty get numberOfFrame() { return this.info?.numberOfFrame ?? 0; }
     @nativeProperty get totalTime() { return this.info?.totalTime ?? 0; }
     @nativeProperty get layer1() { return this.layer1; }
-    @nativeProperty set layer1(value) { const s = this; s.layer1 = value === null || value === undefined ? null : unwrap(value); }
+    @nativeProperty set layer1(value) { const old = this.layer1; this.layer1 = value == null ? null : retainScriptValue(nativeReference(value), this); return disposeScriptValue(old); }
     @nativeProperty get layer2() { return this.layer2; }
-    @nativeProperty set layer2(value) { const s = this; s.layer2 = value === null || value === undefined ? null : unwrap(value); }
+    @nativeProperty set layer2(value) { const old = this.layer2; this.layer2 = value == null ? null : retainScriptValue(nativeReference(value), this); return disposeScriptValue(old); }
     @nativeProperty get mode() { return this.mode; }
     // SetMode refuses changes after open (VideoOvlImpl.cpp 797).
     @nativeProperty set mode(value) { const s = this; if (!s.player) s.mode = Math.trunc(number(value)); }
@@ -581,6 +586,8 @@ export function createVideoOverlayClass({ Window, Layer, storage, getAudioContex
     s.player = null;
     s.info = null;
     await disposeScriptValue(s.actionOwner);
+    await disposeScriptValue(s.layer1);
+    await disposeScriptValue(s.layer2);
     s.actionOwner = null;
     s.owner = null;
   };

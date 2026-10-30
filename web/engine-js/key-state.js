@@ -32,3 +32,28 @@ export function queryKeyState(code, getcurrent = true) {
 
 // Focus loss: no keyup arrives for keys held while the window lost focus.
 export function clearKeyStates() { states.clear(); }
+
+const NAMED_KEY_CODES = {
+  Enter: 0x0d, Escape: 0x1b, Space: 0x20, Tab: 0x09, Backspace: 0x08,
+  ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28,
+  Insert: 0x2d, Delete: 0x2e, Home: 0x24, End: 0x23, PageUp: 0x21, PageDown: 0x22,
+  CapsLock: 0x14, Pause: 0x13, ScrollLock: 0x91, NumLock: 0x90, PrintScreen: 0x2c,
+  ContextMenu: 0x5d, Shift: 0x10, Control: 0x11, Alt: 0x12, Meta: 0x5b,
+};
+const KEY_CODE_ALIASES = {
+  ControlLeft: 0x11, ControlRight: 0x11, ShiftLeft: 0x10, ShiftRight: 0x10,
+  AltLeft: 0x12, AltRight: 0x12, MetaLeft: 0x5b, MetaRight: 0x5c,
+};
+// Side-specific virtual keys for System.getKeyState (VK_LCONTROL and friends).
+const SIDE_KEY_CODES = {
+  ControlLeft: 0xa2, ControlRight: 0xa3, ShiftLeft: 0xa0,
+  ShiftRight: 0xa1, AltLeft: 0xa4, AltRight: 0xa5,
+};
+export function virtualKeyCode(event) {
+  const code = event.keyCode || KEY_CODE_ALIASES[event.code] || NAMED_KEY_CODES[event.key];
+  if (code) return code;
+  return event.key?.length === 1 ? event.key.toUpperCase().charCodeAt(0) : 0;
+}
+export function virtualKeySide(event) {
+  return SIDE_KEY_CODES[event.code] ?? 0;
+}

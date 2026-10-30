@@ -20,6 +20,10 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   let mixerContext, mixerModule, mixerUnavailable = false;
   let masterContext, masterStages = [];
   const buffers = new Set();
+  // Playback remains detached from AudioWorklet/device initialization. A play
+  // issued after open is remembered until the transport can be constructed.
+  const pendingStarts = new Set();
+  let audioReady = false, audioTask = null;
   let globalVolume = 100000, globalFocusMode = 0;
   let gainQueryCallback = null, gainQueryCallbackOPUS = null;
   const BEAT = 60; // TVP_SB_BEAT_INTERVAL (win32/SoundBufferBaseImpl.h 15)
@@ -227,6 +231,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   // so `looping = true; open(...)` is valid.
   const clear = state => {
     stopPlay(state);
+    pendingStarts.delete(state);
     releaseWorklet(state);
     releaseFilterClaims(state);
     state.buffer = null;
@@ -373,6 +378,9 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     }
 
     @nativeMethod WaveSoundBuffer() {}
+    // WaveImpl::Open is synchronous from TJS. Browser decoding remains
+    // asynchronous internally, but the binding waits for it before returning
+    // so following setters/getters observe the loaded buffer in call order.
     @nativeMethod async open(name) {
       if (!arguments.length) throw new Error('TJS WaveSoundBuffer.open requires storage');
       const state = this;
@@ -384,9 +392,9 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       let bytes, buffer, loopInfo = { links: [], labels: [] }, format;
       try {
         // WaveImpl.cpp RebuildFilterChain runs at Open; later changes to the
-        // filters array are not visible until the next open.  Requiring the
-        // filter instance here also reproduces Recreate's "one buffer at a
-        // time" error at open time rather than at play time.
+        // filters array are not visible until the next open. Requiring the
+        // filter instance here also reproduces Recreate's one-buffer-at-a-time
+        // error at open time rather than at play time.
         state.filterSnapshot = (state.filters ?? []).slice();
         const claimedFilters = state.filterSnapshot.map(value => Phase.state(value));
         for (const filter of claimedFilters) {
@@ -398,8 +406,6 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
         state.activeFilters = claimedFilters;
         bytes = await storage.read(name);
         if (generation !== state.openGeneration) return;
-        // The first Ogg packet identifies the decoder independently of the
-        // storage extension. Query once at open, on the script execution queue.
         if (bytes[0] === 79 && bytes[1] === 103 && bytes[2] === 103 && bytes[3] === 83 && bytes.length > 26) {
           const packet = 27 + bytes[26];
           if (packet + 8 <= bytes.length) {
@@ -417,10 +423,8 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
           }
         }
         format = probeAudioFormat(bytes);
-        const context = getAudioContext();
-        buffer = await context.decodeAudioData(bytes.slice().buffer);
+        buffer = await getAudioContext().decodeAudioData(bytes.slice().buffer);
         if (generation !== state.openGeneration) return;
-
         const sliName = String(name) + '.sli';
         if (await storage.has(sliName)) {
           const sli = await storage.read(sliName);
@@ -432,12 +436,9 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
           }
         }
         if (generation !== state.openGeneration) return;
-
         state.buffer = buffer;
         state.decodedRate = buffer.sampleRate;
         state.sourceRate = format?.sampleRate || buffer.sampleRate;
-        // RebuildFilterChain converts float/24/32-bit decoder output to PCM16;
-        // only 8-bit sources remain 8-bit in InputFormat.
         state.bits = format?.bits === 8 ? 8 : 16;
         state.frequency = state.sourceRate;
         state.position = 0;
@@ -451,22 +452,24 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
         throw error;
       }
     }
-    @nativeMethod async play() {
+    @nativeMethod play() {
       const state = this;
-      if (!scheduling || !state.buffer || state.bufferPlaying) return;
-      const generation = state.openGeneration;
-      const { context } = await ensureAudio();
-      if (!scheduling || state.openGeneration !== generation || !state.buffer || state.bufferPlaying) return;
-      stopPlay(state);
-      startPlay(state, context);
-      // WaveImpl.cpp Play: Status becomes play after StartPlay.  The transport
-      // is created even while Paused; in that case it remains silent.
+      if (!scheduling || state.bufferPlaying || pendingStarts.has(state)) return;
+      // WaveImpl.cpp Play is synchronous: the status becomes play right away.
+      // The transport itself is built as soon as the AudioBuffer and the
+      // AudioWorklet module are available, which is the same tick in the
+      // steady state and one decode later when open() has just been issued.
+      pendingStarts.add(state);
       setStatus(state, 'play');
+      scheduleAudio();
+      tryStartPlay(state);
     }
     @nativeMethod stop() {
       const state = this;
       // Stop (WaveImpl.cpp 3451): halt, status stop, rewind. Paused is kept;
-      // the reference does not stop an active fade.
+      // the reference does not stop an active fade.  A Play that is still
+      // waiting for its buffer is cancelled too.
+      pendingStarts.delete(state);
       stopPlay(state);
       if (state.status !== 'unload') setStatus(state, 'stop');
       state.position = 0;
@@ -497,6 +500,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     @nativeMethod finalize() {
       const state = this;
       ++state.openGeneration;
+      pendingStarts.delete(state);
       if (state.fadeTimer) { clearInterval(state.fadeTimer); state.fadeTimer = null; }
       state.fading = false;
       stopPlay(state);
@@ -615,6 +619,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
   Wave.invalidate = async owner => {
     const state = Wave.state(owner);
     ++state.openGeneration;
+    pendingStarts.delete(state);
     state.owner = null;
     if (state.fadeTimer) clearInterval(state.fadeTimer);
     state.fadeTimer = null;
@@ -637,6 +642,7 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
       if (state.fadeTimer) clearInterval(state.fadeTimer);
       state.fadeTimer = null;
       state.fading = false;
+      pendingStarts.delete(state);
       stopPlay(state);
       releaseWorklet(state);
       releaseFilterClaims(state);
@@ -786,6 +792,34 @@ export function createWaveSoundBufferClass(storage, getAudioContext, { enqueueEv
     if (context.state === 'suspended') context.resume().catch(() => {});
     return { context, worklet };
   }
+  // Load the worklet/mixer modules once, without parking the caller.  Repeated
+  // play() calls reuse the resolved promise and start synchronously.
+  const scheduleAudio = () => {
+    if (audioReady || audioTask) return audioTask;
+    audioTask = ensureAudio().then(() => {
+      audioReady = true;
+      for (const state of pendingStarts) tryStartPlay(state);
+    }).catch(error => {
+      audioTask = null;
+      report(`Audio device unavailable: ${error?.message ?? error}`);
+    });
+    return audioTask;
+  };
+  // Deferred Play: the request is honoured once buffer and modules are ready.
+  const tryStartPlay = state => {
+    if (!pendingStarts.has(state)) return;
+    if (!scheduling) { pendingStarts.delete(state); return; }
+    if (!state.buffer || !audioReady) return;
+    pendingStarts.delete(state);
+    stopPlay(state);
+    try {
+      startPlay(state, getAudioContext());
+      setStatus(state, 'play');
+    } catch (error) {
+      setStatus(state, state.buffer ? 'stop' : 'unload');
+      report(`WaveSoundBuffer play failed: ${error?.message ?? error}`);
+    }
+  };
 
   // StartPlay (WaveImpl.cpp 3190): build the transport and filter chain, then
   // start the device unless Paused.  The worklet is created synchronously so

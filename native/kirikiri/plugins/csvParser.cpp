@@ -238,11 +238,11 @@ class NI_CSVParser : public tTJSNativeInstance
         lineNo = 0;
     }
 
-    void initStorage(tTJSVariantString *filename, bool utf8 = false)
+    void initStorage(tTJSVariantString *filename, bool utf8 = false, const tjs_char *mode = nullptr)
     {
         clear();
         ttstr text;
-        if (utf8)
+        if (!mode)
         {
             tTJSBinaryStream *stream = TJSCreateBinaryStreamForRead(filename, ttstr());
             if (!stream)
@@ -259,11 +259,12 @@ class NI_CSVParser : public tTJSNativeInstance
             delete stream;
             // ttstr's implicit narrow conversion stops at the first NUL, which is
             // the same truncation the reference gets from its NUL-terminated buffer.
-            text = ttstr(boost::locale::conv::utf_to_utf<char16_t>(bytes).c_str());
+            text = utf8 ? ttstr(boost::locale::conv::utf_to_utf<char16_t>(bytes).c_str())
+                        : ttstr(bytes.c_str());
         }
         else
         {
-            iTJSTextReadStream *stream = TVPCreateTextStreamForRead(ttstr(filename), TJS_W(""));
+            iTJSTextReadStream *stream = TVPCreateTextStreamForRead(ttstr(filename), mode);
             if (!stream)
             {
                 TVPThrowExceptionMessage(TJS_W("can't open storage:%1"), ttstr(filename));
@@ -377,7 +378,8 @@ tTJSNativeClass *TVPCreateNativeClass_CSVParser()
         if (numparams < 1)
             return TJS_E_BADPARAMCOUNT;
         _this->initStorage(param[0]->AsStringNoAddRef(),
-                           numparams > 1 && (tjs_int)*param[1] != 0);
+            TJS_PARAM_EXIST(1) && param[1]->Type() != tvtString && (tjs_int)*param[1] != 0,
+            !TJS_PARAM_EXIST(1) ? TJS_W("") : param[1]->Type() == tvtString ? param[1]->GetString() : nullptr);
         return TJS_S_OK;
     }
     TJS_END_NATIVE_METHOD_DECL(/*func. name*/ initStorage)
@@ -408,7 +410,8 @@ tTJSNativeClass *TVPCreateNativeClass_CSVParser()
         if (numparams > 0)
         {
             _this->initStorage(param[0]->AsStringNoAddRef(),
-                               numparams > 1 && (tjs_int)*param[1] != 0);
+                TJS_PARAM_EXIST(1) && param[1]->Type() != tvtString && (tjs_int)*param[1] != 0,
+                !TJS_PARAM_EXIST(1) ? TJS_W("") : param[1]->Type() == tvtString ? param[1]->GetString() : nullptr);
         }
         _this->parse(objthis);
         return TJS_S_OK;

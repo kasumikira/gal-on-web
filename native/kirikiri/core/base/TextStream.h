@@ -1,5 +1,5 @@
 #pragma once
-#include "StoragesIntf.h"
+#include "StorageIntf.h"
 
 iTJSTextReadStream *TVPCreateTextStreamForRead(const ttstr &name,
                                                const ttstr &mode);

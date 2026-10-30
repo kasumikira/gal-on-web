@@ -2,7 +2,7 @@
 
 #include <optional>
 
-#include "StoragesIntf.h"
+#include "StorageIntf.h"
 
 /**
  * \brief 通用模式数字解析函数

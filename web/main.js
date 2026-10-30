@@ -21,6 +21,7 @@ try {
     entry: game.entry,
     arguments: {},
     document,
+    canvas: document.createElement('canvas'),
     wasmURL,
     container: document.body,
     inform(value) {

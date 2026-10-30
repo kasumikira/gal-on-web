@@ -1,6 +1,6 @@
 // Directory result conversion shared by dirlist and the implemented fstat subset.
 #pragma once
-#include "StoragesIntf.h"
+#include "StorageIntf.h"
 #include "runtime.h"
 #include "tjsArray.h"
 inline tTJSVariant LocalField(const tTJSVariant &value, const tjs_char *name) {

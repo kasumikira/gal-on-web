@@ -1,6 +1,6 @@
 # Kirikiri WASM 运行时
 
-这是正式的 C++ 脚本运行时项目。CMake 生成 tjs-runtime，包含原版 TJS2、KAGParser、Scripts、核心类及按需加载的原生插件；源码编译、字节码加载和执行使用同一个 tTJS 实例。
+这是正式的 C++ 引擎运行时项目。CMake 生成 tjs-runtime，包含原版 TJS2、KAGParser、Scripts、System、视觉类、GLES 后端及按需加载的原生插件；源码编译、字节码加载和执行使用同一个 tTJS 实例。
 
 ## 源码布局
 
@@ -9,6 +9,9 @@
 - core/plugin/：同模块插件注册器、ncbind 及运行时类元数据。
 - core/utils/：原版 MD5 实现。
 - core/common/：公共头文件。
+- visual/：原版 Layer/LayerManager、Font/FreeType、Bitmap、图形缓存、转场、事件及浏览器窗口适配。
+- render/：Emscripten GLES、纹理、分块位图、混合方法与呈递。
+- image/：PNG/JPEG/TLG/WebP 和图像加载入口。
 - plugins/：scriptsEx、csvParser、saveStruct、TextRenderBase、脚本 PSBFile、JSON、Expat 与 kirikiroid2 扩展的同模块注册。
 - runtime.h / runtime.cpp：运行时状态、借用与 owner 持有值、导出索引和生命周期。
 - runtime-api.cpp：值、对象、脚本执行等 WASM 导出 API。
@@ -53,9 +56,9 @@ Bison 语法和日期词表按输入依赖在构建目录生成。源码修正�
 
 ## 平台边界
 
-脚本编译、执行、内建容器、KAGParser 和脚本对象生命周期由 C++ 及原版 TJS2 实现。图像、渲染、音频、归档和实际资源 IO 在 JS；绑定层通过不透明句柄调用 API，C++ 管理调用期间的 Variant 和宿主根。
+脚本编译、执行、内建容器、KAGParser、System、图层、字体、位图、Motion 和脚本对象生命周期由 C++ 实现。图像解码、FreeType 栅格化和 GLES 绘制也在 native；JS 提供浏览器窗口、输入采集、音视频、归档和实际资源 IO。绑定层通过不透明句柄调用 API，C++ 管理调用期间的 Variant 和宿主根。存储公共能力仍唯一保留在 JS，native 不维护第二份路径/归档状态。
 
-scriptsEx、saveStruct 和其他 native 插件复用参考 ncbind 声明及调用模板，解析、脚本对象操作与序列化体沿用原版：csvParser 的 `parse()` 是当前调用帧内的嵌套回调，saveStruct 直接写 UTF-16 码元而不再套文本流 BOM。实际字节 IO 通过平台接口接入 JS 资源层；文本流的编码、加密和压缩在 native。
+scriptsEx、saveStruct 和其他 native 插件复用参考 ncbind 声明及调用模板，解析、脚本对象操作与序列化体沿用原版：csvParser 的 `parse()` 是当前调用帧内的嵌套回调，saveStruct 沿用历史 Wamsoft 的 UTF-8／当前代码页写流、精确 real 表达式和整形选项，默认换行保留 CRLF。实际字节 IO 通过平台接口接入 JS 资源层；文本流的编码、加密和压缩在 native。
 
 `BinaryWriteStream` 将二进制存档缓冲在内存中，并在析构时经宿主存储接口提交，提交调用会等待完成。`tTJSBinaryStream` 的析构不可抛异常，因此析构阶段的存储失败不能从原版 `Array.saveStruct`／`Dictionary.saveStruct` 返回给脚本；该行为保留核心的原有流删除路径，不通过修改核心接口弥补。
 

@@ -1,5 +1,6 @@
 #pragma once
 #include "tjs.h"
+#include "SystemIntf.h"
 #include "tjsError.h"
 #include "core/plugin/PluginRegistry.h"
 #include <map>
@@ -48,6 +49,9 @@ struct Runtime : iTJSConsoleOutput
     std::unordered_map<iTJSDispatch2 *, std::set<int>> exportsByObject;
     int next = 1, alive = 0, invalidations = 0, storage = 0;
     bool stopped = false;
+    tTJSVariant visualService;
+    TVPSystemState system;
+    std::shared_ptr<void> kagParserExScenarioCache;
     ttstr defaultReadEncoding = TJS_W("UTF-8");
     int (*defaultReadConverter)(unsigned short *, const unsigned char *) = nullptr;
     tTJSVariant timerScheduler;

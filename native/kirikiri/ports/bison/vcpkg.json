@@ -1,0 +1,5 @@
+{
+  "name": "bison",
+  "version": "2.5.25",
+  "description": "WinFlexBison host tools for the Kirikiri parser build"
+}

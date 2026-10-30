@@ -14,7 +14,9 @@
         "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
         "VCPKG_TARGET_TRIPLET": "wasm32-emscripten",
         "VCPKG_MANIFEST_INSTALL": true,
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/../../out/vcpkg_installed"
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/../../out/vcpkg_installed",
+        "VCPKG_OVERLAY_PORTS": "${sourceDir}/ports",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets"
       }
     }
   ],

@@ -221,11 +221,10 @@ export class XP3Archive {
 export async function createXP3Filter(storage, wasmURL, message) {
   if (!await storage.exists('/xp3filter.tjs')) return;
   const vm = await new TJSInterop(wasmURL).init(Object.create(null));
-  const system = createSystem({ vm, storage, enqueueEvent: callback => vm.enqueue(callback) });
+  const system = await createSystem({ vm, storage });
   let service;
   try {
     vm.registerGlobal('Debug', createDebugClass(message));
-    vm.registerGlobal('System', system.api);
     vm.attachStorage(storage);
     await vm.nativePlugins(0, 'xp3filter.dll');
     service = await vm.get(vm.global.Storages, '_xp3Filter');

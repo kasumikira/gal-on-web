@@ -1,13 +1,15 @@
-// AlphaMovie 的 AMV 后端：专用 Worker 解码 + 有界预解码（架构图：AMV: 专用 Worker 后端）。
+// AlphaMovie AMV backend: dedicated Worker decoding + bounded predecode (architecture diagram: AMV dedicated Worker backend).
 //
-// 主线程只做三件事：把 storage 读出的文件字节交给 Worker、维护容器策略
-// （Loop / NextMovieFile，需要 storage）、把解出的帧交给统一管线。像素解码、
-// Huffman/IDCT 与 WASM 上下文都留在 Worker，主线程不再被整帧解码阻塞。
+// The main thread does only three things: send file bytes read by storage to the Worker,
+// maintain container policy (Loop / NextMovieFile, which needs storage), and pass decoded
+// frames to the shared pipeline. Pixel decoding, Huffman/IDCT, and the WASM context stay in
+// the Worker, so full-frame decoding no longer blocks the main thread.
 //
-// 参考实现的 AlphaMovieNative_guess 是“实例一个线程 + Free/Ready 有界帧池”：
-// 这里由 VideoPipeline 的有界队列承担同一职责（容量 = preloadSamples），
-// Worker 在队列满时自然停止预解码。多个 AlphaMovie 实例共用一个 Worker，
-// 会话按实例隔离，避免每个实例都重新实例化 WASM。
+// The reference AlphaMovieNative_guess uses one thread per instance and a bounded Free/Ready
+// frame pool. Here, VideoPipeline's bounded queue provides the same role (capacity =
+// preloadSamples), and the Worker naturally pauses predecode when the queue is full. Multiple
+// AlphaMovie instances share one Worker, with sessions isolated per instance to avoid creating
+// a new WASM instance for each one.
 let nextSessionId = 1;
 
 function createAmvTransport() {
@@ -42,7 +44,7 @@ export class AmvWorkerSource {
     this.nextLoop = true;
     this.nextMovieFile = '';
     this.lastError = null;
-    // Decoder.Frame：最后解出的帧号（预解码可能领先已呈现的帧）。
+    // Decoder.Frame: the index of the last decoded frame (predecode may be ahead of presentation).
     this.decoderFrame = 0;
     this.session = nextSessionId++;
     this.nextRequestId = 1;
@@ -79,14 +81,14 @@ export class AmvWorkerSource {
     });
   }
 
-  // 返回错误消息或 null，与 amv.js 的 AMVDecoder.open 契约一致。
+  // Return an error message or null, matching the AMVDecoder.open contract in amv.js.
   async open(name) {
     try { return await this.openBytes(await this.storage.read(String(name))); }
     catch (error) { return error.message; }
   }
 
   async openBytes(bytes) {
-    // 借用归档视图不能转移所有权；显式拥有的完整缓冲才直接转移。
+    // A borrowed archive view cannot transfer ownership; transfer only a complete buffer that is explicitly owned.
     const input = this.storage.transferOwnership && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
       ? bytes : bytes.slice();
     try {
@@ -100,8 +102,8 @@ export class AmvWorkerSource {
     }
   }
 
-  // 解下一帧；返回 null 表示影片数据结束。片尾的循环与下一个文件切换
-  // （参考 DecodeNext_guess 的 Loop / NextMovieFile 分支）在这里决策。
+  // Decode the next frame; return null at end of media. Decide here whether to loop or
+  // switch to the next file (matching the Loop / NextMovieFile branches in DecodeNext_guess).
   async next() {
     for (;;) {
       const reply = await this.request({ type: 'decode' });
@@ -111,7 +113,7 @@ export class AmvWorkerSource {
         return { frame, timestamp: null, width, height, left, top, rgba: reply.pixels ?? null, ownedPixels: true };
       }
       if (!this.nextMovieFile) return null;
-      // 参考 DecodeNext_guess：NextMovieFile 打不开时返回 2，工作线程结束。
+      // Match DecodeNext_guess: if NextMovieFile cannot be opened, return 2 and end the worker thread.
       let bytes;
       try { bytes = await this.storage.read(this.nextMovieFile); }
       catch (error) { this.lastError = error?.message ?? String(error); return null; }

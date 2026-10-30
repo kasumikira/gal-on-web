@@ -1,4 +1,7 @@
 #include "runtime.h"
+#include "visual/EventIntf.h"
+#include "visual/RenderManager.h"
+#include "visual/LayerBitmapIntf.h"
 #include "ScriptMgnIntf.h"
 #include "tjsNative.h"
 #include <algorithm>
@@ -225,6 +228,7 @@ void Runtime::shutdown()
             if (TJS_FAILED(status)) TJS_eTJSError(status);
         }
     }
+    TVPShutdownVisualEvents();
     // Drop bridge roots that are not held by a native instance first.
     // Owner-held values stay available while their owning objects run
     // their original TJS finalization callbacks.
@@ -237,8 +241,15 @@ void Runtime::shutdown()
         auto held = extractValue(index->second.front());
         held.mapped().value.Clear();
     }
+    system.arguments.Clear();
+    kagParserExScenarioCache.reset();
+    system.registerData.Clear();
     engine->Shutdown();
+    TVPClearCharacterTextures();
+    iTVPTexture2D::RecycleProcess();
     timerScheduler.Clear();
+    visualService.Clear();
+    system.service.Clear();
     pluginValues.clear();
     pluginClasses.clear();
     loadedPlugins.clear();

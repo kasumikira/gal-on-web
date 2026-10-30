@@ -1,16 +1,9 @@
 import { config, initializeGlobals } from './global.js';
 import { initializeCodecs } from './codecs/wasm.js';
-import { initializeGPU } from './gpu.js';
 import { TJSInterop } from './wasm-vm.js';
-import { Closure } from '#krkr/values';
 import { Storages } from './storage.js';
 import { createXP3Filter } from './xp3.js';
-import { createWindowClass, createBasicDrawDeviceClass } from './window.js';
-import { createLayerClass } from './layer.js';
-import { createFontClass, TEXT_BLEND } from './font.js';
-import { createBitmapClass } from './bitmap-native.js';
-import { attachCompositor } from './layer-composite.js';
-import { createGraphicLoader } from './graphic.js';
+import { createWindowClass, createBasicDrawDeviceClass, attachNativeCompositor } from './window.js';
 import { createWaveSoundBufferClass } from './sound.js';
 import { createVideoOverlayClass } from './video.js';
 import { Plugins } from './plugins.js';
@@ -18,30 +11,44 @@ import { initializeConstants } from './constants.js';
 import { createDebugClass } from './debug.js';
 import { createSystem } from './system.js';
 import { createTimerScheduler } from './timer.js';
-import { nativeOwner, defineNativeClass, installNativeStubs, unimplemented, retainScriptValue, disposeScriptValue } from '#krkr/native';
+import { defineNativeClass, installNativeStubs, unimplemented, retainScriptValue, disposeScriptValue } from '#krkr/native';
 import { nativeGlobals } from '#krkr/native-api';
 
 export async function createRuntime(options) {
   await initializeCodecs();
   initializeGlobals(options);
-  const { entry, gameStorage, saveStorage, wasmURL, document, inform, message } = config;
+  const { entry, gameStorage, saveStorage, wasmURL, document, canvas, inform, message } = config;
   const storage = new Storages(gameStorage, saveStorage, entry + '>');
   await storage.initialize();
+  // Native FreeType uses the same shared storage interface for packaged font
+  // assets and game files. No native filesystem or archive state is added.
+  const defaultFontURL = new URL('../assets/fonts/default.ttf', import.meta.url);
+  storage.registerMedia('engine-resource://', {
+    isExistent: path => path === 'fonts/default.ttf',
+    async read(path) {
+      if (path !== 'fonts/default.ttf') throw new Error(`Engine resource does not exist: ${path}`);
+      const response = await fetch(defaultFontURL);
+      if (!response.ok) throw new Error(`Unable to load default font: HTTP ${response.status}`);
+      return new Uint8Array(await response.arrayBuffer());
+    },
+  });
   if (!await storage.exists(storage.normalize(entry))) {
     await storage.finalize();
     throw new Error(`Game entry not found: ${entry}`);
   }
   storage.addAutoPath('/');
   storage.extractionFilter = await createXP3Filter(storage, wasmURL, message);
-  const gpu = initializeGPU(document, TEXT_BLEND);
   const global = Object.create(null);
   let vm;
   try {
-    vm = await new TJSInterop(wasmURL).init(global);
+    const gl = canvas.getContext('webgl2', { alpha: true, antialias: false, depth: false,
+      stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: true,
+      powerPreference: 'high-performance' });
+    if (!gl) throw new Error('Unable to create WebGL2 context');
+    vm = await new TJSInterop(wasmURL).init(global, { canvas, gl });
   } catch (error) {
     await storage.finalize();
     await storage.extractionFilter?.finalize();
-    gpu.finalize();
     throw error;
   }
   const register = (name, value) => {
@@ -52,6 +59,7 @@ export async function createRuntime(options) {
   let plugins;
   plugins = new Plugins({
     nativePlugins: (operation, name) => vm.nativePlugins(operation, name),
+    presentAlphaMovieFrame: (target, frame, left, top) => vm.visualMovieFrame(target, frame, left, top),
     global,
     storage,
     registerGlobal: register,
@@ -76,33 +84,16 @@ export async function createRuntime(options) {
   register('Plugins', plugins);
   register('BasicDrawDevice', createBasicDrawDeviceClass());
   register('Window', createWindowClass(global.BasicDrawDevice));
-  const paintAll = () => compositor.requestPaintAll();
-  // TVPFindGraphicLoadHandler (GraphicsLoaderIntf.cpp 1583): extension-less
-  // graphic names try each registered graphic extension until a storage
-  // exists, and _m/_p sibling lookups follow the same rule.
-  const graphicExtensions = ['.tlg', '.png', '.jpg', '.jpeg', '.bmp', '.webp'];
-  const resolveGraphicName = async name => {
-    if (await storage.has(name)) return name;
-    if (!/[.][A-Za-z0-9]+$/.test(name)) {
-      for (const ext of graphicExtensions) {
-        if (await storage.has(name + ext)) return name + ext;
-      }
-    }
-    return name;
-  };
-  const graphicCache = createGraphicLoader(storage);
-  const loadGraphic = graphicCache.load;
-  const loadLayerGraphic = async (name, key, opts) => loadGraphic(await resolveGraphicName(name), key, opts);
-  register('Bitmap', createBitmapClass({ storage, loadGraphic: loadLayerGraphic }));
-  const Layer = createLayerClass(document, {
-    Window: global.Window,
-    Bitmap: global.Bitmap,
-    storage,
-    enqueueEvent: (callback, cleanup) => enqueueEvent(callback, cleanup),
-    onLayerChange: paintAll,
-    loadGraphic: loadLayerGraphic,
-  });
-  register('Layer', Layer);
+  vm.attachStorage(storage);
+  // SysInitImpl.cpp sets the graphic cache ceiling from physical memory
+  // (physmem / 10, at most 512MB).  navigator.deviceMemory is the browser's
+  // coarse equivalent; the native side clamps the value and keeps its own
+  // platform default when the host does not provide one.
+  vm.setGraphicCacheSystemLimit?.(
+    Math.floor((Number(document.defaultView?.navigator?.deviceMemory) || 1) *
+      1024 * 1024 * 1024 / 10));
+  await vm.initializeVisual();
+  const Layer = global.Layer;
   // The event queue is created before the compositor so browser input events
   // enter the same serial dispatcher as Timer, AsyncTrigger and continuous
   // callbacks (EventIntf.cpp TVPPostEvent).
@@ -139,7 +130,7 @@ export async function createRuntime(options) {
     compactNativeHeap().catch(inform);
   };
   document.addEventListener('visibilitychange', onVisibilityChange);
-  const compositor = attachCompositor(global.Window, Layer, document, { enqueueEvent });
+  const compositor = await attachNativeCompositor(global.Window, vm, document, { canvas, enqueueEvent, reportError: inform });
   // Window instance hooks: update/resize/add repaint the compositor; input
   // events go through the compositor's dispatcher.
   const originalWindowInit = global.Window.initialize;
@@ -153,11 +144,9 @@ export async function createRuntime(options) {
       const owner = retainScriptValue(state.owner);
       enqueueEvent(() => owner.invalid ? undefined : state.onResize(), () => disposeScriptValue(owner)).catch(inform);
     };
-    state.onLayerAdded = () => compositor.requestPaint(state);
-    compositor.wire(state);
+    await compositor.wire(state);
     return state;
   };
-  register('Font', createFontClass(document, { storage, Rect: global.Rect, Layer }));
   const timerScheduler = await createTimerScheduler({
     vm, enqueueEvent, isIdle: () => pendingEvents === 1, reportError: inform,
     laxTimer: config.arguments['-laxtimer'] === 'yes',
@@ -171,100 +160,23 @@ export async function createRuntime(options) {
   // VideoOverlay decodes with libav/WebCodecs and renders through layer1/layer2
   // (KRMovieLayer's vomLayer path).
   register('VideoOverlay', createVideoOverlayClass({
-    Window: global.Window, Layer, storage,
-    getAudioContext, enqueueEvent,
+    Window: global.Window, storage, getAudioContext, enqueueEvent,
+    presentLayerFrame: (target, frame) => vm.visualMovieFrame(target, frame, 0, 0, true),
   }));
-  vm.attachStorage(storage);
   register('Debug', Object.assign(createDebugClass((important,value)=>message(important?`! ${value}`:value)),{
     // The JS plugin registry does not search native debug DLL directories.
     dllSearchForDebug:0,
   }));
-  const system = createSystem({vm,enqueueEvent,storage,graphicCache});
-  register('System', system.api);
+  const system = await createSystem({vm,storage});
   for (const name of nativeGlobals) {
     if (!global[name]) register(name, defineNativeClass(name, { initialize: unimplemented(`${name}: 原生类尚未实现`) }));
   }
   const diagnostics = () => {
-      if (disposePromise) throw new Error('Runtime is disposed');
-      let layers = 0, pixelBytes = 0;
-      const images = new Set(), nodes = new Set(), layerTextures = new Map();
-      const visit = node => {
-        if (!node || node.invalid || nativeOwner(node.owner).invalid || nodes.has(node)) return;
-        nodes.add(node);
-        layers++;
-        let visible = true;
-        for (let ancestor = node; ancestor; ancestor = ancestor.parent) {
-          if (!ancestor.visible || !ancestor.opacity) { visible = false; break; }
-        }
-        for (const image of [node.image, node.province]) if (image) {
-          const storage = image._storage;
-          if (!images.has(storage)) {
-            images.add(storage);
-            pixelBytes += storage.pixels?.byteLength ?? 0;
-          }
-          const entry = storage.gpu;
-          if (entry) {
-            let texture = layerTextures.get(storage);
-            if (!texture) {
-              texture = { bytes: entry.width * entry.height * entry.bytesPerPixel,
-                width: image.width, height: image.height, visible: false, names: [] };
-              layerTextures.set(storage, texture);
-            }
-            texture.visible ||= visible;
-            texture.names.push(node.name);
-          }
-        }
-        for (const child of node.children) visit(child);
-      };
-      for (const window of global.Window.instances.values()) {
-        visit(window.primaryLayer);
-      }
-      for (const state of Layer.instances.values()) visit(state.node);
-      const conductors = vm.kagParsers();
-      const imageInfo = image => ({
-        width: image?.width,
-        height: image?.height,
-        // GPU-only alpha remains unknown rather than forcing a readback.
-        alpha: image ? (image.cpuValid ? image.pixels.some((value, index) => index % 4 === 3 && value > 0) : null) : undefined,
-      });
-      const graphics = [];
-      for (const node of nodes) {
-        if (!node.visible || !nativeOwner(node.owner).classNames.has('EnvGraphicLayer')) continue;
-        let ancestor = node;
-        while (ancestor?.visible) ancestor = ancestor.parent;
-        if (ancestor) continue;
-        const owner = nativeOwner(node.owner);
-        const image = owner.members.get('_image');
-        const source = image instanceof Closure ? image.object : image;
-        const raw = source?.members.get('_image');
-        const rawOwner = raw instanceof Closure ? raw.object : raw;
-        const rawNode = Layer.instances.get(rawOwner)?.node;
-        const srcLayer = source?.members.get('_srclayer');
-        const srcOwner = srcLayer instanceof Closure ? srcLayer.object : srcLayer;
-        const srcNode = Layer.instances.get(srcOwner)?.node;
-        graphics.push({
-          classes: [...(source?.classNames ?? [])],
-          fields: Object.fromEntries([...(source?.members ?? [])].filter(([, value]) =>
-            value == null || ['number', 'string'].includes(typeof value))),
-          raw: rawNode ? imageInfo(rawNode.image) : null,
-          dest: imageInfo(node.image),
-          src: srcNode ? imageInfo(srcNode.image) : null,
-        });
-      }
-      const textures = [...layerTextures.values()];
-      return { pendingEvents, layers, pixelBytes, rendering: compositor.diagnostics(), conductors, graphics,
-        memory: {
-          wasm: { capacityBytes: vm.module.HEAPU8.byteLength,
-            allocatedBytes: vm.module._tjs_memory_allocated_bytes(),
-            allocatorFreeBytes: vm.module._tjs_memory_free_bytes() },
-          graphicCache: graphicCache.diagnostics(),
-          layerTextures: {
-            visibleBytes: textures.filter(t => t.visible).reduce((sum, t) => sum + t.bytes, 0),
-            hiddenBytes: textures.filter(t => !t.visible).reduce((sum, t) => sum + t.bytes, 0),
-            largestHidden: textures.filter(t => !t.visible).sort((a, b) => b.bytes - a.bytes).slice(0, 12),
-          },
-        },
-      };
+    if (disposePromise) throw new Error('Runtime is disposed');
+    return { pendingEvents, rendering: compositor.diagnostics(), conductors: vm.kagParsers(),
+      memory: { wasm: { capacityBytes: vm.module.HEAPU8.byteLength,
+        allocatedBytes: vm.module._tjs_memory_allocated_bytes(),
+        allocatorFreeBytes: vm.module._tjs_memory_free_bytes() } } };
   };
   let startPromise, disposePromise;
   const start = () => {
@@ -283,7 +195,7 @@ export async function createRuntime(options) {
         // startup-script events have drained.
         lastCompact = Date.now();
         compactNativeHeap().catch(inform);
-        system.startMaintenance();
+        await system.startMaintenance();
       } catch (error) {
         acceptingEvents = false;
         throw error;
@@ -295,7 +207,7 @@ export async function createRuntime(options) {
   };
   // stop cancels browser work synchronously; finalize may enter the VM and
   // therefore runs serially after startup and event delivery have drained.
-  const resources = [timerScheduler, system, global.VideoOverlay, Layer, compositor, global.WaveSoundBuffer];
+  const resources = [timerScheduler, system, global.VideoOverlay, compositor, global.WaveSoundBuffer];
   const dispose = () => {
     if (disposePromise) return disposePromise;
     acceptingEvents = false;
@@ -315,10 +227,7 @@ export async function createRuntime(options) {
         document.removeEventListener('visibilitychange', onVisibilityChange);
         await storage.finalize();
         await storage.extractionFilter?.finalize();
-        // Drop decoded images (and their resident GPU textures) before the
-        // device tears itself down.
-        graphicCache.clear();
-        gpu.finalize();
+        compositor.releaseDevice();
         if (audioContext) {
           await audioContext.close();
           audioContext = null;

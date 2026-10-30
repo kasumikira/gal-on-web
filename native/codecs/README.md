@@ -1,15 +1,12 @@
 # Codecs
 
-Rust 图像解码器在本目录构建；libav.js WMV 后端的配置和构建脚本位于 [native/libav](../libav/README.md)，Windows 用户在 MSYS2 终端执行 `bash native/libav/build.sh`。
+Rust AMV 帧解码器在本目录构建；通用 PNG/JPEG/TLG/WebP 图像解码已迁入 `native/kirikiri/image`，不再由此模块提供。libav.js WMV 后端的配置和构建脚本位于 [native/libav](../libav/README.md)，Windows 用户在 MSYS2 终端执行 `bash native/libav/build.sh`。
 
 构建：`pnpm build:codecs`。需安装 Rust 的 `wasm32-unknown-unknown` target；构建启用 `simd128`，产物为 `web/engine-js/codecs/codecs.wasm`。
 
-- `src/tlg.rs`：TLG5 / TLG6 解码。
-- `src/png.rs`：索引 PNG 解码。
-- `src/pixels.rs`：PSB RLE 和 BGRA 转换。
 - `src/amv.rs`：AMV 帧解码、可复用上下文及 SIMD 转色。
-- `src/ffi.rs`：无状态图像算子的 WASM 接口。
-- `src/lib.rs`：公共错误和尺寸读取工具。
+- `src/ffi.rs`：WASM 内存分配接口。
+- `src/lib.rs`：公共错误类型。
 
 容器、存储、播放时钟与 TJS 业务逻辑留在 JS。JS 通过 `codecs/wasm.js` 访问 WASM，AMV 每帧输入复制一次、RGBA 输出复制一次；不会按宏块跨边界调用。
 

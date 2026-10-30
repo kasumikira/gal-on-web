@@ -1,23 +1,24 @@
 // AlphaMovie.cpp: TJS binding for the AMV worker backend (./amv-source.js).
 //
-// 消费端是“脚本驱动”：Worker 把解码帧预解进统一有界队列（容量 =
-// preloadSamples），脚本每次 showNextImage 取走一帧，经公共图层呈现入口写进
-// 目标图层。这对应 AlphaMovieNative_guess 的 Ready/Free 帧池与
-// layer->SetSize / GetMainImage()->Update / SetPosition / Update 路径。
-import { nativeClass, nativeMethod, nativeProperty, nativeOwner, callScript } from '#krkr/native';
+// The consumer is script-driven: the Worker predecodes frames into a shared bounded queue
+// (capacity = preloadSamples), and each showNextImage call takes a frame and sends it through
+// the native layer presentation entry point to the target layer. This corresponds to the
+// Ready/Free frame pool and layer->SetSize / GetMainImage()->Update / SetPosition / Update path
+// in AlphaMovieNative_guess.
+import { nativeClass, nativeMethod, nativeProperty, nativeReference } from '#krkr/native';
 import { number } from '#krkr/values';
 import { config } from '../global.js';
-import { VideoPipeline, presentVideoFrame, closeFrame } from '../video-pipeline.js';
+import { VideoPipeline, closeFrame } from '../video-pipeline.js';
 import { AmvWorkerSource } from './amv-source.js';
 
 const ERROR_PREFIX = "can't open alpha movie file - ";
-// AlphaMovieNative_guess 的 PreloadSamples 初值。
+// Initial PreloadSamples value from AlphaMovieNative_guess.
 const DEFAULT_PRELOAD = 5;
 
-export function registerAlphaMovie({ storage, get, registerGlobal }) {
-  const Layer = get('Layer');
+export function registerAlphaMovie({ storage, registerGlobal, presentAlphaMovieFrame }) {
   const report = message => config.inform?.(message);
-  // 会话与错误处理不是参考实现的脚本成员，因此留在模块内而不是原生类上。
+  // Sessions and error handling are not script members in the reference, so keep them in
+  // this module rather than on the native class.
   const closeSession = async state => {
     if (state.pipeline) await state.pipeline.dispose();
     else await state.source?.dispose();
@@ -59,8 +60,8 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
       });
     }
 
-    // AlphaMovieNative_guess::clear：丢弃已解出的帧（Ready/Free 清空），
-    // 解码器保持打开；再次 play() 之前不会产生新帧。
+    // AlphaMovieNative_guess::clear: discard decoded frames (clear Ready/Free) but keep the
+    // decoder open; no new frames are produced until play() is called again.
     @nativeMethod
     clear() {
       this.playing = false;
@@ -72,14 +73,14 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
     @nativeMethod
     isPlaying() { return this.playing ? 1 : 0; }
 
-    // stop：停止工作线程但保留 Ready 中已解出的帧（参考实现不清理 Ready）。
+    // stop: stop the worker thread but retain decoded frames in Ready (the reference does not clear Ready).
     @nativeMethod
     stop() {
       this.playing = false;
       return this.pipeline?.stop();
     }
 
-    // play：按 PreloadSamples 重建帧池、解码位置回到片头，再启动预解码。
+    // play: rebuild the frame pool using PreloadSamples, seek decoding to the beginning, then start predecode.
     @nativeMethod
     async play() {
       const pipeline = this.pipeline, source = this.source;
@@ -105,9 +106,9 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
       if (this.source) this.source.nextMovieFile = String(name);
     }
 
-    // AlphaMovieNative::showNextImage：取走队列头部的帧，设置图层尺寸、写入
-    // 主图像、按 (left, top) 移动并请求重绘。队列为空时保留上一帧，与参考
-    // 实现“工作线程尚未产出”的行为一致。
+    // AlphaMovieNative::showNextImage: take the queue's first frame, set layer dimensions,
+    // write the main image, move it to (left, top), and request repaint. If the queue is empty,
+    // keep the previous frame, matching the reference behavior when the worker has not produced one yet.
     @nativeMethod
     async showNextImage(target) {
       if (!arguments.length) throw new Error('TJS AlphaMovie.showNextImage requires a layer');
@@ -117,13 +118,8 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
       if (!frame) return this.displayedFrame;
       this.displayedFrame = frame.frame;
       try {
-        const owner = nativeOwner(target);
-        await presentVideoFrame([owner], frame, {
-          Layer,
-          left: frame.left + this.leftOffset,
-          top: frame.top + this.topOffset,
-          repaint: layer => callScript(layer, 'update', []),
-        });
+        const owner = nativeReference(target);
+        await presentAlphaMovieFrame(owner, frame, frame.left + this.leftOffset, frame.top + this.topOffset);
       } finally { closeFrame(frame); }
       return this.displayedFrame;
     }
@@ -131,8 +127,8 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
     @nativeProperty get numOfFrame() { return this.source?.info?.numOfFrame ?? 0; }
 
     @nativeProperty get frame() { return this.source?.decoderFrame ?? 0; }
-    // SetFrame_guess：作废在途解码并丢弃 Ready，再 seek；只有原本在解码时
-    // 才继续预解码（参考实现只在 SeekFrame 成功时通知工作线程）。
+    // SetFrame_guess: invalidate in-flight decoding and discard Ready, then seek. Resume
+    // predecode only if decoding was active (the reference notifies the worker only when SeekFrame succeeds).
     @nativeProperty set frame(value) {
       const pipeline = this.pipeline, source = this.source;
       if (!pipeline || !source) return;
@@ -157,7 +153,7 @@ export function registerAlphaMovie({ storage, get, registerGlobal }) {
     }
 
     // AlphaMovieNative::preloadSamples clamps to 1..30 and ignores other values;
-    // 参考实现同样只在 play() 时按该值重建帧池。
+    // The reference also rebuilds the frame pool from this value only during play().
     @nativeProperty get preloadSamples() { return this.preloadSamplesCount; }
     @nativeProperty set preloadSamples(value) {
       const count = Math.trunc(number(value));

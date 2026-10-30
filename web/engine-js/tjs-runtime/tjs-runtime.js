@@ -138,6 +138,11 @@ var wasmBinary;
 // set in exit() and abort()
 var ABORT = false;
 
+// set by exit() and abort().  Passed to 'onExit' handler.
+// NOTE: This is also used as the process return code in shell environments
+// but only when noExitRuntime is false.
+var EXITSTATUS;
+
 /**
  * Indicates whether filename is delivered via file protocol (as opposed to http/https)
  * @noinline
@@ -168,6 +173,7 @@ function updateMemoryViews() {
   HEAPU16 = new Uint16Array(b);
   HEAP32 = new Int32Array(b);
   Module["HEAPU32"] = HEAPU32 = new Uint32Array(b);
+  HEAPF32 = new Float32Array(b);
   HEAP64 = new BigInt64Array(b);
 }
 
@@ -376,14 +382,104 @@ var onPreRuns = [];
 
 var noExitRuntime = true;
 
-/** @type {!Int32Array} */ var HEAP32;
+var UTF8Decoder = globalThis.TextDecoder && new TextDecoder;
 
-var syscallGetVarargI = () => {
-  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
-  var ret = HEAP32[((+SYSCALLS.varargs) >> 2)];
-  SYSCALLS.varargs += 4;
-  return ret;
+/**
+   * heapOrArray is either a regular array, or a JavaScript typed array view.
+   * @param {number} idx
+   * @param {number=} maxBytesToRead
+   * @param {boolean=} ignoreNul
+   * @return {number}
+   */ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
+  var maxIdx = idx + maxBytesToRead;
+  if (ignoreNul) return maxIdx;
+  // TextDecoder needs to know the byte length in advance, it doesn't stop on
+  // null terminator by itself.
+  // As a tiny code save trick, compare idx against maxIdx using a negation,
+  // so that maxBytesToRead=undefined/NaN means Infinity.
+  while (heapOrArray[idx] && !(idx >= maxIdx)) ++idx;
+  return idx;
 };
+
+/**
+   * Given a pointer 'idx' to a null-terminated UTF8-encoded string in the given
+   * array that contains uint8 values, returns a copy of that string as a
+   * Javascript String object.
+   * heapOrArray is either a regular array, or a JavaScript typed array view.
+   * @param {number=} idx
+   * @param {number=} maxBytesToRead
+   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
+   * @return {string}
+   */ var UTF8ArrayToString = (heapOrArray, idx = 0, maxBytesToRead, ignoreNul) => {
+  var endPtr = findStringEnd(heapOrArray, idx, maxBytesToRead, ignoreNul);
+  // When using conditional TextDecoder, skip it for short strings as the overhead of the native call is not worth it.
+  if (endPtr - idx > 16 && heapOrArray.buffer && UTF8Decoder) {
+    return UTF8Decoder.decode(heapOrArray.subarray(idx, endPtr));
+  }
+  var str = "";
+  while (idx < endPtr) {
+    // For UTF8 byte structure, see:
+    // http://en.wikipedia.org/wiki/UTF-8#Description
+    // https://www.ietf.org/rfc/rfc2279.txt
+    // https://tools.ietf.org/html/rfc3629
+    var u0 = heapOrArray[idx++];
+    if (!(u0 & 128)) {
+      str += String.fromCharCode(u0);
+      continue;
+    }
+    var u1 = heapOrArray[idx++] & 63;
+    if ((u0 & 224) == 192) {
+      str += String.fromCharCode(((u0 & 31) << 6) | u1);
+      continue;
+    }
+    var u2 = heapOrArray[idx++] & 63;
+    if ((u0 & 240) == 224) {
+      u0 = ((u0 & 15) << 12) | (u1 << 6) | u2;
+    } else {
+      u0 = ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | (heapOrArray[idx++] & 63);
+    }
+    if (u0 < 65536) {
+      str += String.fromCharCode(u0);
+    } else {
+      var ch = u0 - 65536;
+      str += String.fromCharCode(55296 | (ch >> 10), 56320 | (ch & 1023));
+    }
+  }
+  return str;
+};
+
+/** @type {!Uint8Array} */ var HEAPU8;
+
+/**
+   * Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the
+   * emscripten HEAP, returns a copy of that string as a Javascript String object.
+   *
+   * @param {number} ptr
+   * @param {number=} maxBytesToRead - An optional length that specifies the
+   *   maximum number of bytes to read. You can omit this parameter to scan the
+   *   string until the first 0 byte. If maxBytesToRead is passed, and the string
+   *   at [ptr, ptr+maxBytesToReadr[ contains a null byte in the middle, then the
+   *   string will cut short at that byte index.
+   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
+   * @return {string}
+   */ var UTF8ToString = (ptr, maxBytesToRead, ignoreNul) => ptr ? UTF8ArrayToString(HEAPU8, ptr, maxBytesToRead, ignoreNul) : "";
+
+var ___assert_fail = (condition, filename, line, func) => abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [ filename ? UTF8ToString(filename) : "unknown filename", line, func ? UTF8ToString(func) : "unknown function" ]);
+
+var wasmTableMirror = [];
+
+var getWasmTableEntry = funcPtr => {
+  var func = wasmTableMirror[funcPtr];
+  if (!func) {
+    /** @suppress {checkTypes} */ wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+    if (Asyncify.isAsyncExport(func)) {
+      wasmTableMirror[funcPtr] = func = Asyncify.makeAsyncFunction(func);
+    }
+  }
+  return func;
+};
+
+var ___call_sighandler = (fp, sig) => getWasmTableEntry(fp)(sig);
 
 var PATH = {
   isAbs: path => path.charAt(0) === "/",
@@ -505,72 +601,6 @@ var PATH_FS = {
     outputParts = outputParts.concat(toParts.slice(samePartsLength));
     return outputParts.join("/");
   }
-};
-
-var UTF8Decoder = globalThis.TextDecoder && new TextDecoder;
-
-/**
-   * heapOrArray is either a regular array, or a JavaScript typed array view.
-   * @param {number} idx
-   * @param {number=} maxBytesToRead
-   * @param {boolean=} ignoreNul
-   * @return {number}
-   */ var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
-  var maxIdx = idx + maxBytesToRead;
-  if (ignoreNul) return maxIdx;
-  // TextDecoder needs to know the byte length in advance, it doesn't stop on
-  // null terminator by itself.
-  // As a tiny code save trick, compare idx against maxIdx using a negation,
-  // so that maxBytesToRead=undefined/NaN means Infinity.
-  while (heapOrArray[idx] && !(idx >= maxIdx)) ++idx;
-  return idx;
-};
-
-/**
-   * Given a pointer 'idx' to a null-terminated UTF8-encoded string in the given
-   * array that contains uint8 values, returns a copy of that string as a
-   * Javascript String object.
-   * heapOrArray is either a regular array, or a JavaScript typed array view.
-   * @param {number=} idx
-   * @param {number=} maxBytesToRead
-   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
-   * @return {string}
-   */ var UTF8ArrayToString = (heapOrArray, idx = 0, maxBytesToRead, ignoreNul) => {
-  var endPtr = findStringEnd(heapOrArray, idx, maxBytesToRead, ignoreNul);
-  // When using conditional TextDecoder, skip it for short strings as the overhead of the native call is not worth it.
-  if (endPtr - idx > 16 && heapOrArray.buffer && UTF8Decoder) {
-    return UTF8Decoder.decode(heapOrArray.subarray(idx, endPtr));
-  }
-  var str = "";
-  while (idx < endPtr) {
-    // For UTF8 byte structure, see:
-    // http://en.wikipedia.org/wiki/UTF-8#Description
-    // https://www.ietf.org/rfc/rfc2279.txt
-    // https://tools.ietf.org/html/rfc3629
-    var u0 = heapOrArray[idx++];
-    if (!(u0 & 128)) {
-      str += String.fromCharCode(u0);
-      continue;
-    }
-    var u1 = heapOrArray[idx++] & 63;
-    if ((u0 & 224) == 192) {
-      str += String.fromCharCode(((u0 & 31) << 6) | u1);
-      continue;
-    }
-    var u2 = heapOrArray[idx++] & 63;
-    if ((u0 & 240) == 224) {
-      u0 = ((u0 & 15) << 12) | (u1 << 6) | u2;
-    } else {
-      u0 = ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | (heapOrArray[idx++] & 63);
-    }
-    if (u0 < 65536) {
-      str += String.fromCharCode(u0);
-    } else {
-      var ch = u0 - 65536;
-      str += String.fromCharCode(55296 | (ch >> 10), 56320 | (ch & 1023));
-    }
-  }
-  return str;
 };
 
 var FS_stdin_getChar_buffer = [];
@@ -807,8 +837,15 @@ var TTY = {
   }
 };
 
+var zeroMemory = (ptr, size) => HEAPU8.fill(0, ptr, ptr + size);
+
+var alignMemory = (size, alignment) => Math.ceil(size / alignment) * alignment;
+
 var mmapAlloc = size => {
-  abort();
+  size = alignMemory(size, 65536);
+  var ptr = _emscripten_builtin_memalign(65536, size);
+  if (ptr) zeroMemory(ptr, size);
+  return ptr;
 };
 
 var MEMFS = {
@@ -2903,21 +2940,7 @@ var FS = {
   }
 };
 
-/** @type {!Uint8Array} */ var HEAPU8;
-
-/**
-   * Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the
-   * emscripten HEAP, returns a copy of that string as a Javascript String object.
-   *
-   * @param {number} ptr
-   * @param {number=} maxBytesToRead - An optional length that specifies the
-   *   maximum number of bytes to read. You can omit this parameter to scan the
-   *   string until the first 0 byte. If maxBytesToRead is passed, and the string
-   *   at [ptr, ptr+maxBytesToReadr[ contains a null byte in the middle, then the
-   *   string will cut short at that byte index.
-   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
-   * @return {string}
-   */ var UTF8ToString = (ptr, maxBytesToRead, ignoreNul) => ptr ? UTF8ArrayToString(HEAPU8, ptr, maxBytesToRead, ignoreNul) : "";
+/** @type {!Int32Array} */ var HEAP32;
 
 /** @type {!Uint32Array} */ var HEAPU32;
 
@@ -3002,6 +3025,399 @@ var SYSCALLS = {
   }
 };
 
+function ___syscall_chmod(path, mode) {
+  try {
+    path = SYSCALLS.getStr(path);
+    FS.chmod(path, mode);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_faccessat(dirfd, path, amode, flags) {
+  try {
+    path = SYSCALLS.getStr(path);
+    path = SYSCALLS.calculateAt(dirfd, path);
+    if (amode & ~7) {
+      // need a valid mode
+      return -28;
+    }
+    var lookup = FS.lookupPath(path, {
+      follow: true
+    });
+    var node = lookup.node;
+    if (!node) {
+      return -44;
+    }
+    var perms = "";
+    if (amode & 4) perms += "r";
+    if (amode & 2) perms += "w";
+    if (amode & 1) perms += "x";
+    if (perms && FS.nodePermissions(node, perms)) {
+      return -2;
+    }
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+var INT53_MAX = 9007199254740992;
+
+var INT53_MIN = -9007199254740992;
+
+var bigintToI53Checked = num => (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
+
+function ___syscall_fadvise64(fd, offset, len, advice) {
+  offset = bigintToI53Checked(offset);
+  len = bigintToI53Checked(len);
+  try {
+    // Advisory only, so a no-op, but a pipe/socket fd is still a seek error
+    // (ESPIPE), matching Linux.
+    if (!SYSCALLS.getStreamFromFD(fd).seekable) {
+      return -70;
+    }
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+var syscallGetVarargI = () => {
+  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
+  var ret = HEAP32[((+SYSCALLS.varargs) >> 2)];
+  SYSCALLS.varargs += 4;
+  return ret;
+};
+
+var syscallGetVarargP = syscallGetVarargI;
+
+/** @type {!Int16Array} */ var HEAP16;
+
+function ___syscall_fcntl64(fd, cmd, varargs) {
+  SYSCALLS.varargs = varargs;
+  try {
+    var stream = SYSCALLS.getStreamFromFD(fd);
+    switch (cmd) {
+     case 0:
+      {
+        var arg = syscallGetVarargI();
+        if (arg < 0) {
+          return -28;
+        }
+        while (FS.streams[arg]) {
+          arg++;
+        }
+        var newStream;
+        newStream = FS.dupStream(stream, arg);
+        return newStream.fd;
+      }
+
+     case 1:
+     case 2:
+      return 0;
+
+     // FD_CLOEXEC makes no sense for a single process.
+      case 3:
+      return stream.flags;
+
+     case 4:
+      {
+        var arg = syscallGetVarargI();
+        var mask = 289792;
+        stream.flags = (stream.flags & ~mask) | (arg & mask);
+        return 0;
+      }
+
+     case 12:
+      {
+        var arg = syscallGetVarargP();
+        var offset = 0;
+        // We're always unlocked.
+        HEAP16[(((arg) + (offset)) >> 1)] = 2;
+        return 0;
+      }
+
+     case 13:
+     case 14:
+      // Pretend that the locking is successful. These are process-level locks,
+      // and Emscripten programs are a single process. If we supported linking a
+      // filesystem between programs, we'd need to do more here.
+      // See https://github.com/emscripten-core/emscripten/issues/23697
+      return 0;
+    }
+    return -28;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_fstat64(fd, buf) {
+  try {
+    return SYSCALLS.writeStat(buf, FS.fstat(fd));
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+var stringToUTF8 = (str, outPtr, maxBytesToWrite) => stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
+
+function ___syscall_getcwd(buf, size) {
+  try {
+    if (!size) return -28;
+    var cwd = FS.cwd();
+    var cwdLengthInBytes = lengthBytesUTF8(cwd) + 1;
+    if (size < cwdLengthInBytes) return -68;
+    stringToUTF8(cwd, buf, size);
+    return cwdLengthInBytes;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_getdents64(fd, dirp, count) {
+  try {
+    var stream = SYSCALLS.getStreamFromFD(fd);
+    stream.getdents ||= FS.readdir(stream.path);
+    var struct_size = 280;
+    var pos = 0;
+    var off = FS.llseek(stream, 0, 1);
+    var startIdx = Math.floor(off / struct_size);
+    var endIdx = Math.min(stream.getdents.length, startIdx + Math.floor(count / struct_size));
+    for (var idx = startIdx; idx < endIdx; idx++) {
+      var id;
+      var type;
+      var name = stream.getdents[idx];
+      if (name === ".") {
+        id = stream.node.id;
+        type = 4;
+      } else if (name === "..") {
+        var lookup = FS.lookupPath(stream.path, {
+          parent: true
+        });
+        id = lookup.node.id;
+        type = 4;
+      } else {
+        var child;
+        try {
+          child = FS.lookupNode(stream.node, name);
+        } catch (e) {
+          // If the entry is not a directory, file, or symlink, nodefs
+          // lookupNode will raise EINVAL. Skip these and continue.
+          if (e?.errno === 28) {
+            continue;
+          }
+          throw e;
+        }
+        id = child.id;
+        type = FS.isChrdev(child.mode) ? 2 : // character device.
+        FS.isDir(child.mode) ? 4 : // directory
+        FS.isLink(child.mode) ? 10 : // symbolic link.
+        8;
+      }
+      HEAP64[((dirp + pos) >> 3)] = BigInt(id);
+      HEAP64[(((dirp + pos) + (8)) >> 3)] = BigInt((idx + 1) * struct_size);
+      HEAP16[(((dirp + pos) + (16)) >> 1)] = 280;
+      HEAP8[(dirp + pos) + (18)] = type;
+      stringToUTF8(name, dirp + pos + 19, 256);
+      pos += struct_size;
+    }
+    FS.llseek(stream, idx * struct_size, 0);
+    return pos;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+var ___syscall_getegid32 = () => 0;
+
+var ___syscall_geteuid32 = () => 0;
+
+var ___syscall_getgid32 = () => 0;
+
+var ___syscall_getuid32 = () => 0;
+
+function ___syscall_ioctl(fd, op, varargs) {
+  SYSCALLS.varargs = varargs;
+  try {
+    var stream = SYSCALLS.getStreamFromFD(fd);
+    switch (op) {
+     case 21509:
+      {
+        if (!stream.tty) return -59;
+        return 0;
+      }
+
+     case 21505:
+      {
+        if (!stream.tty) return -59;
+        if (stream.tty.ops.ioctl_tcgets) {
+          var termios = stream.tty.ops.ioctl_tcgets(stream);
+          var argp = syscallGetVarargP();
+          HEAP32[((argp) >> 2)] = termios.c_iflag || 0;
+          HEAP32[(((argp) + (4)) >> 2)] = termios.c_oflag || 0;
+          HEAP32[(((argp) + (8)) >> 2)] = termios.c_cflag || 0;
+          HEAP32[(((argp) + (12)) >> 2)] = termios.c_lflag || 0;
+          for (var i = 0; i < 32; i++) {
+            HEAP8[(argp + i) + (17)] = termios.c_cc[i] || 0;
+          }
+          return 0;
+        }
+        return 0;
+      }
+
+     case 21510:
+     case 21511:
+     case 21512:
+      {
+        if (!stream.tty) return -59;
+        return 0;
+      }
+
+     case 21506:
+     case 21507:
+     case 21508:
+      {
+        if (!stream.tty) return -59;
+        if (stream.tty.ops.ioctl_tcsets) {
+          var argp = syscallGetVarargP();
+          var c_iflag = HEAP32[((argp) >> 2)];
+          var c_oflag = HEAP32[(((argp) + (4)) >> 2)];
+          var c_cflag = HEAP32[(((argp) + (8)) >> 2)];
+          var c_lflag = HEAP32[(((argp) + (12)) >> 2)];
+          var c_cc = [];
+          for (var i = 0; i < 32; i++) {
+            c_cc.push(HEAP8[(argp + i) + (17)]);
+          }
+          return stream.tty.ops.ioctl_tcsets(stream.tty, op, {
+            c_iflag,
+            c_oflag,
+            c_cflag,
+            c_lflag,
+            c_cc
+          });
+        }
+        return 0;
+      }
+
+     case 21519:
+      {
+        if (!stream.tty) return -59;
+        var argp = syscallGetVarargP();
+        HEAP32[((argp) >> 2)] = 0;
+        return 0;
+      }
+
+     case 21520:
+      {
+        if (!stream.tty) return -59;
+        return -28;
+      }
+
+     case 21537:
+     case 21531:
+      {
+        var argp = syscallGetVarargP();
+        return FS.ioctl(stream, op, argp);
+      }
+
+     case 21523:
+      {
+        // TODO: in theory we should write to the winsize struct that gets
+        // passed in, but for now musl doesn't read anything on it
+        if (!stream.tty) return -59;
+        if (stream.tty.ops.ioctl_tiocgwinsz) {
+          var winsize = stream.tty.ops.ioctl_tiocgwinsz(stream.tty);
+          var argp = syscallGetVarargP();
+          HEAP16[((argp) >> 1)] = winsize[0];
+          HEAP16[(((argp) + (2)) >> 1)] = winsize[1];
+        }
+        return 0;
+      }
+
+     case 21524:
+      {
+        // TODO: technically, this ioctl call should change the window size.
+        // but, since emscripten doesn't have any concept of a terminal window
+        // yet, we'll just silently throw it away as we do TIOCGWINSZ
+        if (!stream.tty) return -59;
+        return 0;
+      }
+
+     case 21515:
+      {
+        if (!stream.tty) return -59;
+        return 0;
+      }
+
+     default:
+      return -28;
+    }
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_linkat(olddirfd, oldpath, newdirfd, newpath, flags) {
+  try {
+    oldpath = SYSCALLS.getStr(oldpath);
+    newpath = SYSCALLS.getStr(newpath);
+    oldpath = SYSCALLS.calculateAt(olddirfd, oldpath);
+    newpath = SYSCALLS.calculateAt(newdirfd, newpath);
+    FS.link(oldpath, newpath, flags);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_lstat64(path, buf) {
+  try {
+    path = SYSCALLS.getStr(path);
+    return SYSCALLS.writeStat(buf, FS.lstat(path));
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_mkdirat(dirfd, path, mode) {
+  try {
+    path = SYSCALLS.getStr(path);
+    path = SYSCALLS.calculateAt(dirfd, path);
+    mode &= ~SYSCALLS.currentUmask;
+    FS.mkdir(path, mode);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_newfstatat(dirfd, path, buf, flags) {
+  try {
+    path = SYSCALLS.getStr(path);
+    var nofollow = flags & 256;
+    var allowEmpty = flags & 4096;
+    flags = flags & (~6400);
+    path = SYSCALLS.calculateAt(dirfd, path, allowEmpty);
+    return SYSCALLS.writeStat(buf, nofollow ? FS.lstat(path) : FS.stat(path));
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
 function ___syscall_openat(dirfd, path, flags, varargs) {
   SYSCALLS.varargs = varargs;
   try {
@@ -3018,13 +3434,99 @@ function ___syscall_openat(dirfd, path, flags, varargs) {
   }
 }
 
+function ___syscall_readlinkat(dirfd, path, buf, bufsize) {
+  try {
+    path = SYSCALLS.getStr(path);
+    path = SYSCALLS.calculateAt(dirfd, path);
+    if (bufsize <= 0) return -28;
+    var ret = FS.readlink(path);
+    var len = Math.min(bufsize, lengthBytesUTF8(ret));
+    var endChar = HEAP8[buf + len];
+    stringToUTF8(ret, buf, bufsize + 1);
+    // readlink is one of the rare functions that write out a C string, but does never append a null to the output buffer(!)
+    // stringToUTF8() always appends a null byte, so restore the character under the null byte after the write.
+    HEAP8[buf + len] = endChar;
+    return len;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_renameat(olddirfd, oldpath, newdirfd, newpath) {
+  try {
+    oldpath = SYSCALLS.getStr(oldpath);
+    newpath = SYSCALLS.getStr(newpath);
+    oldpath = SYSCALLS.calculateAt(olddirfd, oldpath);
+    newpath = SYSCALLS.calculateAt(newdirfd, newpath);
+    FS.rename(oldpath, newpath);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_rmdir(path) {
+  try {
+    path = SYSCALLS.getStr(path);
+    FS.rmdir(path);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_stat64(path, buf) {
+  try {
+    path = SYSCALLS.getStr(path);
+    return SYSCALLS.writeStat(buf, FS.stat(path));
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_symlinkat(target, dirfd, linkpath) {
+  try {
+    target = SYSCALLS.getStr(target);
+    linkpath = SYSCALLS.getStr(linkpath);
+    linkpath = SYSCALLS.calculateAt(dirfd, linkpath);
+    FS.symlink(target, linkpath);
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function ___syscall_unlinkat(dirfd, path, flags) {
+  try {
+    path = SYSCALLS.getStr(path);
+    path = SYSCALLS.calculateAt(dirfd, path);
+    if (!flags) {
+      FS.unlink(path);
+    } else if (flags === 512) {
+      FS.rmdir(path);
+    } else {
+      return -28;
+    }
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
 var __abort_js = () => abort("");
 
-var INT53_MAX = 9007199254740992;
+var runtimeKeepaliveCounter = 0;
 
-var INT53_MIN = -9007199254740992;
-
-var bigintToI53Checked = num => (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
+var __emscripten_runtime_keepalive_clear = () => {
+  noExitRuntime = false;
+  runtimeKeepaliveCounter = 0;
+};
 
 function __gmtime_js(time, tmPtr) {
   time = bigintToI53Checked(time);
@@ -3129,7 +3631,33 @@ var __mktime_js = function(tmPtr) {
   return BigInt(ret);
 };
 
-var stringToUTF8 = (str, outPtr, maxBytesToWrite) => stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
+function __mmap_js(len, prot, flags, fd, offset, allocated, addr) {
+  offset = bigintToI53Checked(offset);
+  try {
+    var stream = SYSCALLS.getStreamFromFD(fd);
+    var res = FS.mmap(stream, len, offset, prot, flags);
+    var ptr = res.ptr;
+    HEAP32[((allocated) >> 2)] = res.allocated;
+    HEAPU32[((addr) >> 2)] = ptr;
+    return 0;
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
+
+function __munmap_js(addr, len, prot, flags, fd, offset) {
+  offset = bigintToI53Checked(offset);
+  try {
+    var stream = SYSCALLS.getStreamFromFD(fd);
+    if (prot & 2) {
+      SYSCALLS.doMsync(addr, stream, len, flags, offset);
+    }
+  } catch (e) {
+    if (typeof FS === "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
 
 var __tzset_js = (timezone, daylight, std_name, dst_name) => {
   // TODO: Use (malleable) environment variables instead of system settings.
@@ -3207,8 +3735,6 @@ var getHeapMax = () => // Stay one Wasm page short of 4GB: while e.g. Chrome is 
 // casing all heap size related code to treat 0 specially.
 2147483648;
 
-var alignMemory = (size, alignment) => Math.ceil(size / alignment) * alignment;
-
 var growMemory = size => {
   var oldHeapSize = wasmMemory.buffer.byteLength;
   var pages = ((size - oldHeapSize + 65535) / 65536) | 0;
@@ -3264,6 +3790,206 @@ var _emscripten_resize_heap = requestedSize => {
     }
   }
   return false;
+};
+
+var GLctx;
+
+var webgl_enable_WEBGL_draw_instanced_base_vertex_base_instance = ctx => // Closure is expected to be allowed to minify the '.dibvbi' property, so not accessing it quoted.
+!!(ctx.dibvbi = ctx.getExtension("WEBGL_draw_instanced_base_vertex_base_instance"));
+
+var webgl_enable_WEBGL_multi_draw_instanced_base_vertex_base_instance = ctx => !!(ctx.mdibvbi = ctx.getExtension("WEBGL_multi_draw_instanced_base_vertex_base_instance"));
+
+var webgl_enable_EXT_polygon_offset_clamp = ctx => !!(ctx.extPolygonOffsetClamp = ctx.getExtension("EXT_polygon_offset_clamp"));
+
+var webgl_enable_EXT_clip_control = ctx => !!(ctx.extClipControl = ctx.getExtension("EXT_clip_control"));
+
+var webgl_enable_WEBGL_polygon_mode = ctx => !!(ctx.webglPolygonMode = ctx.getExtension("WEBGL_polygon_mode"));
+
+var webgl_enable_WEBGL_multi_draw = ctx => // Closure is expected to be allowed to minify the '.multiDrawWebgl' property, so not accessing it quoted.
+!!(ctx.multiDrawWebgl = ctx.getExtension("WEBGL_multi_draw"));
+
+var getEmscriptenSupportedExtensions = ctx => {
+  // Restrict the list of advertised extensions to those that we actually
+  // support.
+  var supportedExtensions = [ // WebGL 2 extensions
+  "EXT_color_buffer_float", "EXT_conservative_depth", "EXT_disjoint_timer_query_webgl2", "EXT_texture_norm16", "NV_shader_noperspective_interpolation", "WEBGL_clip_cull_distance", // WebGL 1 and WebGL 2 extensions
+  "EXT_clip_control", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_float_blend", "EXT_polygon_offset_clamp", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "KHR_parallel_shader_compile", "OES_texture_float_linear", "WEBGL_blend_func_extended", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_polygon_mode" ];
+  // .getSupportedExtensions() can return null if context is lost, so coerce to empty array.
+  return ctx.getSupportedExtensions()?.filter(ext => supportedExtensions.includes(ext)) ?? [];
+};
+
+var GL = {
+  counter: 1,
+  buffers: [],
+  programs: [],
+  framebuffers: [],
+  renderbuffers: [],
+  textures: [],
+  shaders: [],
+  vaos: [],
+  contexts: [],
+  offscreenCanvases: {},
+  queries: [],
+  samplers: [],
+  transformFeedbacks: [],
+  syncs: [],
+  stringCache: {},
+  stringiCache: {},
+  unpackAlignment: 4,
+  unpackRowLength: 0,
+  recordError: errorCode => {
+    if (!GL.lastError) {
+      GL.lastError = errorCode;
+    }
+  },
+  getNewId: table => {
+    var ret = GL.counter++;
+    for (var i = table.length; i < ret; i++) {
+      table[i] = null;
+    }
+    return ret;
+  },
+  genObject: (n, buffers, createFunction, objectTable) => {
+    for (var i = 0; i < n; i++) {
+      var buffer = GLctx[createFunction]();
+      var id = buffer && GL.getNewId(objectTable);
+      if (buffer) {
+        buffer.name = id;
+        objectTable[id] = buffer;
+      } else {
+        GL.recordError(1282);
+      }
+      HEAP32[(((buffers) + (i * 4)) >> 2)] = id;
+    }
+  },
+  getSource: (shader, count, string, length) => {
+    var source = "";
+    for (var i = 0; i < count; ++i) {
+      var len = length ? HEAPU32[(((length) + (i * 4)) >> 2)] : undefined;
+      source += UTF8ToString(HEAPU32[(((string) + (i * 4)) >> 2)], len);
+    }
+    return source;
+  },
+  createContext: (/** @type {HTMLCanvasElement} */ canvas, webGLContextAttributes) => {
+    // If WebGL context has already been preinitialized for the page on the JS
+    // side, reuse that context instead. This is useful for example when the
+    // main page precompiles shaders for the application, in which case the
+    // WebGL context is created already before any Emscripten compiled code
+    // has been downloaded.
+    if (Module["preinitializedWebGLContext"]) {
+      var ctx = Module["preinitializedWebGLContext"];
+      // The ctx object may not be of a known class (e.g. it may be a debug
+      // wrapper), so we ask it for its version rather than use instanceof.
+      webGLContextAttributes.majorVersion = Number(ctx.getParameter(ctx.VERSION).match(/^WebGL (\d+).\d+/)[1]);
+    } else {
+      // BUG: Workaround Safari WebGL issue: After successfully acquiring WebGL
+      // context on a canvas, calling .getContext() will always return that
+      // context independent of which 'webgl' or 'webgl2'
+      // context version was passed. See:
+      //   https://webkit.org/b/222758
+      // and:
+      //   https://github.com/emscripten-core/emscripten/issues/13295.
+      // TODO: Once the bug is fixed and shipped in Safari, adjust the Safari
+      // version field in above check.
+      if (!canvas.getContextSafariWebGL2Fixed) {
+        canvas.getContextSafariWebGL2Fixed = canvas.getContext;
+        /** @type {function(this:HTMLCanvasElement, string, (Object|null)=): (RenderingContext|null)} */ function fixedGetContext(ver, attrs) {
+          var gl = canvas.getContextSafariWebGL2Fixed(ver, attrs);
+          return ((ver == "webgl") == (gl instanceof WebGLRenderingContext)) ? gl : null;
+        }
+        canvas.getContext = fixedGetContext;
+      }
+      var ctx = canvas.getContext("webgl2", webGLContextAttributes);
+    }
+    if (!ctx) return 0;
+    var handle = GL.registerContext(ctx, webGLContextAttributes);
+    return handle;
+  },
+  registerContext: (ctx, webGLContextAttributes) => {
+    // without pthreads a context is just an integer ID
+    var handle = GL.getNewId(GL.contexts);
+    var context = {
+      handle,
+      attributes: webGLContextAttributes,
+      version: webGLContextAttributes.majorVersion,
+      GLctx: ctx
+    };
+    // Store the created context object so that we can access the context
+    // given a canvas without having to pass the parameters again.
+    if (ctx.canvas) ctx.canvas.GLctxObject = context;
+    GL.contexts[handle] = context;
+    if (typeof webGLContextAttributes.enableExtensionsByDefault === "undefined" || webGLContextAttributes.enableExtensionsByDefault) {
+      GL.initExtensions(context);
+    }
+    return handle;
+  },
+  makeContextCurrent: contextHandle => {
+    // Active Emscripten GL layer context object.
+    GL.currentContext = GL.contexts[contextHandle];
+    // Active WebGL context object.
+    Module["ctx"] = GLctx = GL.currentContext?.GLctx;
+    return !(contextHandle && !GLctx);
+  },
+  getContext: contextHandle => GL.contexts[contextHandle],
+  deleteContext: contextHandle => {
+    if (GL.currentContext === GL.contexts[contextHandle]) {
+      GL.currentContext = null;
+    }
+    if (typeof JSEvents === "object") {
+      // Release all JS event handlers on the DOM element that the GL context is
+      // associated with since the context is now deleted.
+      JSEvents.removeAllHandlersOnTarget(GL.contexts[contextHandle].GLctx.canvas);
+    }
+    // Make sure the canvas object no longer refers to the context object so
+    // there are no GC surprises.
+    if (GL.contexts[contextHandle]?.GLctx.canvas) {
+      GL.contexts[contextHandle].GLctx.canvas.GLctxObject = undefined;
+    }
+    GL.contexts[contextHandle] = null;
+  },
+  initExtensions: context => {
+    // If this function is called without a specific context object, init the
+    // extensions of the currently active context.
+    context ||= GL.currentContext;
+    if (context.initExtensionsDone) return;
+    context.initExtensionsDone = true;
+    var GLctx = context.GLctx;
+    // Detect the presence of a few extensions manually, since the GL interop
+    // layer itself will need to know if they exist.
+    // Extensions that are available in both WebGL 1 and WebGL 2
+    webgl_enable_WEBGL_multi_draw(GLctx);
+    webgl_enable_EXT_polygon_offset_clamp(GLctx);
+    webgl_enable_EXT_clip_control(GLctx);
+    webgl_enable_WEBGL_polygon_mode(GLctx);
+    // Extensions that are available from WebGL >= 2 (no-op if called on a WebGL 1 context active)
+    webgl_enable_WEBGL_draw_instanced_base_vertex_base_instance(GLctx);
+    webgl_enable_WEBGL_multi_draw_instanced_base_vertex_base_instance(GLctx);
+    // On WebGL 2, EXT_disjoint_timer_query is replaced with an alternative
+    // that's based on core APIs, and exposes only the queryCounterEXT()
+    // entrypoint.
+    if (context.version >= 2) {
+      GLctx.disjointTimerQueryExt = GLctx.getExtension("EXT_disjoint_timer_query_webgl2");
+    }
+    // However, Firefox exposes the WebGL 1 version on WebGL 2 as well and
+    // thus we look for the WebGL 1 version again if the WebGL 2 version
+    // isn't present. https://bugzil.la/1328882
+    if (context.version < 2 || !GLctx.disjointTimerQueryExt) {
+      GLctx.disjointTimerQueryExt = GLctx.getExtension("EXT_disjoint_timer_query");
+    }
+    for (var ext of getEmscriptenSupportedExtensions(GLctx)) {
+      // WEBGL_lose_context, WEBGL_debug_renderer_info and WEBGL_debug_shaders
+      // are not enabled by default.
+      if (!ext.includes("lose_context") && !ext.includes("debug")) {
+        // Call .getExtension() to enable that extension permanently.
+        GLctx.getExtension(ext);
+      }
+    }
+  }
+};
+
+var _emscripten_webgl_make_context_current = contextHandle => {
+  var success = GL.makeContextCurrent(contextHandle);
+  return success ? 0 : -5;
 };
 
 var ENV = {};
@@ -3322,6 +4048,24 @@ var _environ_sizes_get = (penviron_count, penviron_buf_size) => {
   return 0;
 };
 
+var keepRuntimeAlive = () => noExitRuntime || runtimeKeepaliveCounter > 0;
+
+var _proc_exit = code => {
+  EXITSTATUS = code;
+  if (!keepRuntimeAlive()) {
+    Module["onExit"]?.(code);
+    ABORT = true;
+  }
+  quit_(code, new ExitStatus(code));
+};
+
+/** @param {boolean|number=} implicit */ var exitJS = (status, implicit) => {
+  EXITSTATUS = status;
+  _proc_exit(status);
+};
+
+var _exit = exitJS;
+
 function _fd_close(fd) {
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
@@ -3332,8 +4076,6 @@ function _fd_close(fd) {
     return e.errno;
   }
 }
-
-/** @type {!Int16Array} */ var HEAP16;
 
 function _fd_fdstat_get(fd, pbuf) {
   try {
@@ -3449,6 +4191,910 @@ function _fd_write(fd, iov, iovcnt, pnum) {
   }
 }
 
+var _emscripten_glActiveTexture = x0 => GLctx.activeTexture(x0);
+
+var _glActiveTexture = _emscripten_glActiveTexture;
+
+var _emscripten_glAttachShader = (program, shader) => {
+  GLctx.attachShader(GL.programs[program], GL.shaders[shader]);
+};
+
+var _glAttachShader = _emscripten_glAttachShader;
+
+var _emscripten_glBindAttribLocation = (program, index, name) => {
+  GLctx.bindAttribLocation(GL.programs[program], index, UTF8ToString(name));
+};
+
+var _glBindAttribLocation = _emscripten_glBindAttribLocation;
+
+var _emscripten_glBindBuffer = (target, buffer) => {
+  if (target == 35051) {
+    // In WebGL 2 glReadPixels entry point, we need to use a different WebGL 2
+    // API function call when a buffer is bound to
+    // GL_PIXEL_PACK_BUFFER_BINDING point, so must keep track whether that
+    // binding point is non-null to know what is the proper API function to
+    // call.
+    GLctx.currentPixelPackBufferBinding = buffer;
+  } else if (target == 35052) {
+    // In WebGL 2 gl(Compressed)Tex(Sub)Image[23]D entry points, we need to
+    // use a different WebGL 2 API function call when a buffer is bound to
+    // GL_PIXEL_UNPACK_BUFFER_BINDING point, so must keep track whether that
+    // binding point is non-null to know what is the proper API function to
+    // call.
+    GLctx.currentPixelUnpackBufferBinding = buffer;
+  }
+  GLctx.bindBuffer(target, GL.buffers[buffer]);
+};
+
+var _glBindBuffer = _emscripten_glBindBuffer;
+
+var _emscripten_glBindFramebuffer = (target, framebuffer) => {
+  GLctx.bindFramebuffer(target, GL.framebuffers[framebuffer]);
+};
+
+var _glBindFramebuffer = _emscripten_glBindFramebuffer;
+
+var _emscripten_glBindTexture = (target, texture) => {
+  GLctx.bindTexture(target, GL.textures[texture]);
+};
+
+var _glBindTexture = _emscripten_glBindTexture;
+
+var _emscripten_glBlendColor = (x0, x1, x2, x3) => GLctx.blendColor(x0, x1, x2, x3);
+
+var _glBlendColor = _emscripten_glBlendColor;
+
+var _emscripten_glBlendEquationSeparate = (x0, x1) => GLctx.blendEquationSeparate(x0, x1);
+
+var _glBlendEquationSeparate = _emscripten_glBlendEquationSeparate;
+
+var _emscripten_glBlendFuncSeparate = (x0, x1, x2, x3) => GLctx.blendFuncSeparate(x0, x1, x2, x3);
+
+var _glBlendFuncSeparate = _emscripten_glBlendFuncSeparate;
+
+var _emscripten_glBufferData = (target, size, data, usage) => {
+  if (true) {
+    // If size is zero, WebGL would interpret uploading the whole input
+    // arraybuffer (starting from given offset), which would not make sense in
+    // WebAssembly, so avoid uploading if size is zero. However we must still
+    // call bufferData to establish a backing storage of zero bytes.
+    if (data && size) {
+      GLctx.bufferData(target, HEAPU8, usage, data, size);
+    } else {
+      GLctx.bufferData(target, size, usage);
+    }
+    return;
+  }
+};
+
+var _glBufferData = _emscripten_glBufferData;
+
+var _emscripten_glClear = x0 => GLctx.clear(x0);
+
+var _glClear = _emscripten_glClear;
+
+var _emscripten_glClearColor = (x0, x1, x2, x3) => GLctx.clearColor(x0, x1, x2, x3);
+
+var _glClearColor = _emscripten_glClearColor;
+
+var _emscripten_glClearStencil = x0 => GLctx.clearStencil(x0);
+
+var _glClearStencil = _emscripten_glClearStencil;
+
+var _emscripten_glColorMask = (red, green, blue, alpha) => {
+  GLctx.colorMask(!!red, !!green, !!blue, !!alpha);
+};
+
+var _glColorMask = _emscripten_glColorMask;
+
+var _emscripten_glCompileShader = shader => {
+  GLctx.compileShader(GL.shaders[shader]);
+};
+
+var _glCompileShader = _emscripten_glCompileShader;
+
+var _emscripten_glCreateProgram = () => {
+  var id = GL.getNewId(GL.programs);
+  var program = GLctx.createProgram();
+  // Store additional information needed for each shader program:
+  program.name = id;
+  // Lazy cache results of
+  // glGetProgramiv(GL_ACTIVE_UNIFORM_MAX_LENGTH/GL_ACTIVE_ATTRIBUTE_MAX_LENGTH/GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH)
+  program.maxUniformLength = program.maxAttributeLength = program.maxUniformBlockNameLength = 0;
+  program.uniformIdCounter = 1;
+  GL.programs[id] = program;
+  return id;
+};
+
+var _glCreateProgram = _emscripten_glCreateProgram;
+
+var _emscripten_glCreateShader = shaderType => {
+  var id = GL.getNewId(GL.shaders);
+  GL.shaders[id] = GLctx.createShader(shaderType);
+  return id;
+};
+
+var _glCreateShader = _emscripten_glCreateShader;
+
+var _emscripten_glDeleteBuffers = (n, buffers) => {
+  for (var i = 0; i < n; i++) {
+    var id = HEAP32[(((buffers) + (i * 4)) >> 2)];
+    var buffer = GL.buffers[id];
+    // From spec: "glDeleteBuffers silently ignores 0's and names that do not
+    // correspond to existing buffer objects."
+    if (!buffer) continue;
+    GLctx.deleteBuffer(buffer);
+    buffer.name = 0;
+    GL.buffers[id] = null;
+    if (id == GLctx.currentPixelPackBufferBinding) GLctx.currentPixelPackBufferBinding = 0;
+    if (id == GLctx.currentPixelUnpackBufferBinding) GLctx.currentPixelUnpackBufferBinding = 0;
+  }
+};
+
+var _glDeleteBuffers = _emscripten_glDeleteBuffers;
+
+var _emscripten_glDeleteFramebuffers = (n, framebuffers) => {
+  for (var i = 0; i < n; ++i) {
+    var id = HEAP32[(((framebuffers) + (i * 4)) >> 2)];
+    var framebuffer = GL.framebuffers[id];
+    if (!framebuffer) continue;
+    // GL spec: "glDeleteFramebuffers silently ignores 0s and names that do not correspond to existing framebuffer objects".
+    GLctx.deleteFramebuffer(framebuffer);
+    framebuffer.name = 0;
+    GL.framebuffers[id] = null;
+  }
+};
+
+var _glDeleteFramebuffers = _emscripten_glDeleteFramebuffers;
+
+var _emscripten_glDeleteProgram = id => {
+  if (!id) return;
+  var program = GL.programs[id];
+  if (!program) {
+    // glDeleteProgram actually signals an error when deleting a nonexisting
+    // object, unlike some other GL delete functions.
+    GL.recordError(1281);
+    return;
+  }
+  GLctx.deleteProgram(program);
+  program.name = 0;
+  GL.programs[id] = null;
+};
+
+var _glDeleteProgram = _emscripten_glDeleteProgram;
+
+var _emscripten_glDeleteShader = id => {
+  if (!id) return;
+  var shader = GL.shaders[id];
+  if (!shader) {
+    // glDeleteShader actually signals an error when deleting a nonexisting
+    // object, unlike some other GL delete functions.
+    GL.recordError(1281);
+    return;
+  }
+  GLctx.deleteShader(shader);
+  GL.shaders[id] = null;
+};
+
+var _glDeleteShader = _emscripten_glDeleteShader;
+
+var _emscripten_glDeleteTextures = (n, textures) => {
+  for (var i = 0; i < n; i++) {
+    var id = HEAP32[(((textures) + (i * 4)) >> 2)];
+    var texture = GL.textures[id];
+    // GL spec: "glDeleteTextures silently ignores 0s and names that do not
+    // correspond to existing textures".
+    if (!texture) continue;
+    GLctx.deleteTexture(texture);
+    texture.name = 0;
+    GL.textures[id] = null;
+  }
+};
+
+var _glDeleteTextures = _emscripten_glDeleteTextures;
+
+var _emscripten_glDepthMask = flag => {
+  GLctx.depthMask(!!flag);
+};
+
+var _glDepthMask = _emscripten_glDepthMask;
+
+var _emscripten_glDisable = x0 => GLctx.disable(x0);
+
+var _glDisable = _emscripten_glDisable;
+
+var _emscripten_glDrawArrays = (mode, first, count) => {
+  GLctx.drawArrays(mode, first, count);
+};
+
+var _glDrawArrays = _emscripten_glDrawArrays;
+
+var _emscripten_glEnable = x0 => GLctx.enable(x0);
+
+var _glEnable = _emscripten_glEnable;
+
+var _emscripten_glEnableVertexAttribArray = index => {
+  GLctx.enableVertexAttribArray(index);
+};
+
+var _glEnableVertexAttribArray = _emscripten_glEnableVertexAttribArray;
+
+var _emscripten_glFramebufferTexture2D = (target, attachment, textarget, texture, level) => {
+  GLctx.framebufferTexture2D(target, attachment, textarget, GL.textures[texture], level);
+};
+
+var _glFramebufferTexture2D = _emscripten_glFramebufferTexture2D;
+
+var _emscripten_glGenBuffers = (n, buffers) => {
+  GL.genObject(n, buffers, "createBuffer", GL.buffers);
+};
+
+var _glGenBuffers = _emscripten_glGenBuffers;
+
+var _emscripten_glGenFramebuffers = (n, ids) => {
+  GL.genObject(n, ids, "createFramebuffer", GL.framebuffers);
+};
+
+var _glGenFramebuffers = _emscripten_glGenFramebuffers;
+
+var _emscripten_glGenTextures = (n, textures) => {
+  GL.genObject(n, textures, "createTexture", GL.textures);
+};
+
+var _glGenTextures = _emscripten_glGenTextures;
+
+var writeI53ToI64 = (ptr, num) => {
+  HEAPU32[((ptr) >> 2)] = num;
+  var lower = HEAPU32[((ptr) >> 2)];
+  HEAPU32[(((ptr) + (4)) >> 2)] = (num - lower) / 4294967296;
+};
+
+var webglGetExtensions = () => {
+  var exts = getEmscriptenSupportedExtensions(GLctx);
+  exts = exts.concat(exts.map(e => "GL_" + e));
+  return exts;
+};
+
+/** @type {!Float32Array} */ var HEAPF32;
+
+var emscriptenWebGLGet = (name_, p, type) => {
+  // Guard against user passing a null pointer.
+  // Note that GLES2 spec does not say anything about how passing a null
+  // pointer should be treated.  Testing on desktop core GL 3, the application
+  // crashes on glGetIntegerv to a null pointer, but better to report an error
+  // instead of doing anything random.
+  if (!p) {
+    GL.recordError(1281);
+    return;
+  }
+  var ret = undefined;
+  switch (name_) {
+   // Handle a few trivial GLES values
+    case 36346:
+    // GL_SHADER_COMPILER
+    ret = 1;
+    break;
+
+   case 36344:
+    // GL_SHADER_BINARY_FORMATS
+    if (type != 0 && type != 1) {
+      GL.recordError(1280);
+    }
+    // Do not write anything to the out pointer, since no binary formats are
+    // supported.
+    return;
+
+   case 34814:
+   // GL_NUM_PROGRAM_BINARY_FORMATS
+    case 36345:
+    // GL_NUM_SHADER_BINARY_FORMATS
+    ret = 0;
+    break;
+
+   case 34466:
+    // GL_NUM_COMPRESSED_TEXTURE_FORMATS
+    // WebGL doesn't have GL_NUM_COMPRESSED_TEXTURE_FORMATS (it's obsolete
+    // since GL_COMPRESSED_TEXTURE_FORMATS returns a JS array that can be
+    // queried for length), so implement it ourselves to allow C++ GLES2
+    // code to get the length.
+    var formats = GLctx.getParameter(34467);
+    ret = formats ? formats.length : 0;
+    break;
+
+   case 33309:
+    // GL_NUM_EXTENSIONS
+    if (GL.currentContext.version < 2) {
+      // Calling GLES3/WebGL2 function with a GLES2/WebGL1 context
+      GL.recordError(1282);
+      return;
+    }
+    ret = webglGetExtensions().length;
+    break;
+
+   case 33307:
+   // GL_MAJOR_VERSION
+    case 33308:
+    // GL_MINOR_VERSION
+    if (GL.currentContext.version < 2) {
+      GL.recordError(1280);
+      // GL_INVALID_ENUM
+      return;
+    }
+    ret = name_ == 33307 ? 3 : 0;
+    // return version 3.0
+    break;
+  }
+  if (ret === undefined) {
+    var result = GLctx.getParameter(name_);
+    switch (typeof result) {
+     case "number":
+      ret = result;
+      break;
+
+     case "boolean":
+      ret = result ? 1 : 0;
+      break;
+
+     case "string":
+      GL.recordError(1280);
+      // GL_INVALID_ENUM
+      return;
+
+     case "object":
+      if (result === null) {
+        // null is a valid result for some (e.g., which buffer is bound -
+        // perhaps nothing is bound), but otherwise can mean an invalid
+        // name_, which we need to report as an error
+        switch (name_) {
+         case 34964:
+         // ARRAY_BUFFER_BINDING
+          case 35725:
+         // CURRENT_PROGRAM
+          case 34965:
+         // ELEMENT_ARRAY_BUFFER_BINDING
+          case 36006:
+         // FRAMEBUFFER_BINDING or DRAW_FRAMEBUFFER_BINDING
+          case 36007:
+         // RENDERBUFFER_BINDING
+          case 32873:
+         // TEXTURE_BINDING_2D
+          case 34229:
+         // WebGL 2 GL_VERTEX_ARRAY_BINDING, or WebGL 1 extension OES_vertex_array_object GL_VERTEX_ARRAY_BINDING_OES
+          case 36662:
+         // COPY_READ_BUFFER_BINDING or COPY_READ_BUFFER
+          case 36663:
+         // COPY_WRITE_BUFFER_BINDING or COPY_WRITE_BUFFER
+          case 35053:
+         // PIXEL_PACK_BUFFER_BINDING
+          case 35055:
+         // PIXEL_UNPACK_BUFFER_BINDING
+          case 36010:
+         // READ_FRAMEBUFFER_BINDING
+          case 35097:
+         // SAMPLER_BINDING
+          case 35869:
+         // TEXTURE_BINDING_2D_ARRAY
+          case 32874:
+         // TEXTURE_BINDING_3D
+          case 36389:
+         // TRANSFORM_FEEDBACK_BINDING
+          case 35983:
+         // TRANSFORM_FEEDBACK_BUFFER_BINDING
+          case 35368:
+         // UNIFORM_BUFFER_BINDING
+          case 34068:
+          {
+            // TEXTURE_BINDING_CUBE_MAP
+            ret = 0;
+            break;
+          }
+
+         default:
+          {
+            GL.recordError(1280);
+            // GL_INVALID_ENUM
+            return;
+          }
+        }
+      } else if (result instanceof Float32Array || result instanceof Uint32Array || result instanceof Int32Array || result instanceof Array) {
+        for (var i = 0; i < result.length; ++i) {
+          switch (type) {
+           case 0:
+            HEAP32[(((p) + (i * 4)) >> 2)] = result[i];
+            break;
+
+           case 2:
+            HEAPF32[(((p) + (i * 4)) >> 2)] = result[i];
+            break;
+
+           case 4:
+            HEAP8[(p) + (i)] = result[i] ? 1 : 0;
+            break;
+          }
+        }
+        return;
+      } else {
+        try {
+          ret = result.name | 0;
+        } catch (e) {
+          GL.recordError(1280);
+          // GL_INVALID_ENUM
+          err(`GL_INVALID_ENUM in glGet${type}v: Unknown object returned from WebGL getParameter(${name_})! (error: ${e})`);
+          return;
+        }
+      }
+      break;
+
+     default:
+      GL.recordError(1280);
+      // GL_INVALID_ENUM
+      err(`GL_INVALID_ENUM in glGet${type}v: Native code calling glGet${type}v(${name_}) and it returns ${result} of type ${typeof (result)}!`);
+      return;
+    }
+  }
+  switch (type) {
+   case 1:
+    writeI53ToI64(p, ret);
+    break;
+
+   case 0:
+    HEAP32[((p) >> 2)] = ret;
+    break;
+
+   case 2:
+    HEAPF32[((p) >> 2)] = ret;
+    break;
+
+   case 4:
+    HEAP8[p] = ret ? 1 : 0;
+    break;
+  }
+};
+
+var _emscripten_glGetIntegerv = (name_, p) => emscriptenWebGLGet(name_, p, 0);
+
+var _glGetIntegerv = _emscripten_glGetIntegerv;
+
+var _emscripten_glGetProgramInfoLog = (program, maxLength, length, infoLog) => {
+  var log = GLctx.getProgramInfoLog(GL.programs[program]);
+  if (log === null) log = "(unknown error)";
+  var numBytesWrittenExclNull = (maxLength > 0 && infoLog) ? stringToUTF8(log, infoLog, maxLength) : 0;
+  if (length) HEAP32[((length) >> 2)] = numBytesWrittenExclNull;
+};
+
+var _glGetProgramInfoLog = _emscripten_glGetProgramInfoLog;
+
+var _emscripten_glGetProgramiv = (program, pname, p) => {
+  if (!p) {
+    // GLES2 specification does not specify how to behave if p is a null
+    // pointer. Since calling this function does not make sense if p == null,
+    // issue a GL error to notify user about it.
+    GL.recordError(1281);
+    return;
+  }
+  if (program >= GL.counter) {
+    GL.recordError(1281);
+    return;
+  }
+  program = GL.programs[program];
+  if (pname == 35716) {
+    // GL_INFO_LOG_LENGTH
+    var log = GLctx.getProgramInfoLog(program);
+    if (log === null) log = "(unknown error)";
+    HEAP32[((p) >> 2)] = log.length + 1;
+  } else if (pname == 35719) {
+    if (!program.maxUniformLength) {
+      var numActiveUniforms = GLctx.getProgramParameter(program, 35718);
+      for (var i = 0; i < numActiveUniforms; ++i) {
+        program.maxUniformLength = Math.max(program.maxUniformLength, GLctx.getActiveUniform(program, i).name.length + 1);
+      }
+    }
+    HEAP32[((p) >> 2)] = program.maxUniformLength;
+  } else if (pname == 35722) {
+    if (!program.maxAttributeLength) {
+      var numActiveAttributes = GLctx.getProgramParameter(program, 35721);
+      for (var i = 0; i < numActiveAttributes; ++i) {
+        program.maxAttributeLength = Math.max(program.maxAttributeLength, GLctx.getActiveAttrib(program, i).name.length + 1);
+      }
+    }
+    HEAP32[((p) >> 2)] = program.maxAttributeLength;
+  } else if (pname == 35381) {
+    if (!program.maxUniformBlockNameLength) {
+      var numActiveUniformBlocks = GLctx.getProgramParameter(program, 35382);
+      for (var i = 0; i < numActiveUniformBlocks; ++i) {
+        program.maxUniformBlockNameLength = Math.max(program.maxUniformBlockNameLength, GLctx.getActiveUniformBlockName(program, i).length + 1);
+      }
+    }
+    HEAP32[((p) >> 2)] = program.maxUniformBlockNameLength;
+  } else {
+    HEAP32[((p) >> 2)] = GLctx.getProgramParameter(program, pname);
+  }
+};
+
+var _glGetProgramiv = _emscripten_glGetProgramiv;
+
+var _emscripten_glGetShaderInfoLog = (shader, maxLength, length, infoLog) => {
+  var log = GLctx.getShaderInfoLog(GL.shaders[shader]);
+  if (log === null) log = "(unknown error)";
+  var numBytesWrittenExclNull = (maxLength > 0 && infoLog) ? stringToUTF8(log, infoLog, maxLength) : 0;
+  if (length) HEAP32[((length) >> 2)] = numBytesWrittenExclNull;
+};
+
+var _glGetShaderInfoLog = _emscripten_glGetShaderInfoLog;
+
+var _emscripten_glGetShaderiv = (shader, pname, p) => {
+  if (!p) {
+    // GLES2 specification does not specify how to behave if p is a null
+    // pointer. Since calling this function does not make sense if p == null,
+    // issue a GL error to notify user about it.
+    GL.recordError(1281);
+    return;
+  }
+  if (pname == 35716) {
+    // GL_INFO_LOG_LENGTH
+    var log = GLctx.getShaderInfoLog(GL.shaders[shader]);
+    if (log === null) log = "(unknown error)";
+    // The GLES2 specification says that if the shader has an empty info log,
+    // a value of 0 is returned. Otherwise the log has a null char appended.
+    // (An empty string is falsey, so we can just check that instead of
+    // looking at log.length.)
+    var logLength = log ? log.length + 1 : 0;
+    HEAP32[((p) >> 2)] = logLength;
+  } else if (pname == 35720) {
+    // GL_SHADER_SOURCE_LENGTH
+    var source = GLctx.getShaderSource(GL.shaders[shader]);
+    // source may be a null, or the empty string, both of which are falsey
+    // values that we report a 0 length for.
+    var sourceLength = source ? source.length + 1 : 0;
+    HEAP32[((p) >> 2)] = sourceLength;
+  } else {
+    HEAP32[((p) >> 2)] = GLctx.getShaderParameter(GL.shaders[shader], pname);
+  }
+};
+
+var _glGetShaderiv = _emscripten_glGetShaderiv;
+
+/** @suppress {checkTypes} */ var jstoi_q = str => parseInt(str);
+
+/** @noinline */ var webglGetLeftBracePos = name => name.slice(-1) == "]" && name.lastIndexOf("[");
+
+var webglPrepareUniformLocationsBeforeFirstUse = program => {
+  var uniformLocsById = program.uniformLocsById, // Maps GLuint -> WebGLUniformLocation
+  uniformSizeAndIdsByName = program.uniformSizeAndIdsByName, // Maps name -> [uniform array length, GLuint]
+  i, j;
+  // On the first time invocation of glGetUniformLocation on this shader program:
+  // initialize cache data structures and discover which uniforms are arrays.
+  if (!uniformLocsById) {
+    // maps GLint integer locations to WebGLUniformLocations
+    program.uniformLocsById = uniformLocsById = {};
+    // maps integer locations back to uniform name strings, so that we can lazily fetch uniform array locations
+    program.uniformArrayNamesById = {};
+    var numActiveUniforms = GLctx.getProgramParameter(program, 35718);
+    for (i = 0; i < numActiveUniforms; ++i) {
+      var u = GLctx.getActiveUniform(program, i);
+      var nm = u.name;
+      var sz = u.size;
+      var lb = webglGetLeftBracePos(nm);
+      var arrayName = lb > 0 ? nm.slice(0, lb) : nm;
+      // Assign a new location.
+      var id = program.uniformIdCounter;
+      program.uniformIdCounter += sz;
+      // Eagerly get the location of the uniformArray[0] base element.
+      // The remaining indices >0 will be left for lazy evaluation to
+      // improve performance. Those may never be needed to fetch, if the
+      // application fills arrays always in full starting from the first
+      // element of the array.
+      uniformSizeAndIdsByName[arrayName] = [ sz, id ];
+      // Store placeholder integers in place that highlight that these
+      // >0 index locations are array indices pending population.
+      for (j = 0; j < sz; ++j) {
+        uniformLocsById[id] = j;
+        program.uniformArrayNamesById[id++] = arrayName;
+      }
+    }
+  }
+};
+
+var _emscripten_glGetUniformLocation = (program, name) => {
+  name = UTF8ToString(name);
+  if (program = GL.programs[program]) {
+    webglPrepareUniformLocationsBeforeFirstUse(program);
+    var uniformLocsById = program.uniformLocsById;
+    // Maps GLuint -> WebGLUniformLocation
+    var arrayIndex = 0;
+    var uniformBaseName = name;
+    // Invariant: when populating integer IDs for uniform locations, we must
+    // maintain the precondition that arrays reside in contiguous addresses,
+    // i.e. for a 'vec4 colors[10];', colors[4] must be at location
+    // colors[0]+4.  However, user might call glGetUniformLocation(program,
+    // "colors") for an array, so we cannot discover based on the user input
+    // arguments whether the uniform we are dealing with is an array. The only
+    // way to discover which uniforms are arrays is to enumerate over all the
+    // active uniforms in the program.
+    var leftBrace = webglGetLeftBracePos(name);
+    // If user passed an array accessor "[index]", parse the array index off the accessor.
+    if (leftBrace > 0) {
+      arrayIndex = jstoi_q(name.slice(leftBrace + 1)) >>> 0;
+      // "index]", coerce parseInt(']') with >>>0 to treat "foo[]" as "foo[0]" and foo[-1] as unsigned out-of-bounds.
+      uniformBaseName = name.slice(0, leftBrace);
+    }
+    // Have we cached the location of this uniform before?
+    // A pair [array length, GLint of the uniform location]
+    var sizeAndId = program.uniformSizeAndIdsByName[uniformBaseName];
+    // If a uniform with this name exists, and if its index is within the
+    // array limits (if it's even an array), query the WebGLlocation, or
+    // return an existing cached location.
+    if (sizeAndId && arrayIndex < sizeAndId[0]) {
+      arrayIndex += sizeAndId[1];
+      // Add the base location of the uniform to the array index offset.
+      if ((uniformLocsById[arrayIndex] = uniformLocsById[arrayIndex] || GLctx.getUniformLocation(program, name))) {
+        return arrayIndex;
+      }
+    }
+  } else {
+    // N.b. we are currently unable to distinguish between GL program IDs that
+    // never existed vs GL program IDs that have been deleted, so report
+    // GL_INVALID_VALUE in both cases.
+    GL.recordError(1281);
+  }
+  return -1;
+};
+
+var _glGetUniformLocation = _emscripten_glGetUniformLocation;
+
+var _emscripten_glLinkProgram = program => {
+  program = GL.programs[program];
+  GLctx.linkProgram(program);
+  // Invalidate earlier computed uniform->ID mappings, those have now become stale
+  program.uniformLocsById = 0;
+  // Mark as null-like so that glGetUniformLocation() knows to populate this again.
+  program.uniformSizeAndIdsByName = {};
+};
+
+var _glLinkProgram = _emscripten_glLinkProgram;
+
+var _emscripten_glPixelStorei = (pname, param) => {
+  if (pname == 3317) {
+    GL.unpackAlignment = param;
+  } else if (pname == 3314) {
+    GL.unpackRowLength = param;
+  }
+  GLctx.pixelStorei(pname, param);
+};
+
+var _glPixelStorei = _emscripten_glPixelStorei;
+
+/** @type {!Uint16Array} */ var HEAPU16;
+
+var heapObjectForWebGLType = type => {
+  // Micro-optimization for size: Subtract lowest GL enum number (0x1400/* GL_BYTE */) from type to compare
+  // smaller values for the heap, for shorter generated code size.
+  // Also the type HEAPU16 is not tested for explicitly, but any unrecognized type will return out HEAPU16.
+  // (since most types are HEAPU16)
+  type -= 5120;
+  if (type == 0) return HEAP8;
+  if (type == 1) return HEAPU8;
+  if (type == 2) return HEAP16;
+  if (type == 4) return HEAP32;
+  if (type == 6) return HEAPF32;
+  if (type == 5 || type == 28922 || type == 28520 || type == 30779 || type == 30782) return HEAPU32;
+  return HEAPU16;
+};
+
+var toTypedArrayIndex = (pointer, heap) => pointer >>> (31 - Math.clz32(heap.BYTES_PER_ELEMENT));
+
+var _emscripten_glReadPixels = (x, y, width, height, format, type, pixels) => {
+  if (true) {
+    if (GLctx.currentPixelPackBufferBinding) {
+      GLctx.readPixels(x, y, width, height, format, type, pixels);
+      return;
+    }
+    var heap = heapObjectForWebGLType(type);
+    var target = toTypedArrayIndex(pixels, heap);
+    GLctx.readPixels(x, y, width, height, format, type, heap, target);
+    return;
+  }
+};
+
+var _glReadPixels = _emscripten_glReadPixels;
+
+var _emscripten_glScissor = (x0, x1, x2, x3) => GLctx.scissor(x0, x1, x2, x3);
+
+var _glScissor = _emscripten_glScissor;
+
+var _emscripten_glShaderSource = (shader, count, string, length) => {
+  var source = GL.getSource(shader, count, string, length);
+  GLctx.shaderSource(GL.shaders[shader], source);
+};
+
+var _glShaderSource = _emscripten_glShaderSource;
+
+var _emscripten_glStencilFunc = (x0, x1, x2) => GLctx.stencilFunc(x0, x1, x2);
+
+var _glStencilFunc = _emscripten_glStencilFunc;
+
+var _emscripten_glStencilMask = x0 => GLctx.stencilMask(x0);
+
+var _glStencilMask = _emscripten_glStencilMask;
+
+var _emscripten_glStencilOp = (x0, x1, x2) => GLctx.stencilOp(x0, x1, x2);
+
+var _glStencilOp = _emscripten_glStencilOp;
+
+var computeUnpackAlignedImageSize = (width, height, sizePerPixel) => {
+  function roundedToNextMultipleOf(x, y) {
+    return (x + y - 1) & -y;
+  }
+  var plainRowSize = (GL.unpackRowLength || width) * sizePerPixel;
+  var alignedRowSize = roundedToNextMultipleOf(plainRowSize, GL.unpackAlignment);
+  return height * alignedRowSize;
+};
+
+var colorChannelsInGlTextureFormat = format => {
+  // Micro-optimizations for size: map format to size by subtracting smallest
+  // enum value (0x1902) from all values first.  Also omit the most common
+  // size value (1) from the list, which is assumed by formats not on the
+  // list.
+  var colorChannels = {
+    // 0x1902 /* GL_DEPTH_COMPONENT */ - 0x1902: 1,
+    // 0x1906 /* GL_ALPHA */ - 0x1902: 1,
+    5: 3,
+    6: 4,
+    // 0x1909 /* GL_LUMINANCE */ - 0x1902: 1,
+    8: 2,
+    29502: 3,
+    29504: 4,
+    // 0x1903 /* GL_RED */ - 0x1902: 1,
+    26917: 2,
+    26918: 2,
+    // 0x8D94 /* GL_RED_INTEGER */ - 0x1902: 1,
+    29846: 3,
+    29847: 4
+  };
+  return colorChannels[format - 6402] || 1;
+};
+
+var emscriptenWebGLGetTexPixelData = (type, format, width, height, pixels) => {
+  var heap = heapObjectForWebGLType(type);
+  var sizePerPixel = colorChannelsInGlTextureFormat(format) * heap.BYTES_PER_ELEMENT;
+  var bytes = computeUnpackAlignedImageSize(width, height, sizePerPixel);
+  return heap.subarray(toTypedArrayIndex(pixels, heap), toTypedArrayIndex(pixels + bytes, heap));
+};
+
+var _emscripten_glTexImage2D = (target, level, internalFormat, width, height, border, format, type, pixels) => {
+  if (true) {
+    if (GLctx.currentPixelUnpackBufferBinding) {
+      GLctx.texImage2D(target, level, internalFormat, width, height, border, format, type, pixels);
+      return;
+    }
+    if (pixels) {
+      var heap = heapObjectForWebGLType(type);
+      var index = toTypedArrayIndex(pixels, heap);
+      GLctx.texImage2D(target, level, internalFormat, width, height, border, format, type, heap, index);
+      return;
+    }
+  }
+  var pixelData = pixels ? emscriptenWebGLGetTexPixelData(type, format, width, height, pixels) : null;
+  GLctx.texImage2D(target, level, internalFormat, width, height, border, format, type, pixelData);
+};
+
+var _glTexImage2D = _emscripten_glTexImage2D;
+
+var _emscripten_glTexParameteri = (x0, x1, x2) => GLctx.texParameteri(x0, x1, x2);
+
+var _glTexParameteri = _emscripten_glTexParameteri;
+
+var _emscripten_glTexSubImage2D = (target, level, xoffset, yoffset, width, height, format, type, pixels) => {
+  if (true) {
+    if (GLctx.currentPixelUnpackBufferBinding) {
+      GLctx.texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+      return;
+    }
+    if (pixels) {
+      var heap = heapObjectForWebGLType(type);
+      GLctx.texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, heap, toTypedArrayIndex(pixels, heap));
+      return;
+    }
+  }
+  var pixelData = pixels ? emscriptenWebGLGetTexPixelData(type, format, width, height, pixels) : null;
+  GLctx.texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixelData);
+};
+
+var _glTexSubImage2D = _emscripten_glTexSubImage2D;
+
+var webglGetProgramUniformLocation = (program, location) => {
+  if (program) {
+    var webglLoc = program.uniformLocsById[location];
+    // program.uniformLocsById[location] stores either an integer, or a
+    // WebGLUniformLocation.
+    // If an integer, we have not yet bound the location, so do it now. The
+    // integer value specifies the array index we should bind to.
+    if (typeof webglLoc === "number") {
+      program.uniformLocsById[location] = webglLoc = GLctx.getUniformLocation(program, program.uniformArrayNamesById[location] + (webglLoc > 0 ? `[${webglLoc}]` : ""));
+    }
+    // Else an already cached WebGLUniformLocation, return it.
+    return webglLoc;
+  } else {
+    GL.recordError(1282);
+  }
+};
+
+var webglGetUniformLocation = location => webglGetProgramUniformLocation(GLctx.currentProgram, location);
+
+var _emscripten_glUniform1f = (location, v0) => {
+  GLctx.uniform1f(webglGetUniformLocation(location), v0);
+};
+
+var _glUniform1f = _emscripten_glUniform1f;
+
+var _emscripten_glUniform1fv = (location, count, value) => {
+  count && GLctx.uniform1fv(webglGetUniformLocation(location), HEAPF32, ((value) >> 2), count);
+};
+
+var _glUniform1fv = _emscripten_glUniform1fv;
+
+var _emscripten_glUniform1i = (location, v0) => {
+  GLctx.uniform1i(webglGetUniformLocation(location), v0);
+};
+
+var _glUniform1i = _emscripten_glUniform1i;
+
+var _emscripten_glUniform1iv = (location, count, value) => {
+  count && GLctx.uniform1iv(webglGetUniformLocation(location), HEAP32, ((value) >> 2), count);
+};
+
+var _glUniform1iv = _emscripten_glUniform1iv;
+
+var _emscripten_glUniform2f = (location, v0, v1) => {
+  GLctx.uniform2f(webglGetUniformLocation(location), v0, v1);
+};
+
+var _glUniform2f = _emscripten_glUniform2f;
+
+var _emscripten_glUniform2fv = (location, count, value) => {
+  count && GLctx.uniform2fv(webglGetUniformLocation(location), HEAPF32, ((value) >> 2), count * 2);
+};
+
+var _glUniform2fv = _emscripten_glUniform2fv;
+
+var _emscripten_glUniform2i = (location, v0, v1) => {
+  GLctx.uniform2i(webglGetUniformLocation(location), v0, v1);
+};
+
+var _glUniform2i = _emscripten_glUniform2i;
+
+var _emscripten_glUniform3f = (location, v0, v1, v2) => {
+  GLctx.uniform3f(webglGetUniformLocation(location), v0, v1, v2);
+};
+
+var _glUniform3f = _emscripten_glUniform3f;
+
+var _emscripten_glUniform4f = (location, v0, v1, v2, v3) => {
+  GLctx.uniform4f(webglGetUniformLocation(location), v0, v1, v2, v3);
+};
+
+var _glUniform4f = _emscripten_glUniform4f;
+
+var _emscripten_glUseProgram = program => {
+  program = GL.programs[program];
+  GLctx.useProgram(program);
+  // Record the currently active program so that we can access the uniform
+  // mapping table of that program.
+  GLctx.currentProgram = program;
+};
+
+var _glUseProgram = _emscripten_glUseProgram;
+
+var _emscripten_glVertexAttribPointer = (index, size, type, normalized, stride, ptr) => {
+  GLctx.vertexAttribPointer(index, size, type, !!normalized, stride, ptr);
+};
+
+var _glVertexAttribPointer = _emscripten_glVertexAttribPointer;
+
+var _emscripten_glViewport = (x0, x1, x2, x3) => GLctx.viewport(x0, x1, x2, x3);
+
+var _glViewport = _emscripten_glViewport;
+
 var Asyncify = {
   instrumentWasmImports(imports) {
     var importPattern = /^(host_call|invoke_.*|__asyncjs__.*)$/;
@@ -3463,7 +5109,7 @@ var Asyncify = {
     }
   },
   instrumentWasmExports(exports) {
-    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_get_raw|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_compact|tjs_borrow_end|tjs_window_objects|tjs_plugins|tjs_layer_font|main|__main_argc_argv)$/;
+    var exportPattern = /^(tjs_execute_source|tjs_execute_bytecode|tjs_object_get|tjs_object_get_raw|tjs_object_set|tjs_object_call|tjs_object_clone|tjs_object_construct|tjs_object_invalidate|tjs_runtime_shutdown|tjs_runtime_destroy|tjs_value_release_async|tjs_runtime_compact|tjs_borrow_end|tjs_window_objects|tjs_plugins|tjs_layer_font|tjs_visual_register|tjs_visual_events|tjs_visual_window|tjs_visual_bitmap|tjs_visual_movie_frame|tjs_touch_images|tjs_system_initialize|tjs_system_maintain|main|__main_argc_argv)$/;
     Asyncify.asyncExports = new Set;
     var ret = {};
     for (let [x, original] of Object.entries(exports)) {
@@ -3515,8 +5161,6 @@ var stringToUTF16 = (str, outPtr, maxBytesToWrite = 2147483647) => {
 };
 
 var UTF16Decoder = globalThis.TextDecoder ? new TextDecoder("utf-16le") : undefined;
-
-/** @type {!Uint16Array} */ var HEAPU16;
 
 var UTF16ToString = (ptr, maxBytesToRead, ignoreNul) => {
   var idx = ((ptr) >> 1);
@@ -3632,13 +5276,38 @@ function host_readonly_get(runtime, callback, name) {
 
 host_readonly_get.sig = "iiii";
 
+function gal_create_canvas_context() {
+  return GL.createContext(Module["getRenderCanvas"](), {
+    majorVersion: 2,
+    minorVersion: 0
+  });
+}
+
+gal_create_canvas_context.sig = "i";
+
+function gal_resize_canvas(width, height) {
+  const canvas = GL.currentContext.GLctx.canvas;
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+}
+
+gal_resize_canvas.sig = "vii";
+
+function system_random_bits(data) {
+  crypto.getRandomValues(HEAPU8.subarray(data, data + 16));
+}
+
+system_random_bits.sig = "vi";
+
 // Imports from the Wasm binary.
-var _tjs_memory_allocated_bytes, _tjs_memory_free_bytes, _tjs_runtime_create, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_kind, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_rehash, _tjs_runtime_compact, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_get_stored, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_layer_font, _tjs_class_id, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_deserialize, _malloc, _free, ___trap, memory, __indirect_function_table, wasmMemory;
+var _tjs_memory_allocated_bytes, _tjs_memory_free_bytes, _tjs_runtime_create, _tjs_system_initialize, _tjs_system_maintain, _tjs_plugins, _tjs_kag_parsers, _tjs_runtime_set_storage, _tjs_runtime_destroy, _tjs_runtime_error, _tjs_error_set, _tjs_runtime_diagnostic, _tjs_value_void, _tjs_value_null, _tjs_value_octet, _tjs_value_octet_data, _tjs_value_octet_size, _tjs_value_real, _tjs_value_integer, _tjs_value_string, _tjs_value_copy, _tjs_value_retain, _tjs_value_retain_for_owner, _tjs_value_bind_owner, _tjs_value_pin, _tjs_value_release, _tjs_borrow_end, _tjs_host_bind, _tjs_host_reference, _tjs_value_bind, _tjs_value_context, _tjs_value_equal, _tjs_native_owner, _tjs_window_objects, _tjs_value_type, _tjs_value_convert, _tjs_value_as_real, _tjs_value_as_string, _tjs_value_kind, _tjs_object_is_instance_of, _tjs_object_is_valid, _tjs_object_create, _tjs_runtime_handle_count, _tjs_runtime_instance_count, _tjs_runtime_invalidation_count, _tjs_runtime_rehash, _tjs_runtime_compact, _tjs_graphic_cache_limit, _tjs_graphic_cache_system_limit, _tjs_clear_graphic_cache, _tjs_touch_images, _tjs_runtime_shutdown, _tjs_runtime_global, _tjs_execute_source, _tjs_execute_bytecode, _tjs_object_get, _tjs_object_set, _tjs_object_call, _tjs_object_invalidate, _tjs_object_clone, _tjs_object_delete, _tjs_object_class_names, _tjs_object_set_missing, _tjs_object_construct, _tjs_object_get_raw, _tjs_object_get_stored, _tjs_object_set_raw, _tjs_value_release_async, _tjs_object_get_by_num_raw, _tjs_object_keys, _tjs_array_count, _tjs_layer_font, _tjs_class_id, _tjs_native_state, _tjs_native_states, _tjs_object_create_host, _tjs_class_create, _tjs_class_instance, _tjs_callback_create, _tjs_readonly_create, _tjs_class_register_member, _tjs_visual_movie_frame, _tjs_visual_bitmap, _tjs_visual_register, _tjs_visual_window, _tjs_visual_events, _gal_render_initialize, _gal_render_shutdown, _gal_render_resize, _gal_render_max_texture, _gal_render_texture_create, _gal_render_texture_from_pixels, _gal_render_texture_release, _gal_render_texture_share, _gal_render_texture_clone, _gal_render_texture_writable, _gal_render_texture_width, _gal_render_texture_height, _gal_render_texture_independent, _gal_render_texture_update, _gal_render_texture_read, _gal_render_texture_fill, _gal_render_texture_clear, _gal_render_clear, _gal_render_present, _gal_render_copy, _gal_render_scale, _gal_render_draw_rect, _gal_render_draw_quad, _gal_render_read_canvas, _gal_render_draw_count, _gal_render_last_error, _gal_render_context_lost, _gal_render_context_restored, _gal_bitmap_create, _gal_bitmap_from_pixels, _gal_bitmap_decode, _gal_bitmap_resize, _gal_bitmap_share, _gal_bitmap_release, _gal_bitmap_width, _gal_bitmap_height, _gal_bitmap_fill, _gal_bitmap_copy, _gal_bitmap_draw, _gal_bitmap_read, _gal_font_open, _gal_font_release, _gal_font_glyph_metrics, _gal_font_glyph_read, _gal_font_last_error, _malloc, _free, _gal_image_decode, _gal_image_width, _gal_image_height, _gal_image_channels, _gal_image_pixels, _gal_image_release, _gal_image_last_error, _tjs_deserialize, _emscripten_builtin_memalign, ___trap, memory, __indirect_function_table, wasmMemory, wasmTable;
 
 function assignWasmExports(wasmExports) {
   _tjs_memory_allocated_bytes = Module["_tjs_memory_allocated_bytes"] = wasmExports["tjs_memory_allocated_bytes"];
   _tjs_memory_free_bytes = Module["_tjs_memory_free_bytes"] = wasmExports["tjs_memory_free_bytes"];
   _tjs_runtime_create = Module["_tjs_runtime_create"] = wasmExports["tjs_runtime_create"];
+  _tjs_system_initialize = Module["_tjs_system_initialize"] = wasmExports["tjs_system_initialize"];
+  _tjs_system_maintain = Module["_tjs_system_maintain"] = wasmExports["tjs_system_maintain"];
   _tjs_plugins = Module["_tjs_plugins"] = wasmExports["tjs_plugins"];
   _tjs_kag_parsers = Module["_tjs_kag_parsers"] = wasmExports["tjs_kag_parsers"];
   _tjs_runtime_set_storage = Module["_tjs_runtime_set_storage"] = wasmExports["tjs_runtime_set_storage"];
@@ -3681,6 +5350,10 @@ function assignWasmExports(wasmExports) {
   _tjs_runtime_invalidation_count = Module["_tjs_runtime_invalidation_count"] = wasmExports["tjs_runtime_invalidation_count"];
   _tjs_runtime_rehash = Module["_tjs_runtime_rehash"] = wasmExports["tjs_runtime_rehash"];
   _tjs_runtime_compact = Module["_tjs_runtime_compact"] = wasmExports["tjs_runtime_compact"];
+  _tjs_graphic_cache_limit = Module["_tjs_graphic_cache_limit"] = wasmExports["tjs_graphic_cache_limit"];
+  _tjs_graphic_cache_system_limit = Module["_tjs_graphic_cache_system_limit"] = wasmExports["tjs_graphic_cache_system_limit"];
+  _tjs_clear_graphic_cache = Module["_tjs_clear_graphic_cache"] = wasmExports["tjs_clear_graphic_cache"];
+  _tjs_touch_images = Module["_tjs_touch_images"] = wasmExports["tjs_touch_images"];
   _tjs_runtime_shutdown = Module["_tjs_runtime_shutdown"] = wasmExports["tjs_runtime_shutdown"];
   _tjs_runtime_global = Module["_tjs_runtime_global"] = wasmExports["tjs_runtime_global"];
   _tjs_execute_source = Module["_tjs_execute_source"] = wasmExports["tjs_execute_source"];
@@ -3711,37 +5384,188 @@ function assignWasmExports(wasmExports) {
   _tjs_callback_create = Module["_tjs_callback_create"] = wasmExports["tjs_callback_create"];
   _tjs_readonly_create = Module["_tjs_readonly_create"] = wasmExports["tjs_readonly_create"];
   _tjs_class_register_member = Module["_tjs_class_register_member"] = wasmExports["tjs_class_register_member"];
-  _tjs_deserialize = Module["_tjs_deserialize"] = wasmExports["tjs_deserialize"];
+  _tjs_visual_movie_frame = Module["_tjs_visual_movie_frame"] = wasmExports["tjs_visual_movie_frame"];
+  _tjs_visual_bitmap = Module["_tjs_visual_bitmap"] = wasmExports["tjs_visual_bitmap"];
+  _tjs_visual_register = Module["_tjs_visual_register"] = wasmExports["tjs_visual_register"];
+  _tjs_visual_window = Module["_tjs_visual_window"] = wasmExports["tjs_visual_window"];
+  _tjs_visual_events = Module["_tjs_visual_events"] = wasmExports["tjs_visual_events"];
+  _gal_render_initialize = Module["_gal_render_initialize"] = wasmExports["gal_render_initialize"];
+  _gal_render_shutdown = Module["_gal_render_shutdown"] = wasmExports["gal_render_shutdown"];
+  _gal_render_resize = Module["_gal_render_resize"] = wasmExports["gal_render_resize"];
+  _gal_render_max_texture = Module["_gal_render_max_texture"] = wasmExports["gal_render_max_texture"];
+  _gal_render_texture_create = Module["_gal_render_texture_create"] = wasmExports["gal_render_texture_create"];
+  _gal_render_texture_from_pixels = Module["_gal_render_texture_from_pixels"] = wasmExports["gal_render_texture_from_pixels"];
+  _gal_render_texture_release = Module["_gal_render_texture_release"] = wasmExports["gal_render_texture_release"];
+  _gal_render_texture_share = Module["_gal_render_texture_share"] = wasmExports["gal_render_texture_share"];
+  _gal_render_texture_clone = Module["_gal_render_texture_clone"] = wasmExports["gal_render_texture_clone"];
+  _gal_render_texture_writable = Module["_gal_render_texture_writable"] = wasmExports["gal_render_texture_writable"];
+  _gal_render_texture_width = Module["_gal_render_texture_width"] = wasmExports["gal_render_texture_width"];
+  _gal_render_texture_height = Module["_gal_render_texture_height"] = wasmExports["gal_render_texture_height"];
+  _gal_render_texture_independent = Module["_gal_render_texture_independent"] = wasmExports["gal_render_texture_independent"];
+  _gal_render_texture_update = Module["_gal_render_texture_update"] = wasmExports["gal_render_texture_update"];
+  _gal_render_texture_read = Module["_gal_render_texture_read"] = wasmExports["gal_render_texture_read"];
+  _gal_render_texture_fill = Module["_gal_render_texture_fill"] = wasmExports["gal_render_texture_fill"];
+  _gal_render_texture_clear = Module["_gal_render_texture_clear"] = wasmExports["gal_render_texture_clear"];
+  _gal_render_clear = Module["_gal_render_clear"] = wasmExports["gal_render_clear"];
+  _gal_render_present = Module["_gal_render_present"] = wasmExports["gal_render_present"];
+  _gal_render_copy = Module["_gal_render_copy"] = wasmExports["gal_render_copy"];
+  _gal_render_scale = Module["_gal_render_scale"] = wasmExports["gal_render_scale"];
+  _gal_render_draw_rect = Module["_gal_render_draw_rect"] = wasmExports["gal_render_draw_rect"];
+  _gal_render_draw_quad = Module["_gal_render_draw_quad"] = wasmExports["gal_render_draw_quad"];
+  _gal_render_read_canvas = Module["_gal_render_read_canvas"] = wasmExports["gal_render_read_canvas"];
+  _gal_render_draw_count = Module["_gal_render_draw_count"] = wasmExports["gal_render_draw_count"];
+  _gal_render_last_error = Module["_gal_render_last_error"] = wasmExports["gal_render_last_error"];
+  _gal_render_context_lost = Module["_gal_render_context_lost"] = wasmExports["gal_render_context_lost"];
+  _gal_render_context_restored = Module["_gal_render_context_restored"] = wasmExports["gal_render_context_restored"];
+  _gal_bitmap_create = Module["_gal_bitmap_create"] = wasmExports["gal_bitmap_create"];
+  _gal_bitmap_from_pixels = Module["_gal_bitmap_from_pixels"] = wasmExports["gal_bitmap_from_pixels"];
+  _gal_bitmap_decode = Module["_gal_bitmap_decode"] = wasmExports["gal_bitmap_decode"];
+  _gal_bitmap_resize = Module["_gal_bitmap_resize"] = wasmExports["gal_bitmap_resize"];
+  _gal_bitmap_share = Module["_gal_bitmap_share"] = wasmExports["gal_bitmap_share"];
+  _gal_bitmap_release = Module["_gal_bitmap_release"] = wasmExports["gal_bitmap_release"];
+  _gal_bitmap_width = Module["_gal_bitmap_width"] = wasmExports["gal_bitmap_width"];
+  _gal_bitmap_height = Module["_gal_bitmap_height"] = wasmExports["gal_bitmap_height"];
+  _gal_bitmap_fill = Module["_gal_bitmap_fill"] = wasmExports["gal_bitmap_fill"];
+  _gal_bitmap_copy = Module["_gal_bitmap_copy"] = wasmExports["gal_bitmap_copy"];
+  _gal_bitmap_draw = Module["_gal_bitmap_draw"] = wasmExports["gal_bitmap_draw"];
+  _gal_bitmap_read = Module["_gal_bitmap_read"] = wasmExports["gal_bitmap_read"];
+  _gal_font_open = Module["_gal_font_open"] = wasmExports["gal_font_open"];
+  _gal_font_release = Module["_gal_font_release"] = wasmExports["gal_font_release"];
+  _gal_font_glyph_metrics = Module["_gal_font_glyph_metrics"] = wasmExports["gal_font_glyph_metrics"];
+  _gal_font_glyph_read = Module["_gal_font_glyph_read"] = wasmExports["gal_font_glyph_read"];
+  _gal_font_last_error = Module["_gal_font_last_error"] = wasmExports["gal_font_last_error"];
   _malloc = Module["_malloc"] = wasmExports["malloc"];
   _free = Module["_free"] = wasmExports["free"];
+  _gal_image_decode = Module["_gal_image_decode"] = wasmExports["gal_image_decode"];
+  _gal_image_width = Module["_gal_image_width"] = wasmExports["gal_image_width"];
+  _gal_image_height = Module["_gal_image_height"] = wasmExports["gal_image_height"];
+  _gal_image_channels = Module["_gal_image_channels"] = wasmExports["gal_image_channels"];
+  _gal_image_pixels = Module["_gal_image_pixels"] = wasmExports["gal_image_pixels"];
+  _gal_image_release = Module["_gal_image_release"] = wasmExports["gal_image_release"];
+  _gal_image_last_error = Module["_gal_image_last_error"] = wasmExports["gal_image_last_error"];
+  _tjs_deserialize = Module["_tjs_deserialize"] = wasmExports["tjs_deserialize"];
+  _emscripten_builtin_memalign = wasmExports["emscripten_builtin_memalign"];
   ___trap = wasmExports["__trap"];
   memory = wasmMemory = wasmExports["memory"];
-  __indirect_function_table = wasmExports["__indirect_function_table"];
+  __indirect_function_table = wasmTable = wasmExports["__indirect_function_table"];
 }
 
 var wasmImports = {
+  /** @export */ __assert_fail: ___assert_fail,
+  /** @export */ __call_sighandler: ___call_sighandler,
+  /** @export */ __syscall_chmod: ___syscall_chmod,
+  /** @export */ __syscall_faccessat: ___syscall_faccessat,
+  /** @export */ __syscall_fadvise64: ___syscall_fadvise64,
+  /** @export */ __syscall_fcntl64: ___syscall_fcntl64,
+  /** @export */ __syscall_fstat64: ___syscall_fstat64,
+  /** @export */ __syscall_getcwd: ___syscall_getcwd,
+  /** @export */ __syscall_getdents64: ___syscall_getdents64,
+  /** @export */ __syscall_getegid32: ___syscall_getegid32,
+  /** @export */ __syscall_geteuid32: ___syscall_geteuid32,
+  /** @export */ __syscall_getgid32: ___syscall_getgid32,
+  /** @export */ __syscall_getuid32: ___syscall_getuid32,
+  /** @export */ __syscall_ioctl: ___syscall_ioctl,
+  /** @export */ __syscall_linkat: ___syscall_linkat,
+  /** @export */ __syscall_lstat64: ___syscall_lstat64,
+  /** @export */ __syscall_mkdirat: ___syscall_mkdirat,
+  /** @export */ __syscall_newfstatat: ___syscall_newfstatat,
   /** @export */ __syscall_openat: ___syscall_openat,
+  /** @export */ __syscall_readlinkat: ___syscall_readlinkat,
+  /** @export */ __syscall_renameat: ___syscall_renameat,
+  /** @export */ __syscall_rmdir: ___syscall_rmdir,
+  /** @export */ __syscall_stat64: ___syscall_stat64,
+  /** @export */ __syscall_symlinkat: ___syscall_symlinkat,
+  /** @export */ __syscall_unlinkat: ___syscall_unlinkat,
   /** @export */ _abort_js: __abort_js,
+  /** @export */ _emscripten_runtime_keepalive_clear: __emscripten_runtime_keepalive_clear,
   /** @export */ _gmtime_js: __gmtime_js,
   /** @export */ _localtime_js: __localtime_js,
   /** @export */ _mktime_js: __mktime_js,
+  /** @export */ _mmap_js: __mmap_js,
+  /** @export */ _munmap_js: __munmap_js,
   /** @export */ _tzset_js: __tzset_js,
   /** @export */ clock_time_get: _clock_time_get,
   /** @export */ emscripten_date_now: _emscripten_date_now,
   /** @export */ emscripten_get_now: _emscripten_get_now,
   /** @export */ emscripten_resize_heap: _emscripten_resize_heap,
+  /** @export */ emscripten_webgl_make_context_current: _emscripten_webgl_make_context_current,
   /** @export */ environ_get: _environ_get,
   /** @export */ environ_sizes_get: _environ_sizes_get,
+  /** @export */ exit: _exit,
   /** @export */ fd_close: _fd_close,
   /** @export */ fd_fdstat_get: _fd_fdstat_get,
   /** @export */ fd_read: _fd_read,
   /** @export */ fd_seek: _fd_seek,
   /** @export */ fd_write: _fd_write,
+  /** @export */ gal_create_canvas_context,
+  /** @export */ gal_resize_canvas,
+  /** @export */ glActiveTexture: _glActiveTexture,
+  /** @export */ glAttachShader: _glAttachShader,
+  /** @export */ glBindAttribLocation: _glBindAttribLocation,
+  /** @export */ glBindBuffer: _glBindBuffer,
+  /** @export */ glBindFramebuffer: _glBindFramebuffer,
+  /** @export */ glBindTexture: _glBindTexture,
+  /** @export */ glBlendColor: _glBlendColor,
+  /** @export */ glBlendEquationSeparate: _glBlendEquationSeparate,
+  /** @export */ glBlendFuncSeparate: _glBlendFuncSeparate,
+  /** @export */ glBufferData: _glBufferData,
+  /** @export */ glClear: _glClear,
+  /** @export */ glClearColor: _glClearColor,
+  /** @export */ glClearStencil: _glClearStencil,
+  /** @export */ glColorMask: _glColorMask,
+  /** @export */ glCompileShader: _glCompileShader,
+  /** @export */ glCreateProgram: _glCreateProgram,
+  /** @export */ glCreateShader: _glCreateShader,
+  /** @export */ glDeleteBuffers: _glDeleteBuffers,
+  /** @export */ glDeleteFramebuffers: _glDeleteFramebuffers,
+  /** @export */ glDeleteProgram: _glDeleteProgram,
+  /** @export */ glDeleteShader: _glDeleteShader,
+  /** @export */ glDeleteTextures: _glDeleteTextures,
+  /** @export */ glDepthMask: _glDepthMask,
+  /** @export */ glDisable: _glDisable,
+  /** @export */ glDrawArrays: _glDrawArrays,
+  /** @export */ glEnable: _glEnable,
+  /** @export */ glEnableVertexAttribArray: _glEnableVertexAttribArray,
+  /** @export */ glFramebufferTexture2D: _glFramebufferTexture2D,
+  /** @export */ glGenBuffers: _glGenBuffers,
+  /** @export */ glGenFramebuffers: _glGenFramebuffers,
+  /** @export */ glGenTextures: _glGenTextures,
+  /** @export */ glGetIntegerv: _glGetIntegerv,
+  /** @export */ glGetProgramInfoLog: _glGetProgramInfoLog,
+  /** @export */ glGetProgramiv: _glGetProgramiv,
+  /** @export */ glGetShaderInfoLog: _glGetShaderInfoLog,
+  /** @export */ glGetShaderiv: _glGetShaderiv,
+  /** @export */ glGetUniformLocation: _glGetUniformLocation,
+  /** @export */ glLinkProgram: _glLinkProgram,
+  /** @export */ glPixelStorei: _glPixelStorei,
+  /** @export */ glReadPixels: _glReadPixels,
+  /** @export */ glScissor: _glScissor,
+  /** @export */ glShaderSource: _glShaderSource,
+  /** @export */ glStencilFunc: _glStencilFunc,
+  /** @export */ glStencilMask: _glStencilMask,
+  /** @export */ glStencilOp: _glStencilOp,
+  /** @export */ glTexImage2D: _glTexImage2D,
+  /** @export */ glTexParameteri: _glTexParameteri,
+  /** @export */ glTexSubImage2D: _glTexSubImage2D,
+  /** @export */ glUniform1f: _glUniform1f,
+  /** @export */ glUniform1fv: _glUniform1fv,
+  /** @export */ glUniform1i: _glUniform1i,
+  /** @export */ glUniform1iv: _glUniform1iv,
+  /** @export */ glUniform2f: _glUniform2f,
+  /** @export */ glUniform2fv: _glUniform2fv,
+  /** @export */ glUniform2i: _glUniform2i,
+  /** @export */ glUniform3f: _glUniform3f,
+  /** @export */ glUniform4f: _glUniform4f,
+  /** @export */ glUseProgram: _glUseProgram,
+  /** @export */ glVertexAttribPointer: _glVertexAttribPointer,
+  /** @export */ glViewport: _glViewport,
   /** @export */ host_call,
   /** @export */ host_owner,
   /** @export */ host_readonly_get,
   /** @export */ host_release,
-  /** @export */ host_retain
+  /** @export */ host_retain,
+  /** @export */ proc_exit: _proc_exit,
+  /** @export */ system_random_bits
 };
 
 // include: postamble.js

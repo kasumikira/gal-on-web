@@ -1,4 +1,4 @@
-#include "StoragesIntf.h"
+#include "StorageIntf.h"
 #include "TextStream.h"
 #include "BinaryStream.h"
 #include "runtime.h"
@@ -24,10 +24,14 @@ void TVPUnregisterKAGParser(iTJSDispatch2 *owner)
 {
     activeRuntime->forgetOwner(owner);
 }
-static tTVPCompactEventCallbackIntf *compactCallback = nullptr;
+static std::vector<tTVPCompactEventCallbackIntf *> compactCallbacks;
 void TVPAddCompactEventHook(tTVPCompactEventCallbackIntf *callback)
 {
-    compactCallback = callback;
+    compactCallbacks.push_back(callback);
+}
+void TVPRemoveCompactEventHook(tTVPCompactEventCallbackIntf *callback)
+{
+    for (auto &entry : compactCallbacks) if (entry == callback) entry = nullptr;
 }
 void TVPExecuteExpression(const ttstr &expression, iTJSDispatch2 *context, tTJSVariant *result)
 {
@@ -57,16 +61,11 @@ ttstr TVPGetMessageByLocale(const std::string &key)
 }
 [[noreturn]] void TVPThrowExceptionMessage(const tjs_char *message, const ttstr &a)
 {
-    ttstr text(message);
-    text.Replace(TJS_W("%1"), a.c_str());
-    throw eTJSError(text);
+    throw eTJSError(TVPFormatMessage(message, a));
 }
 [[noreturn]] void TVPThrowExceptionMessage(const tjs_char *message, const ttstr &a, const ttstr &b)
 {
-    ttstr text(message);
-    text.Replace(TJS_W("%1"), a.c_str());
-    text.Replace(TJS_W("%2"), b.c_str());
-    throw eTJSError(text);
+    throw eTJSError(TVPFormatMessage(message, a, b));
 }
 [[noreturn]] void TVPThrowExceptionMessage(const tjs_char *message, const ttstr &a, tjs_int b)
 {
@@ -321,7 +320,13 @@ void initializeStorageCallbacks()
 }
 void compactRuntime(tjs_int level)
 {
-    if (compactCallback) compactCallback->OnCompact(level);
+    for (size_t i = 0; i < compactCallbacks.size(); ++i) {
+        if (!compactCallbacks[i]) continue;
+        try { compactCallbacks[i]->OnCompact(level); }
+        catch (const eTJS &error) { activeRuntime->ExceptionPrint(error.GetMessage().c_str()); }
+        catch (const std::exception &error) { activeRuntime->ExceptionPrint(ttstr(error.what()).c_str()); }
+    }
+    std::erase(compactCallbacks, nullptr);
 }
 
 extern "C"

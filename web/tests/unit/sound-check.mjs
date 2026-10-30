@@ -44,7 +44,7 @@ try {
   };
   const vm = await new TJSInterop().init(Object.create(null));
   const Wave = createWaveSoundBufferClass({ async read() { return new Uint8Array([0]); }, async has() { return false; } }, () => context, {
-    enqueueEvent: callback => Promise.resolve().then(callback),
+    enqueueEvent: callback => vm.enqueue(callback),
   });
   const global = Object.create(null);
   vm.registerGlobal('WaveSoundBuffer', Wave);
@@ -60,7 +60,12 @@ try {
   vm.registerGlobal('Plugins', plugins);
   await plugins.link('getSample.dll');
 
-  const run = source => vm.source(source, 'sound-check');
+  const run = source => vm.enqueue(() => vm.source(source, 'sound-check'));
+  const ready = async source => {
+    await run(source);
+    await new Promise(resolve => setImmediate(resolve));
+    await vm.enqueue(() => {});
+  };
   // Same reference formulas as WaveIntf.cpp 131 for a mono 16-bit window.
   const downmix = (from, count) => {
     const result = [];
@@ -73,32 +78,40 @@ try {
   const squaredPeak = samples => (Math.max(...samples.map(Math.abs)) / 32768) ** 2;
 
   assert.equal(await run('return typeof WaveSoundBuffer.setDefaultAheads;'), 'Object');
-  const built = await run(`
+  await ready(`
     WaveSoundBuffer.setDefaultAheads(0);
     var w = new WaveSoundBuffer();
     w.open("voice.ogg");
     w.play();
+  `);
+  const built = await run(`
     var before = w.useVisBuffer;
     var count = w.sampleCount;
     return [before, count, w.sampleAhead, w.useVisBuffer];
   `);
   assert.deepEqual(built, [0, 100, 0, 1], 'first plugin access enables useVisBuffer');
 
-  const value = await run('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play(); return w.sampleValue;');
+  await ready('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play();');
+  const value = await run('return w.sampleValue;');
   assert.equal(value, squaredPeak(downmix(0, 100)), 'sampleValue is the squared peak of the downmixed window');
 
-  const ahead = await run('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.sampleAhead = 1000; w.play(); return w.sampleValue;');
+  await ready('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.sampleAhead = 1000; w.play();');
+  const ahead = await run('return w.sampleValue;');
   assert.equal(ahead, squaredPeak(downmix(1000, 100)), 'sampleAhead shifts the window in samples');
 
-  assert.equal(await run('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play(); var count = w.sampleCount; w.useVisBuffer = 0; return w.sampleValue;'), 0,
+  await ready('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play();');
+  assert.equal(await run('var count = w.sampleCount; w.useVisBuffer = 0; return w.sampleValue;'), 0,
     'useVisBuffer=0 disables the window');
 
-  const average = await run('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play(); w.useVisBuffer = 1; return w.getSample(8);');
+  await ready('var w = new WaveSoundBuffer(); w.open("voice.ogg"); w.play();');
+  const average = await run('w.useVisBuffer = 1; return w.getSample(8);');
   const window = downmix(0, 8).filter(sample => sample >= 0);
   assert.equal(average, Math.trunc(window.reduce((sum, sample) => sum + sample, 0) / window.length),
     'getSample averages the non-negative samples');
 
   console.log('sound-check passed', { value, ahead, average });
+  Wave.stop();
+  await Wave.finalize();
   await vm.dispose();
 } finally {
   await server.close();

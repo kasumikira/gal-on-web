@@ -25,7 +25,7 @@ export class Storages {
     this.saveStorage = saveStorage;
     // Graphic caches include this monotonically increasing generation.  A
     // successful host write therefore cannot leave a decoded pre-write image
-    // in createGraphicLoader's cache.
+    // in the native graphic cache.
     this.revision = 0;
     this.archives = new Map();
     this.autoPaths = [];

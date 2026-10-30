@@ -1,14 +1,16 @@
-// 视频管线浏览器验证：真实 Worker、真实 WASM 解码、真实 WebGL2 上传与真实时钟。
+// Browser verification of the video pipeline: real Worker, WASM decoding, WebGL2 uploads,
+// and a real clock.
 //
-// 两个后端各走一条消费路径：
-//   AlphaMovie  脚本驱动：AmvWorkerSource（专用 Worker）+ VideoPipeline + showNextImage 式取帧
-//   VideoOverlay 时钟驱动：video.js 的 Player（libav/WebCodecs 后端 + 有界队列）
-// 素材都在页面内合成：AMV 用已知的块 alpha 位流（解码结果恒为 128,128,128,128），
-// WebM 用 MediaRecorder 录制一块逐帧变色的画布。
-import { initializeGPU, getGPU } from '/engine-js/gpu.js';
-import { TEXT_BLEND } from '/engine-js/font.js';
-import { Image } from '/engine-js/bitmap.js';
-import { VideoPipeline, presentVideoFrame } from '/engine-js/video-pipeline.js';
+// Each backend is exercised through its own consumption path:
+//   AlphaMovie  script-driven: AmvWorkerSource (dedicated Worker) + VideoPipeline + showNextImage-style frame retrieval
+//   VideoOverlay clock-driven: video.js Player (libav/WebCodecs backend + bounded queue)
+// All media is generated in the page: AMV uses a known block alpha bitstream (decoding
+// always yields 128,128,128,128); WebM is recorded from a canvas whose color changes each frame.
+import { initializeGPU, getGPU } from './gpu-reference.js';
+import { TEXT_BLEND } from '/tests/gpu/font-reference.js';
+import { Image } from './bitmap-reference.js';
+import { VideoPipeline } from '/engine-js/video-pipeline.js';
+import { presentVideoFrame } from './presentation-reference.js';
 import { probeLibavVideo } from '/engine-js/video-libav.js';
 import { Player } from '/engine-js/video.js';
 import { VideoAudio } from '/engine-js/video-audio.js';
@@ -58,9 +60,10 @@ function render() {
   window.videoTestResult = { passed: results.length - failed, failed, results };
 }
 
-// --- 素材合成 -------------------------------------------------------------
-// AMV 素材来自 web/tests/fixtures/amv-fixture.mjs：中性块 alpha 位流解码结果恒为
-// (128,128,128,128)，因此可以把“Worker 解出的字节”和“写进图层的字节”逐字节对照。
+// --- Media generation -----------------------------------------------------
+// AMV media comes from web/tests/fixtures/amv-fixture.mjs. Its neutral block alpha
+// bitstream always decodes to (128,128,128,128), allowing a byte-for-byte comparison
+// between Worker output and the bytes written to the layer.
 const COLORS = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
 async function recordClip() {
   const canvas = document.createElement('canvas');
@@ -84,13 +87,13 @@ async function recordClip() {
   return new Uint8Array(await new Blob(chunks).arrayBuffer());
 }
 
-// --- 图层桩：真实 Image + 共享 GPU，只有状态查询被替换 ---------------------
+// --- Layer stub: real Image and shared GPU; only state queries are replaced ------------
 function createLayerTarget(width, height) {
   const node = { image: new Image(width, height), width: 0, height: 0, left: 0, top: 0, imageModified: false };
   const Layer = {
     peekState: () => ({ node }),
     peekNode: () => node,
-    // 真实 Layer::SetSize 只增不减；这里保持同样语义，便于验证行距写入。
+    // Real Layer::SetSize only grows the layer; preserve that behavior to verify row-stride writes.
     resizeNode: (target, w, h) => { target.width = w; target.height = h; },
   };
   return { node, Layer };
@@ -104,7 +107,7 @@ function preview(id, node) {
   context.putImageData(new ImageData(new Uint8ClampedArray(node.image.pixels), node.image.width, node.image.height), 0, 0);
 }
 
-// --- 检查 -----------------------------------------------------------------
+// --- Checks ----------------------------------------------------------------
 async function main() {
   const info = document.createElement('div');
   info.id = 'gpu';
@@ -137,26 +140,6 @@ async function main() {
       } finally { await audio.dispose(); }
     }
     return '44.1kHz to 48kHz, pause/resume, rate=1 and 2: native PCM output correct';
-  });
-
-  await check('GPU tiled linear sampling matches unsplit textures', () => {
-    const source = new Image(8, 2), normal = new Image(16, 4), tiled = new Image(16, 4);
-    const limit = gpu.maxTextureSize;
-    try {
-      const pixels = source.writablePixels;
-      for (let y = 0; y < 2; y++) for (let x = 0; x < 8; x++) {
-        pixels[(y * 8 + x) * 4] = x * 32; pixels[(y * 8 + x) * 4 + 3] = 255;
-      }
-      gpu.texture(normal); gpu.texture(tiled);
-      const options = { matrix: [2,0,0,2,0,0], mode: 1, copySourceAlpha: true, smooth: true };
-      gpu.draw(normal, source, options);
-      gpu.maxTextureSize = 4;
-      gpu.draw(tiled, source, options);
-      const expected = normal.pixels, actual = tiled.pixels;
-      const error = expected.reduce((max, value, i) => Math.max(max, Math.abs(value - actual[i])), 0);
-      assertEqual(error, 0, 'tile borders participate in linear sampling');
-      return 'all RGBA pixels identical, maximum error=0';
-    } finally { gpu.maxTextureSize = limit; source.release(); normal.release(); tiled.release(); }
   });
 
   await check('AMV Worker 后端：脚本驱动逐帧取帧，图层字节与 Worker 解出一致', async () => {
@@ -211,7 +194,7 @@ async function main() {
     pipeline.start();
     await waitFor(() => pipeline.length === 1, '解出唯一一帧');
     const frame = pipeline.shift();
-    const { node, Layer } = createLayerTarget(24, 24);   // 图像大于帧
+    const { node, Layer } = createLayerTarget(24, 24);   // Image is larger than the frame.
     node.image.pixels.fill(7);
     await presentVideoFrame([{}], frame, { Layer, left: 0, top: 0, repaint: () => {} });
     const pixels = node.image.pixels;
@@ -234,7 +217,8 @@ async function main() {
     assert(probed.numberOfFrame >= 5, `帧数 ${probed.numberOfFrame}`);
 
     const { node, Layer } = createLayerTarget(64, 48);
-    // 无音轨片段：时钟走 performance.now()，AudioContext 只需提供 resume/currentTime。
+    // For a clip without audio, use performance.now() as the clock; AudioContext only
+    // needs to provide resume/currentTime.
     const context = { currentTime: 0, resume: async () => {} };
     const player = new Player(probed, () => context, window);
     const presented = [];

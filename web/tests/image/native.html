@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>native 图像解码验证</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 16px; color: #111; background: #fbfbfb; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #summary { font-weight: 600; margin-bottom: 8px; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #ddd; padding: 2px 8px; text-align: left; }
+  tr.fail td { background: #ffecec; }
+</style>
+</head>
+<body>
+<h1>native 图像解码验证</h1>
+<div id="summary">运行中…</div>
+<table id="report"><thead><tr><th>用例</th><th>结果</th><th>说明</th></tr></thead><tbody></tbody></table>
+<script>
+// If a module script fails during import, its body never runs and the error handler above
+// cannot catch it. Use a regular script as a watchdog so the page cannot silently remain
+// stuck on "Running…".
+setTimeout(() => {
+  if (window.imageTestResult) return;
+  document.getElementById('summary').textContent =
+    'FAIL — 20 秒内没有结果（模块加载或初始化卡住），详见控制台';
+}, 20000);
+</script>
+<script type="module">
+// Verify decoding only: the page generates bytes according to each format specification,
+// then compares native-decoded pixels with the source byte for byte.
+// Do not load the VM, storage, or audio, so runtime issues cannot affect decode results.
+import createModule from '../../engine-js/tjs-runtime/tjs-runtime.js';
+import { encodeTLG } from '../fixtures/tlg-encode.js';
+
+const results = [];
+const globalErrors = [];
+window.addEventListener('error', event => globalErrors.push(String(event.message)));
+function record(name, pass, detail = '') { results.push({ name, pass: !!pass, detail }); }
+
+// If a top-level await throws, the page could remain stuck on "Running…". Surface module
+// load failures and unhandled rejections in the summary row to make these failures visible.
+function fatal(error) {
+  const text = String(error?.stack ?? error);
+  document.getElementById('summary').textContent = `FAIL — ${text}`;
+  console.error(error);
+}
+window.addEventListener('error', event => fatal(event.error ?? event.message));
+window.addEventListener('unhandledrejection', event => fatal(event.reason));
+
+const summaryNode = document.getElementById('summary');
+summaryNode.textContent = '加载运行时…';
+const module = await createModule({
+  locateFile: () => new URL('../../engine-js/tjs-runtime/tjs-runtime.wasm', import.meta.url).href,
+});
+summaryNode.textContent = '解码中…';
+
+const CL_NONE = 0x1fffffff;
+const CL_ADAPT = 0x01ffffff;
+
+function lastError() {
+  const scratch = module._malloc(1024);
+  const length = module._gal_image_last_error(scratch, 1024);
+  const text = length ? new TextDecoder().decode(new Uint8Array(module.HEAPU8.buffer, scratch, length)) : '';
+  module._free(scratch);
+  return text;
+}
+
+// Copy bytes into the WASM heap, decode, then copy the result back to JS. The pixel pointer
+// stays in native code; in production, this buffer is used directly as the texture source.
+function decodeNative(bytes, key = CL_NONE, mode = 0) {
+  const ptr = module._malloc(bytes.length);
+  module.HEAPU8.set(bytes, ptr);
+  const handle = module._gal_image_decode(ptr, bytes.length, key, mode);
+  module._free(ptr);
+  if (!handle) return { error: lastError() };
+  const width = module._gal_image_width(handle), height = module._gal_image_height(handle);
+  const channels = module._gal_image_channels(handle);
+  const pointer = module._gal_image_pixels(handle);
+  const size = width * height * channels;
+  const pixels = module.HEAPU8.slice(pointer, pointer + size);
+  module._gal_image_release(handle);
+  return { width, height, channels, pixels: new Uint8Array(pixels) };
+}
+
+//---------------------------------------------------------------------------
+// Generate PNG with stored deflate so pixels are fully controlled and browser encoders
+// or color management cannot affect the result.
+//---------------------------------------------------------------------------
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function adler32(bytes) {
+  let a = 1, b = 0;
+  for (const byte of bytes) { a = (a + byte) % 65521; b = (b + a) % 65521; }
+  return ((b << 16) | a) >>> 0;
+}
+function zlibStored(raw) {
+  // A complete zlib stream is a 2-byte header (CMF/FLG: deflate, 32K window, no dictionary,
+  // fastest compression level), followed by the deflate block and Adler-32.
+  // Without the header, libpng fails with "IDAT: incorrect header check".
+  const out = [0x78, 0x01];
+  let position = 0;
+  do {
+    const length = Math.min(65535, raw.length - position);
+    const final = position + length >= raw.length;
+    out.push(final ? 1 : 0);
+    out.push(length & 0xff, (length >> 8) & 0xff, ~length & 0xff, (~length >> 8) & 0xff);
+    for (let i = 0; i < length; i++) out.push(raw[position + i]);
+    position += length;
+  } while (position < raw.length);
+  const sum = adler32(raw);
+  out.push((sum >>> 24) & 0xff, (sum >>> 16) & 0xff, (sum >>> 8) & 0xff, sum & 0xff);
+  return new Uint8Array(out);
+}
+function pngChunk(type, data) {
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  const crcInput = out.subarray(4, 8 + data.length);
+  view.setUint32(8 + data.length, crc32(crcInput));
+  return out;
+}
+// colorType: 0 grayscale / 2 RGB / 3 palette / 6 RGBA
+function encodePNG({ width, height, colorType, pixels, palette, trns, bitDepth = 8 }) {
+  const samples = { 0: 1, 2: 3, 3: 1, 6: 4 }[colorType];
+  const stride = width * samples;
+  const raw = new Uint8Array(height * (stride + 1));
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: None
+    raw.set(pixels.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
+  }
+  const ihdr = new Uint8Array(13);
+  const ihdrView = new DataView(ihdr.buffer);
+  ihdrView.setUint32(0, width); ihdrView.setUint32(4, height);
+  ihdr[8] = bitDepth; ihdr[9] = colorType; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const parts = [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr)];
+  if (palette) parts.push(pngChunk('PLTE', palette));
+  if (trns) parts.push(pngChunk('tRNS', trns));
+  parts.push(pngChunk('IDAT', zlibStored(raw)), pngChunk('IEND', new Uint8Array(0)));
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) { out.set(part, offset); offset += part.length; }
+  return out;
+}
+
+function samePixels(actual, expected) {
+  if (actual.length !== expected.length) return `长度 ${actual.length} != ${expected.length}`;
+  for (let i = 0; i < actual.length; i++) {
+    if (actual[i] !== expected[i]) {
+      const pixel = Math.floor(i / 4), channel = i % 4;
+      return `首个差异 @像素${pixel} 通道${channel}: ${actual[i]} != ${expected[i]}`;
+    }
+  }
+  return '';
+}
+const hex = value => '#' + value.toString(16).padStart(8, '0');
+
+// 1. Pass-through RGBA: every pixel has distinct color and alpha values, catching channel swaps.
+{
+  const width = 4, height = 2;
+  const source = new Uint8Array([
+    255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 255, 255, 255, 64,
+    10, 20, 30, 200, 40, 50, 60, 255, 70, 80, 90, 1, 100, 110, 120, 250,
+  ]);
+  const result = decodeNative(encodePNG({ width, height, colorType: 6, pixels: source }));
+  const diff = result.error ?? samePixels(result.pixels, source);
+  record('PNG RGBA 直通（颜色通道与 alpha）', !diff,
+    diff || `${result.width}x${result.height} 通道 ${result.channels}`);
+}
+
+// 2. PNG RGB (no alpha channel) -> opaque
+{
+  const width = 2, height = 1;
+  const source = new Uint8Array([12, 34, 56, 200, 150, 100]);
+  const result = decodeNative(encodePNG({ width, height, colorType: 2, pixels: source }));
+  const expected = new Uint8Array([12, 34, 56, 255, 200, 150, 100, 255]);
+  const diff = result.error ?? samePixels(result.pixels, expected);
+  record('PNG RGB 展开为不透明 32bit', !diff, diff || '');
+}
+
+// 3. PNG palette + tRNS
+{
+  const width = 4, height = 1;
+  const palette = new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 9, 9]);
+  const pixels = new Uint8Array([0, 1, 2, 3]);
+  const trns = new Uint8Array([0, 128]); // Index 0 is fully transparent; index 1 is half-transparent.
+  const result = decodeNative(encodePNG({ width, height, colorType: 3, pixels, palette, trns }));
+  const expected = new Uint8Array([255, 0, 0, 0, 0, 255, 0, 128, 0, 0, 255, 255, 9, 9, 9, 255]);
+  const diff = result.error ?? samePixels(result.pixels, expected);
+  record('PNG 调色板展开与 tRNS 透明度', !diff, diff || '');
+}
+
+// 4. 8-bit grayscale: glmNormal expands to opaque pixels; glmGrayscale keeps one channel.
+{
+  const width = 4, height = 1;
+  const source = new Uint8Array([0, 64, 128, 255]);
+  const bytes = encodePNG({ width, height, colorType: 0, pixels: source });
+  const normal = decodeNative(bytes);
+  const expected = new Uint8Array([0, 0, 0, 255, 64, 64, 64, 255, 128, 128, 128, 255, 255, 255, 255, 255]);
+  const normalDiff = normal.error ?? samePixels(normal.pixels, expected);
+  record('灰度 PNG → 不透明 32bit', !normalDiff, normalDiff || '');
+
+  const gray = decodeNative(bytes, CL_NONE, 2);
+  const grayDiff = gray.error ?? (gray.channels === 1 ? samePixels(gray.pixels, source) : `通道 ${gray.channels}`);
+  record('灰度 PNG → glmGrayscale 单通道', !grayDiff, grayDiff || '');
+}
+
+// 5. Adaptive color key: make the most frequent color in the first row transparent.
+{
+  const width = 4, height = 2;
+  const source = new Uint8Array([
+    0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 200, 10, 10, 255,
+    0, 255, 0, 255, 7, 8, 9, 255, 0, 255, 0, 255, 1, 2, 3, 255,
+  ]);
+  const result = decodeNative(encodePNG({ width, height, colorType: 6, pixels: source }), CL_ADAPT);
+  const expected = new Uint8Array([
+    0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 200, 10, 10, 255,
+    0, 255, 0, 0, 7, 8, 9, 255, 0, 255, 0, 0, 1, 2, 3, 255,
+  ]);
+  const diff = result.error ?? samePixels(result.pixels, expected);
+  record('自适应色键（首行众数颜色）', !diff, diff || '');
+}
+
+// 6. Constant color key 0x00RRGGBB
+{
+  const width = 2, height = 1;
+  const source = new Uint8Array([0, 255, 0, 255, 9, 9, 9, 255]);
+  const result = decodeNative(encodePNG({ width, height, colorType: 6, pixels: source }), 0x00ff00);
+  const expected = new Uint8Array([0, 255, 0, 0, 9, 9, 9, 255]);
+  const diff = result.error ?? samePixels(result.pixels, expected);
+  record('常量色键（key=0x00FF00）', !diff, diff || '');
+}
+
+// Use an asymmetric color key so green cannot hide an R/B swap.
+{
+  const source = new Uint8Array([255, 0, 0, 255, 0, 0, 255, 255]);
+  const result = decodeNative(encodePNG({ width: 2, height: 1, colorType: 6, pixels: source }), 0xff0000);
+  const diff = result.error ?? samePixels(result.pixels, new Uint8Array([255, 0, 0, 0, 0, 0, 255, 255]));
+  record('常量红色色键保持 RGBA 顺序', !diff, diff || '');
+}
+
+{
+  const palette = new Uint8Array([255, 0, 0, 0, 0, 255]);
+  const bytes = encodePNG({ width: 2, height: 1, colorType: 3,
+    pixels: new Uint8Array([0, 1]), palette });
+  const indices = decodeNative(bytes, CL_NONE, 1);
+  const indicesDiff = indices.error ?? (indices.channels !== 1 ? `通道 ${indices.channels}` :
+    samePixels(indices.pixels, new Uint8Array([0, 1])));
+  record('调色板索引输出为单通道', !indicesDiff, indicesDiff || '');
+  const rgb = decodeNative(bytes, 0xff0000);
+  const rgbDiff = rgb.error ?? samePixels(rgb.pixels, new Uint8Array([255, 0, 0, 0, 0, 0, 255, 255]));
+  record('调色板 PNG 的 RGB 色键不作为索引传递', !rgbDiff, rgbDiff || '');
+  const index = decodeNative(bytes, 0x03000001);
+  const indexDiff = index.error ?? samePixels(index.pixels, new Uint8Array([255, 0, 0, 255, 0, 0, 255, 0]));
+  record('调色板 PNG 只透明指定索引', !indexDiff, indexDiff ? `${indexDiff}; pixels=${index.pixels}` : '');
+}
+
+// The native Layer loader and independent byte API now share BMP/WebP routing.
+{
+  const bytes = new Uint8Array(70), header = new DataView(bytes.buffer);
+  bytes.set([0x42, 0x4d]);
+  header.setUint32(2, bytes.length, true);
+  header.setUint32(10, 54, true); header.setUint32(14, 40, true);
+  header.setInt32(18, 2, true); header.setInt32(22, 2, true);
+  header.setUint16(26, 1, true); header.setUint16(28, 24, true);
+  bytes.set([255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0], 54);
+  const result = decodeNative(bytes);
+  const diff = result.error ?? samePixels(result.pixels,
+    new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]));
+  record('BMP 24bit 行距、上下翻转与 BGR 通道展开', !diff, diff || '');
+}
+{
+  const canvas = new OffscreenCanvas(3, 3), context = canvas.getContext('2d');
+  context.fillStyle = '#ff0000'; context.fillRect(0, 0, 3, 3);
+  const blob = await canvas.convertToBlob({ type: 'image/webp', quality: 1 });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const result = decodeNative(bytes);
+  const valid = !result.error && result.width === 3 && result.height === 3 &&
+    result.channels === 4 && result.pixels.every((v, i) => Math.abs(v - [255, 0, 0, 255][i % 4]) <= 3);
+  record('WebP 解码与奇数尺寸', valid, result.error || '');
+  const gray = decodeNative(bytes, CL_NONE, 2);
+  record('WebP 奇数尺寸灰度输出', !gray.error && gray.channels === 1 && gray.pixels.length === 9 &&
+    gray.pixels.every(v => Math.abs(v - 82) <= 2), gray.error || `channels=${gray.channels}`);
+}
+
+// 7. TLG5 / TLG6 round trip: use the existing JS encoder (save path) and native decoder.
+for (const mode of ['tlg5', 'tlg6']) {
+  const width = 8, height = 8;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      pixels[i] = (x * 31) & 0xff; pixels[i + 1] = (y * 29) & 0xff;
+      pixels[i + 2] = ((x + y) * 13) & 0xff; pixels[i + 3] = 255;
+    }
+  }
+  // The encoder reads image.pixels (the RGBA source buffer), following the same convention as the save path.
+  const bytes = encodeTLG({ width, height, pixels }, mode);
+  const result = decodeNative(bytes);
+  const diff = result.error ?? samePixels(result.pixels, new Uint8Array(pixels));
+  record(`${mode.toUpperCase()} 往返${mode === 'tlg6' ? '（TLG6 块解码）' : '（TLG5 平面解码）'}`,
+    !diff, diff || `${bytes.length} 字节`);
+}
+
+// 8. JPEG: encode in the browser and decode natively; compare the mean error against browser decoding.
+{
+  const width = 32, height = 32;
+  const canvas = new OffscreenCanvas(width, height);
+  const context = canvas.getContext('2d');
+  const gradient = context.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, '#ff0000'); gradient.addColorStop(1, '#0000ff');
+  context.fillStyle = gradient; context.fillRect(0, 0, width, height);
+  context.fillStyle = '#00ff00'; context.fillRect(8, 8, 16, 16);
+  const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+
+  const result = decodeNative(bytes);
+  let reference = null;
+  try {
+    const bitmap = await createImageBitmap(new Blob([bytes]), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    const refCanvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const refContext = refCanvas.getContext('2d', { willReadFrequently: true });
+    refContext.drawImage(bitmap, 0, 0);
+    reference = refContext.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    bitmap.close();
+  } catch { /* Check dimensions only if browser decoding fails. */ }
+
+  if (result.error) {
+    record('JPEG 解码', false, result.error);
+  } else if (result.width !== width || result.height !== height) {
+    record('JPEG 解码', false, `尺寸 ${result.width}x${result.height}`);
+  } else if (result.channels !== 4) {
+    record('JPEG 解码', false, `通道 ${result.channels}，应为 4（ARGB）`);
+  } else if (!reference) {
+    record('JPEG 解码', true, `${result.width}x${result.height}，浏览器未提供对照`);
+  } else {
+    let total = 0;
+    for (let i = 0; i < width * height * 4; i += 4) {
+      for (let c = 0; c < 3; c++) total += Math.abs(result.pixels[i + c] - reference[i + c]);
+      total += Math.abs(result.pixels[i + 3] - 255);
+    }
+    const mean = total / (width * height * 4);
+    record('JPEG 解码（与浏览器解码的平均误差）', mean < 6, `平均误差 ${mean.toFixed(2)}`);
+  }
+}
+
+// 9. Unknown formats must fail explicitly; do not silently return an empty image.
+{
+  const result = decodeNative(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]));
+  record('未知格式报错', !result.pixels && !!result.error, result.error ?? '未返回错误');
+}
+
+// Pre-rendered fonts: native owns the image and uses the reference UTF-16 index/RLE.
+for (const version of [0, 1]) {
+  const packed = version === 0 ? [16, 0x41, 2, 64] : [16, 0x42, 64];
+  const bytes = new Uint8Array(102 + packed.length);
+  bytes.set(new TextEncoder().encode('TVP pre-rendered font\x1a'));
+  bytes[22] = version; bytes[23] = 2;
+  const view = new DataView(bytes.buffer);
+  view.setUint32(24, 3, true); view.setUint32(28, 36, true); view.setUint32(32, 42, true);
+  [32, 65, 0x4e2d].forEach((ch, i) => view.setUint16(36 + i * 2, ch, true));
+  // A zero-sized space and two glyphs sharing compressed image bytes.
+  for (let i = 0; i < 3; i++) {
+    const offset = 42 + i * 20;
+    view.setUint32(offset, 102, true);
+    view.setUint16(offset + 4, i ? 2 : 0, true);
+    view.setUint16(offset + 6, i ? 2 : 0, true);
+    [-2, 9, 7, -1, 8].forEach((value, n) => view.setInt16(offset + 8 + n * 2, value, true));
+  }
+  bytes.set(packed, 102);
+  const input = module._malloc(bytes.length), output = module._malloc(64);
+  module.HEAPU8.set(bytes, input);
+  const font = module._gal_font_open(input, bytes.length);
+  // Opening owns a copy; callers may immediately release or reuse their input.
+  module.HEAPU8.fill(0, input, input + bytes.length);
+  module._free(input);
+  try {
+    record(`预渲染字体 v${version} 打开`, font > 0);
+    const found = module._gal_font_glyph_metrics(font, 0x4e2d, output);
+    const metrics = Array.from(new Int32Array(module.HEAPU8.buffer, output, 8));
+    record(`预渲染字体 v${version} 索引与有符号度量`, found === 1 &&
+      metrics.join() === '2,2,-2,9,7,-1,8,0', metrics.join());
+    module.HEAPU8.fill(99, output, output + 8);
+    const decoded = module._gal_font_glyph_read(font, 65, output, 4);
+    const pixels = Array.from(module.HEAPU8.slice(output, output + 8));
+    record(`预渲染字体 v${version} RLE、65级覆盖率与行距`, decoded === 1 &&
+      pixels.join() === '64,64,64,255,64,255,99,99', pixels.join());
+    record(`预渲染字体 v${version} 缺字与空白字形`,
+      module._gal_font_glyph_metrics(font, 64, output) === 0 &&
+      module._gal_font_glyph_read(font, 32, 0, 0) === 1);
+    record(`预渲染字体 v${version} 拒绝短行距`,
+      module._gal_font_glyph_read(font, 65, output, 1) === -1);
+  } finally {
+    module._gal_font_release(font);
+    module._free(output);
+  }
+}
+
+const passed = results.filter(item => item.pass).length;
+const tbody = document.querySelector('#report tbody');
+for (const item of results) {
+  const row = document.createElement('tr');
+  if (!item.pass) row.className = 'fail';
+  row.innerHTML = `<td>${item.name}</td><td>${item.pass ? 'PASS' : 'FAIL'}</td><td>${item.detail}</td>`;
+  tbody.append(row);
+}
+document.getElementById('summary').textContent = `${passed}/${results.length} 通过`;
+window.imageTestResult = { passed, total: results.length, results, globalErrors };
+</script>
+</body>
+</html>

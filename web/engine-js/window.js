@@ -1,10 +1,10 @@
 import { config } from './global.js';
 import { nativeClass, nativeMethod, nativeEvent, nativeProperty, unimplemented, script, readScript, constructNative, nativeOwner, retainScriptValue, disposeScriptValue, windowObjects } from '#krkr/native';
 import { number, truth } from '#krkr/values';
+import { setKeyState, clearKeyStates, virtualKeyCode, virtualKeySide } from './key-state.js';
 
 // WindowIntf.cpp / WindowImpl.cpp, with the native form represented by a
-// browser canvas. Layer rendering attaches to this form separately (the
-// compositor lives in layer-composite.js and is wired through attachCompositor).
+// browser canvas. Original native LayerManager owns the tree, focus and composition.
 export function createBasicDrawDeviceClass() {
   let nextHandle = 1;
   @nativeClass('BasicDrawDevice')
@@ -26,8 +26,9 @@ export function createBasicDrawDeviceClass() {
 
 export function createWindowClass(BasicDrawDevice) {
   const { document, container } = config;
-  const resize = (state,width,height) => {
+  const resize = (state,width,height,explicit = false) => {
     width = Math.trunc(Number(width)); height = Math.trunc(Number(height));
+    if (explicit) state.sizeExplicit = true;
     if (state.width === width && state.height === height) return;
     state.width = width; state.height = height;
     state.canvas.width = state.width; state.canvas.height = state.height;
@@ -40,15 +41,24 @@ export function createWindowClass(BasicDrawDevice) {
       canvas.width = 0; canvas.height = 0; canvas.hidden = true;
       canvas.style.maxWidth = '100%'; canvas.style.maxHeight = '100%';
       canvas.style.touchAction = 'none';
+      canvas.style.outline = 'none';
       canvas.addEventListener('pointermove', () => { canvas.style.cursor = ''; });
       container.append(canvas);
       const state = {
         owner, canvas, handle: Array.from(Window.instances.values()).length + 1,
         width: 0, height: 0, visible: false, fullScreen: false, caption: '', enabled: true,
-        layers: [], primaryLayer: null, focusedLayer: null, modalLayers: [],
         hint: '', hintSender: null, attentionPoint: null,
-        defaultImeMode: 0, activeImeMode: null, touchCaptures: new Map(),
+        defaultImeMode: 0, activeImeMode: null,
         messageHooks: new Set(), allMessageHooks: false,
+        sizeExplicit: false,
+      };
+      // Reference window resize semantics: the window follows its primary
+      // layer unless the game explicitly chose a window size (Window.setSize
+      // or width/height).  Present() scales either way.
+      state.applyLayerSize = (width,height) => {
+        width = Math.trunc(Number(width)); height = Math.trunc(Number(height));
+        state.sourceWidth = width; state.sourceHeight = height;
+        if (!state.sizeExplicit && width > 0 && height > 0) resize(state,width,height);
       };
       // These callbacks model the layer-tree owner notifications used by the
       // native manager. A browser canvas has no Win32 caret/IME host, but the
@@ -74,10 +84,6 @@ export function createWindowClass(BasicDrawDevice) {
         state.activeImeMode = null;
         if (state.onResetImeMode) state.onResetImeMode();
       };
-      state.releaseTouchCapture = (id, all = false) => {
-        if (all) state.touchCaptures.clear();
-        else state.touchCaptures.delete(Number(id) >>> 0);
-      };
       return state;
     }
 
@@ -92,11 +98,11 @@ export function createWindowClass(BasicDrawDevice) {
     }
     @nativeMethod setSize(width,height) {
       if (arguments.length<2) throw new Error('TJS Window.setSize requires width and height');
-      resize(this,width,height);
+      resize(this,width,height,true);
     }
     @nativeMethod setInnerSize(width,height) {
       if (arguments.length<2) throw new Error('TJS Window.setInnerSize requires width and height');
-      resize(this,width,height);
+      resize(this,width,height,true);
     }
     @nativeMethod setPos(x,y){ if(arguments.length<2) throw new Error('TJS Window.setPos requires 2 arguments'); }
     @nativeMethod setLayerPos(x,y){ if(arguments.length<2) throw new Error('TJS Window.setLayerPos requires 2 arguments'); }
@@ -192,13 +198,13 @@ export function createWindowClass(BasicDrawDevice) {
       return disposeScriptValue(previous);
     }
     @nativeProperty get width() { return this.width; }
-    @nativeProperty set width(value) { resize(this,value,this.height); }
+    @nativeProperty set width(value) { resize(this,value,this.height,true); }
     @nativeProperty get height() { return this.height; }
-    @nativeProperty set height(value) { resize(this,this.width,value); }
+    @nativeProperty set height(value) { resize(this,this.width,value,true); }
     @nativeProperty get innerWidth() { return this.width; }
-    @nativeProperty set innerWidth(value) { resize(this,value,this.height); }
+    @nativeProperty set innerWidth(value) { resize(this,value,this.height,true); }
     @nativeProperty get innerHeight() { return this.height; }
-    @nativeProperty set innerHeight(value) { resize(this,this.width,value); }
+    @nativeProperty set innerHeight(value) { resize(this,this.width,value,true); }
     @nativeProperty get caption() { return this.caption; }
     @nativeProperty set caption(value) { this.caption = String(value); document.title = this.caption; }
     @nativeProperty get enabled() { return Number(this.enabled); }
@@ -241,46 +247,7 @@ export function createWindowClass(BasicDrawDevice) {
     @nativeProperty set fullScreen(value) { this.fullScreen = !!truth(value); }
     @nativeProperty get waitVSync() { return 0; }
     @nativeProperty set waitVSync(value) {}
-    @nativeProperty get layerTreeOwnerInterface() { return this.owner; }
-    @nativeProperty get primaryLayer() {
-      const s = this;
-      // WindowIntf.cpp primaryLayer getter throws when no layer is attached.
-      if(!s.primaryLayer) throw new Error('TJS window has no layer');
-      return s.primaryLayer.owner;
-    }
-    @nativeProperty get focusedLayer() {
-      const s = this;
-      return s.focusedLayer?.owner ?? null;
-    }
-    // WindowIntf.cpp delegates to LayerManager::SetFocusTo(layer, false).
-    @nativeProperty set focusedLayer(value) {
-      const s = this;
-      const resolve = value => {
-        const owner = nativeOwner(value);
-        if (owner == null) return null;
-        return Window.getLayerNode(owner);
-      };
-      const ref = node => node?.owner ?? null;
-      const focusable = async node => !node || truth(await script(node.owner).nodeFocusable);
-      return (async () => {
-        let node = resolve(value);
-        if (!await focusable(node)) return;
-        if (node) {
-          node.focusWork = node;
-          await script(node.owner).onBeforeFocus(ref(node),ref(s.focusedLayer),0);
-          node = node.focusWork;
-        }
-        if (!await focusable(node) || s.focusedLayer === node) return;
-        if (s.focusChangeLock) throw new Error('TJS cannot change focus while processing focus');
-        s.focusChangeLock = true;
-        const previous = s.focusedLayer;
-        s.focusedLayer = node;
-        try {
-          if (previous) await script(previous.owner).onBlur(ref(node));
-          if (s.focusedLayer) await script(s.focusedLayer.owner).onFocus(ref(previous),0);
-        } finally { s.focusChangeLock = false; }
-      })();
-    }
+
   }
   Window.invalidate = async owner => {
     const state = Window.state(owner);
@@ -367,4 +334,195 @@ export function createWindowClass(BasicDrawDevice) {
     return notifications[Math.trunc(number(num))] ?? '';
   }, { static: true });
   return Window;
+}
+
+
+// The native renderer owns one GL context. Browser windows receive only its
+// finished frame; no layer state or tree traversal crosses this platform edge.
+export async function attachNativeCompositor(Window, vm, document, { canvas, enqueueEvent, reportError }) {
+  const view = document.defaultView;
+  let nativeModule = vm.module;
+  if (!nativeModule._gal_render_initialize(1, 1)) throw new Error('Unable to initialize native GLES');
+  await vm.visualWindow(4, Window);
+  const pending = new Map(), listeners = [];
+  let stopped = false, queued = false, raf = null, events = false, continuous = false;
+  const listen = (target, name, callback, options) => {
+    target.addEventListener(name, callback, options);
+    listeners.push(() => target.removeEventListener(name, callback, options));
+  };
+  listen(canvas, 'webglcontextlost', event => {
+    event.preventDefault();
+    enqueueEvent(() => nativeModule._gal_render_context_lost()).catch(reportError);
+  });
+  listen(canvas, 'webglcontextrestored', () => {
+    enqueueEvent(() => {
+      nativeModule._gal_render_context_restored();
+      for (const state of Window.instances.values()) requestPaint(state);
+    }).catch(reportError);
+  });
+  const schedule = () => {
+    if (stopped || queued || raf !== null) return;
+    raf = view.requestAnimationFrame(() => {
+      raf = null;
+      queued = true;
+      let paints = [];
+      enqueueEvent(async () => {
+        if (stopped) return;
+        if (events) { events = false; await vm.visualEvents(1); }
+        if (continuous) await vm.visualEvents(2);
+        paints = [...pending];
+        pending.clear();
+        for (const [state, owner] of paints) {
+          if (!vm.isValid(owner) || state.width <= 0 || state.height <= 0) continue;
+          await vm.visualWindow(2, owner, undefined, state.width, state.height);
+          await vm.visualWindow(1, owner);
+          const context = state.canvas.getContext('2d');
+          context.globalCompositeOperation = 'copy';
+          context.drawImage(canvas, 0, 0);
+        }
+      }, async () => {
+        for (const [, owner] of paints) await disposeScriptValue(owner);
+      }).catch(reportError).finally(() => {
+        queued = false;
+        if (!stopped && (events || continuous || pending.size)) schedule();
+      });
+    });
+  };
+  const requestPaint = state => {
+    if (stopped) return;
+    if (!pending.has(state)) pending.set(state, retainScriptValue(state.owner));
+    schedule();
+  };
+  await vm.visualEvents(0, {
+    schedule() { events = true; schedule(); },
+    continuous(enabled) { continuous = !!enabled; if (continuous) schedule(); },
+  });
+  const dispatch = (state, callback) => {
+    if (stopped) return;
+    const owner = retainScriptValue(state.owner);
+    enqueueEvent(async () => {
+      if (vm.isValid(owner) && state.enabled) await callback(owner);
+    }, () => disposeScriptValue(owner)).catch(reportError);
+  };
+  const flags = e => (e.shiftKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.ctrlKey ? 4 : 0)
+    | ((e.buttons & 1) ? 8 : 0) | ((e.buttons & 2) ? 16 : 0) | ((e.buttons & 4) ? 32 : 0);
+  const button = e => e.button === 1 ? 2 : e.button === 2 ? 1 : e.button;
+  // TJS uses Windows wheel deltas: up is +120, down is -120.
+  // DOM deltaY has the opposite sign.
+  const wheelDelta = e => e.deltaY === 0 ? 0 : e.deltaY < 0 ? 120 : -120;
+  const coordinates = (state, e) => {
+    const rect = state.canvas.getBoundingClientRect();
+    return [Math.round((e.clientX - rect.left) * state.canvas.width / rect.width),
+      Math.round((e.clientY - rect.top) * state.canvas.height / rect.height)];
+  };
+  const wire = async state => {
+    let pointerId = null;
+    state.canvas.tabIndex = 0;
+    await vm.visualWindow(0, state.owner, {
+      paint() { requestPaint(state); },
+      layerSize(width, height) {
+        // Native NotifyLayerResize: the window follows the primary layer
+        // unless the game set its own size (see state.applyLayerSize).
+        state.applyLayerSize?.(width, height);
+        requestPaint(state);
+      },
+      cursor(value) { state.canvas.style.cursor = value === -1 ? 'none' : ''; },
+      cursorPosition(x, y) { state.mousePosition = { x, y }; },
+      releaseCapture() {
+        if (pointerId !== null && state.canvas.hasPointerCapture(pointerId))
+          state.canvas.releasePointerCapture(pointerId);
+        pointerId = null;
+      },
+      hint(sender, text) { state.hint = text; state.canvas.title = text; },
+      attention(x, y) { state.attentionPoint = { x, y }; },
+      disableAttention() { state.attentionPoint = null; },
+      ime(mode) { state.activeImeMode = mode; },
+      resetIme() { state.activeImeMode = null; },
+    });
+    const input = (kind, x, y, value = 0, shift = 0, cx = 0, cy = 0) =>
+      dispatch(state, owner => vm.visualWindow(3, owner, undefined, x, y, kind, value, shift, cx, cy));
+    const touch = (kind, e, x, y) => {
+      const rect = state.canvas.getBoundingClientRect();
+      input(kind, x, y, e.pointerId, 0,
+        e.width * state.canvas.width / rect.width, e.height * state.canvas.height / rect.height);
+    };
+    listen(state.canvas, 'pointermove', e => {
+      const [x, y] = coordinates(state, e);
+      if (e.pointerType === 'touch') touch(12, e, x, y);
+      if (e.pointerType !== 'touch' || e.isPrimary) input(0, x, y, button(e), flags(e));
+    });
+    listen(state.canvas, 'pointerdown', e => {
+      state.canvas.focus(); state.canvas.setPointerCapture(e.pointerId);
+      const [x, y] = coordinates(state, e);
+      if (e.pointerType === 'touch') touch(10, e, x, y);
+      if (e.pointerType !== 'touch' || e.isPrimary) {
+        pointerId = e.pointerId;
+        setKeyState([1, 4, 2, 5, 6][e.button], true);
+        input(1, x, y, button(e), flags(e));
+      }
+    });
+    listen(state.canvas, 'pointerup', e => {
+      const [x, y] = coordinates(state, e);
+      if (e.pointerType === 'touch') touch(11, e, x, y);
+      if (e.pointerType !== 'touch' || e.isPrimary) {
+        setKeyState([1, 4, 2, 5, 6][e.button], false);
+        const value = button(e), shift = flags(e), click = e.button === 0;
+        dispatch(state, async owner => {
+          if (click) await vm.visualWindow(3, owner, undefined, x, y, 3, 0, shift);
+          await vm.visualWindow(3, owner, undefined, x, y, 2, value, shift);
+        });
+      }
+    });
+    listen(state.canvas, 'pointercancel', e => {
+      const [x, y] = coordinates(state, e);
+      if (e.pointerType === 'touch') touch(11, e, x, y);
+      if (e.pointerType !== 'touch' || e.isPrimary) {
+        setKeyState(1, false);
+        input(2, x, y, 0, flags(e));
+      }
+    });
+    listen(state.canvas, 'dblclick', e => {
+      const [x, y] = coordinates(state, e);
+      input(4, x, y);
+    });
+    listen(state.canvas, 'pointerleave', e => { if (e.pointerType !== 'touch') input(6, 0, 0); });
+    listen(state.canvas, 'pointerenter', e => { if (e.pointerType !== 'touch') input(13, 0, 0); });
+    listen(state.canvas, 'wheel', e => {
+      e.preventDefault();
+      const [x, y] = coordinates(state, e);
+      const delta = wheelDelta(e);
+      input(5, x, y, delta, flags(e));
+    }, { passive: false });
+    state.postKeyEvent = (name, key, shift = 0) =>
+      input({ onKeyDown: 7, onKeyUp: 8, onKeyPress: 9 }[name], 0, 0, key, shift);
+    for (const [type, name] of [['keydown', 'onKeyDown'], ['keyup', 'onKeyUp'], ['keypress', 'onKeyPress']])
+      listen(state.canvas, type, e => {
+        const key = type === 'keypress' && e.key.length === 1 ? e.key.charCodeAt(0) : virtualKeyCode(e);
+        if (type !== 'keypress') setKeyState(virtualKeySide(e) || key, type === 'keydown');
+        if (key) state.postKeyEvent(name, key, flags(e));
+      });
+    requestPaint(state);
+  };
+  listen(view, 'blur', clearKeyStates);
+  return {
+    wire, requestPaint,
+    requestPaintAll() { for (const state of Window.instances.values()) requestPaint(state); },
+    diagnostics() { return { backend: 'native', pendingWindows: pending.size, continuous,
+      draws: Number(vm.module._gal_render_draw_count()) }; },
+    stop() {
+      stopped = true;
+      if (raf !== null) view.cancelAnimationFrame(raf);
+      raf = null;
+      for (const remove of listeners) remove();
+    },
+    async finalize() {
+      for (const owner of pending.values()) await disposeScriptValue(owner);
+      pending.clear();
+    },
+    releaseDevice() {
+      nativeModule._gal_render_shutdown();
+      canvas.width = canvas.height = 0;
+      nativeModule = null;
+    },
+  };
 }
